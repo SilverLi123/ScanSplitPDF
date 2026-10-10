@@ -64,12 +64,3 @@ def test_extract_multi_format_and_monotonic():
     assert pagenum.reset_points({1: 1, 2: 2, 3: 3, 4: 4}) == []
     # 跳页（缺页）不算重置：4 之后是 6
     assert pagenum.reset_points({1: 4, 2: 6}) == []
-
-
-def test_extract_multi_format_and_monotonic():
-    assert pagenum.extract_page_number([FakeLine("第 12 页，共 30 页", H * 0.97)], H) == 12
-    assert pagenum.extract_page_number([FakeLine("Page 3 of 5", H * 0.97)], H) == 3
-    # 页码连续无重置
-    assert pagenum.reset_points({1: 1, 2: 2, 3: 3, 4: 4}) == []
-    # 跳页（缺页）不算重置：4 之后是 6
-    assert pagenum.reset_points({1: 4, 2: 6}) == []

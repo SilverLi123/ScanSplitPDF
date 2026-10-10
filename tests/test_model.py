@@ -57,16 +57,3 @@ def test_page_state_split_before_roundtrip_and_compat():
     # v1.6 旧快照无 split_before 键 → 默认 False，不崩
     old = {"src_index": 1, "rotation": 90, "blank": None, "separator": False}
     assert PageState.restore(old).split_before is False
-
-
-def test_page_state_split_before_roundtrip_and_compat():
-    """v1.7：split_before 快照往返；旧版本快照（无该键）兼容。"""
-    from scansplit.model import PageState
-
-    ps = PageState(src_index=3)
-    ps.split_before = True
-    ps2 = PageState.restore(ps.snapshot())
-    assert ps2.split_before is True
-    # v1.6 旧快照无 split_before 键 → 默认 False，不崩
-    old = {"src_index": 1, "rotation": 90, "blank": None, "separator": False}
-    assert PageState.restore(old).split_before is False

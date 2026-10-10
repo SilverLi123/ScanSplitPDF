@@ -3,7 +3,10 @@ __pycache__/
 .venv/
 venv/
 build/
+build_v*/
 dist/
+dist_v*/
+.workbuddy/
 .pytest_cache/
 .coverage
 htmlcov/
