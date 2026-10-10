@@ -309,3 +309,33 @@ def test_smart_split_review_no_page_number_no_autosplit(tmp_path):
     # 第 2 页有标题特征但无页码信号 → 仅建议，不自动拆
     assert by_page[2].status == "suggest_split"
 
+
+
+def test_smart_split_review_cancel_safe(tmp_path):
+    """取消回调立即生效：不产生任何状态、不抛异常。"""
+    img = ocrimg.make_cn_document("关于检查的通知", ["正文。"], unit=None, page_no=1)
+    p = _build_cn_scan(tmp_path / "c.pdf", [img])
+    doc = _doc(p)
+    refresh_groups(doc)
+    renderer = PageRenderer(p)
+    try:
+        statuses = smart_split_review(
+            doc, renderer, OcrEngine.get(), cancel_cb=lambda: True)
+    finally:
+        renderer.close()
+    assert statuses == []
+
+
+def test_smart_split_review_cancel_safe(tmp_path):
+    """取消回调立即生效：不产生任何状态、不抛异常。"""
+    img = ocrimg.make_cn_document("关于检查的通知", ["正文。"], unit=None, page_no=1)
+    p = _build_cn_scan(tmp_path / "c.pdf", [img])
+    doc = _doc(p)
+    refresh_groups(doc)
+    renderer = PageRenderer(p)
+    try:
+        statuses = smart_split_review(
+            doc, renderer, OcrEngine.get(), cancel_cb=lambda: True)
+    finally:
+        renderer.close()
+    assert statuses == []

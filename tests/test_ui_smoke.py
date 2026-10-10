@@ -243,3 +243,28 @@ def test_step_state_and_guide(ui_env, tmp_path, make_scan):
             app.on_close()
         except Exception:
             root.destroy()
+
+
+def test_add_split_before_keeps_pages(ui_env, tmp_path, make_scan):
+    """v1.7：拆分边界记录在起点页自身——内容页绝不被排除出分组。"""
+    from scansplit.ui import App
+
+    scan = make_scan("three.pdf", ["text", "text", "text"])
+    root = _make_root()
+    try:
+        app = App(root)
+        app.import_files([str(scan)])
+        doc = app._active_doc()
+        app.add_split_before(2)
+        assert [(g.start, g.end) for g in doc.groups] == [(1, 1), (2, 3)]
+        # 所有页面仍在组内（不丢页）
+        covered = sorted(p for g in doc.groups for p in g.pages)
+        assert covered == [1, 2, 3]
+        # 可撤销
+        app.undo()
+        assert [(g.start, g.end) for g in doc.groups] == [(1, 3)]
+    finally:
+        try:
+            app.on_close()
+        except Exception:
+            root.destroy()

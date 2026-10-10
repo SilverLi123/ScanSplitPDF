@@ -111,3 +111,14 @@ def test_compute_groups_split_starts_keep_pages():
     assert compute_groups(set(), 2, {1}) == [(1, 2)]
     # 连续拆分起点合并为多个非空组
     assert compute_groups(set(), 5, {3, 4}) == [(1, 2), (3, 3), (4, 5)]
+
+
+def test_separator_and_split_start_mixed_doc():
+    """空白分隔页与拆分边界混用：各页归属正确、无一丢失。"""
+    from scansplit.grouping import compute_groups
+
+    # 6 页：第 3 页为空白分隔页，第 5 页为拆分边界
+    groups = compute_groups({3}, 6, {5})
+    assert groups == [(1, 2), (4, 4), (5, 6)]
+    # 无一页丢失（(4,4) 单页组展开时注意去重）
+    assert sorted({p for g in groups for p in g}) == [1, 2, 4, 5, 6]
