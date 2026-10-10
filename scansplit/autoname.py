@@ -413,6 +413,7 @@ def smart_split_review(
 
     numbers: dict[int, int | None] = {}
     scores: dict[int, float] = {}
+    structs: dict[int, dict] = {}  # 首页结构特征（用于否决误拆，见下）
     total = len(scan_pages)
     for done, p in enumerate(scan_pages, start=1):
         if cancel_cb and cancel_cb():
@@ -423,11 +424,25 @@ def smart_split_review(
             lines, _w, h, _img = _ocr_page_rotation_aware(
                 renderer, p - 1, engine, 1000, doc.pages[p - 1])
             scores[p] = ocrfields.title_likeness(lines, _w, h)
+            structs[p] = ocrfields.first_page_structure(lines, _w, h)
         except Exception:
             scores[p] = 0.0
+            structs[p] = {}
         numbers[p] = pagenum.extract_page_number(lines, h) if lines else None
         if progress_cb:
             progress_cb(done, total)
+
+    def _looks_like_doc_start(p: int) -> bool:
+        """结构否决（v1.9-nightly P0 修复）：页码重置 + 标题分高**仍不足以**自动补拆，
+        还需该页在结构上**确实像一份新文档的首面**。
+
+        反例（A 套实测误拆）：文档内部"续表/续页"（has_continuation）、
+        或仅重印文头 + 顶部分节标题（has_title=False 且 has_section=True）的页面，
+        其页码会因页脚 `-2-`/`-3-` 与跨文档比较而误判"重置"，进而把一份正确文档切成两半。
+        真正的新文档首面必然带标题（has_title=True）且不是"续表/续页"（has_continuation=False）。
+        """
+        st = structs.get(p) or {}
+        return bool(st.get("has_title")) and not st.get("has_continuation")
 
     resets = set(pagenum.reset_points(numbers))
     out: list[BoundaryStatus] = []
@@ -438,6 +453,7 @@ def smart_split_review(
         t_sig = scores.get(p, 0.0) >= strong
         n_sig = p in resets
         num = numbers.get(p)
+        start_ok = _looks_like_doc_start(p)
         if p in after_sep:
             if t_sig:
                 out.append(BoundaryStatus(
@@ -449,11 +465,20 @@ def smart_split_review(
                     separator_page=p - 1, next_page=p, title_score=scores[p],
                     status="warn", note=f"第 {p} 页无标题特征（{scores[p]:.2f}），拆分点可能不准确，请人工确认",
                 ))
-        elif t_sig and n_sig:
+        elif t_sig and n_sig and start_ok:
             out.append(BoundaryStatus(
                 separator_page=None, next_page=p, title_score=scores[p],
                 status="auto_split", page_num=num,
                 note=f"第 {p} 页页码重置（识别页码 {num}）且具备标题特征（{scores[p]:.2f}），双信号一致",
+            ))
+        elif t_sig and n_sig:
+            # 双信号齐备但结构不像新文档首面（续表/无标题）→ 降级为人工确认，不自动补拆
+            st = structs.get(p) or {}
+            why = "含“续表/续页”标记" if st.get("has_continuation") else "顶部无标题特征"
+            out.append(BoundaryStatus(
+                separator_page=None, next_page=p, title_score=scores[p],
+                status="suggest_split", page_num=num,
+                note=f"第 {p} 页页码重置（识别页码 {num}）但{why}，疑似文档内部续页，建议人工确认",
             ))
         elif t_sig or n_sig:
             if t_sig:

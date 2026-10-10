@@ -311,6 +311,37 @@ def test_smart_split_review_no_page_number_no_autosplit(tmp_path):
 
 
 
+def test_smart_split_review_no_title_continuation_not_autosplit(tmp_path):
+    """v1.9-nightly P0 修复：页码重置 + 标题分高**但结构不像新文档首面**时，
+    不得自动补拆（否则会把一份正确文档切成两半）。
+
+    复现场景（A 套 p45→p46 实测误拆）：
+      - 第 1 页：文头 + 正文（无标题），页脚印刷页码 9 → 为下一页提供“较高”基准；
+      - 第 2 页：仅文头 + 顶部分节标题“二、相关情况说明”，页脚页码 2。
+    跨页比较出现“重置”（2 < 9），旧逻辑据此 + 标题分过线 → 误判 auto_split。
+    真正的新文档首面必带标题；本页无标题 → 只能 suggest_split（人工确认）。
+    """
+    img1 = ocrimg.make_cn_document(
+        "", ["一、工作事项与执行情况", "现就有关情况说明如下。"],
+        header="图书馆文件", unit=None, page_no=9,
+    )
+    img2 = ocrimg.make_cn_document(
+        "", ["二、相关情况说明", "1. 总体情况良好。", "2. 部分问题已整改。"],
+        header="图书馆文件", unit=None, page_no=2,
+    )
+    p = _build_cn_scan(tmp_path / "cont.pdf", [img1, img2])
+    doc = _doc(p)
+    refresh_groups(doc)
+    renderer = PageRenderer(p)
+    try:
+        statuses = smart_split_review(doc, renderer, OcrEngine.get())
+    finally:
+        renderer.close()
+    by_page = {s.next_page: s for s in statuses}
+    # 第 2 页无标题 → 绝不 auto_split；若出现只能是 suggest_split
+    assert 2 not in by_page or by_page[2].status != "auto_split"
+
+
 def test_smart_split_review_cancel_safe(tmp_path):
     """取消回调立即生效：不产生任何状态、不抛异常。"""
     img = ocrimg.make_cn_document("关于检查的通知", ["正文。"], unit=None, page_no=1)
