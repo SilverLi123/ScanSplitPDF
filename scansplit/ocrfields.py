@@ -232,34 +232,65 @@ def extract_unit_first_page(lines: list[OcrLine], img_w: float, img_h: float) ->
 
 
 def extract_unit_last_page(lines: list[OcrLine], img_w: float, img_h: float) -> list[FieldCandidate]:
-    """末页单位候选：落款优先（日期行上方的单位名）。"""
+    """末页单位候选：落款优先（**紧邻**日期行上方的单位名）。
+
+    v1.9-nightly 修复（P1，最小改动）：旧逻辑 `above_date = 任意行 y1 <= 日期 y0`
+    只要"在日期上方**任意**距离"就算落款锚定，导致**表格中间的单元格**（如承办部门
+    列的"设备处"，位于页面中部）被当成落款，压过真正的紧邻落款（"人事处"直接位于
+    日期上一行）。改为按"与日期的垂直距离"分级：真正落款是**离日期最近**的单位行。
+    """
     dates = [l for l in lines if DATE_PATTERN.match(l.text.strip())]
+
+    def _gap(line: OcrLine) -> float | None:
+        """该行到其**下方最近日期**的垂直间距；无日期在其下方则 None（=非日期锚定）。"""
+        below = [d for d in dates if line.y1 <= d.y0 + 5]
+        if not below:
+            return None
+        return min(d.y0 - line.y1 for d in below)
+
+    # 日期锚定行的"紧邻"门槛：单位名与日期通常相隔不超过约 1 行高（~0.06 页高）。
+    near_gap = img_h * 0.06
     out: list[FieldCandidate] = []
     for line in lines:
         text = line.text.strip()
         if not text or _is_date_or_pageno(line):
             continue
-        above_date = any(line.y1 <= d.y0 + 5 for d in dates)
+        gap = _gap(line)
+        above_date = gap is not None            # 在某个日期上方（任意距离）
+        near_date = above_date and gap <= near_gap  # 紧邻日期上方 = 真落款
         m = LABELED_UNIT_RE.match(text)
         if m and line.cy >= img_h * 0.3:
             val = m.group(2)
             if UNIT_PATTERN.match(val) and val not in PLACE_STOPWORDS:
-                conf = line.score * (1.15 if above_date else 1.05)
+                # 明确标注行（"填报单位：X"）本身就强，紧邻日期再加权
+                conf = line.score * (1.15 if near_date else (1.05 if above_date else 1.0))
                 out.append(FieldCandidate(
                     val, round(min(conf, 0.99), 3), "落款",
-                    reason="填报单位标注" + ("（位于日期上方）" if above_date else ""),
+                    reason="填报单位标注" + ("（紧邻日期上方）" if near_date
+                                          else ("（日期上方）" if above_date else "")),
                 ))
             continue
         s = _unit_score_last_page(line, img_w, img_h)
         if s is None:
             continue
-        if not above_date and (line.cy < img_h * 0.8 or min(line.cx / img_w, 1.0) < 0.5):
+        if near_date:
+            # 紧邻日期上方：最强落款信号
+            conf = s * 1.15
+            reason = "紧邻日期上方"
+        elif above_date:
+            # 在日期上方但不紧邻（多为表格中部单元格）：显著降权，且须在页面下半部右侧
+            if line.cy < img_h * 0.72 or min(line.cx / img_w, 1.0) < 0.45:
+                continue
+            conf = s * 0.75
+            reason = "日期上方较远（疑似表格单元格，降权）"
+        elif line.cy < img_h * 0.8 or min(line.cx / img_w, 1.0) < 0.5:
             # 无日期锚定时只认右下角，防表格末页的单元格（如"使用单位"列值）误当落款
             continue
-        conf = s * (1.15 if above_date else 1.0)
+        else:
+            conf = s * 1.0
+            reason = "页面下方区域"
         out.append(FieldCandidate(
-            line.text, round(min(conf, 0.99), 3), "落款",
-            reason="位于日期上方" if above_date else "页面下方区域",
+            line.text, round(min(conf, 0.99), 3), "落款", reason=reason,
         ))
     out.sort(key=lambda c: c.confidence, reverse=True)
     return out[:6]

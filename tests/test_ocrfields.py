@@ -192,6 +192,32 @@ def test_bottom_left_cell_not_issue_unit():
     assert units == []
 
 
+def test_table_cell_mid_page_not_beat_near_date_signature():
+    """页中表格单元格（承办部门列的部门名）不得压过紧邻日期上方的真落款。
+
+    复现 nightly P1：末页有表格（中部多行部门名如"设备处"）+ 页面右下角
+    真落款"人事处"紧邻日期上方。旧逻辑只看"是否在日期上方任意距离"，
+    表格单元格会因 OCR 分数略高而排第一；修复后须取**紧邻日期**的落款。
+    """
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (1240, 1754), "white")
+    d = ImageDraw.Draw(img)
+    f = ocrimg._font(30)
+    # 页中表格单元格：多行"设备处"（承办部门列），分数高于右下角落款
+    for y in (860, 980, 1100):
+        d.text((560, y), "设备处", fill="black", font=f)
+    # 真落款：紧邻日期上方，右下角
+    d.text((700, 1430), "人事处", fill="black", font=f)
+    d.text((720, 1500), "2026年10月10日", fill="black", font=f)
+    lines = _recognize(img)
+    w, h = img.size
+    units = ocrfields.extract_unit_last_page(lines, w, h)
+    assert _top_unit(units) == "人事处", [c.text for c in units]
+    # 表格单元格仍可作为低权候选保留，但不得排第一
+    assert all(c.text != "人事处" for c in units[1:]) or units[1].confidence < units[0].confidence
+
+
 def test_labeled_unit_first_page():
     """首页"部门：教务处"标注行作为文头候选。"""
     from PIL import Image, ImageDraw
