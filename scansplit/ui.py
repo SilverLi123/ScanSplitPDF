@@ -87,7 +87,7 @@ class App:
         tool_section("② 命名 / 检查", [
             ("ocr", "OCR 自动命名（本地）", self.ocr_name),
             ("direction", "识别方向", self.direction_analyze),
-            ("review", "复核拆分", self.boundary_review_action),
+            ("review", "复核拆分/补拆", self.boundary_review_action),
         ])
         tool_section("③ 导出", [
             ("export", "导出全部…", self.export_all),
@@ -388,7 +388,12 @@ class App:
         n_blank = sum(1 for d in docs for p in d.pages if p.blank and p.blank.verdict == "blank")
         n_maybe = sum(1 for d in docs for p in d.pages if p.blank and p.blank.verdict == "maybe")
         self._refresh_all()
-        self.log(f"空白检测完成：空白候选 {n_blank} 页、疑似 {n_maybe} 页。")
+        # 分文件明细日志：避免多文档时汇总数与当前文件页数对不上造成困惑
+        for d in docs:
+            db = sum(1 for p in d.pages if p.blank and p.blank.verdict == "blank")
+            dm = sum(1 for p in d.pages if p.blank and p.blank.verdict == "maybe")
+            self.log(f"{d.name}：空白候选 {db} 页、疑似 {dm} 页（共 {d.page_count} 页）")
+        self.log(f"空白检测完成（全部文件合计）：空白候选 {n_blank} 页、疑似 {n_maybe} 页。")
         messagebox.showinfo(
             "检测完成",
             f"空白候选 {n_blank} 页（蓝色“空白”徽章），疑似空白 {n_maybe} 页（橙色“疑似”徽章）。\n\n"
@@ -431,11 +436,12 @@ class App:
         self.log(f"第 {','.join(map(str, sorted(pages)))} 页：{'标记为分隔页' if value else '取消分隔标记'}")
 
     def add_split_before(self, page_no: int, doc=None):
+        """在第 page_no 页前新增拆分边界（页本身保留在组内，绝不丢页）。"""
         doc = doc or self._active_doc()
         if not doc or page_no <= 1:
             return
         self._push_undo()
-        doc.pages[page_no - 2].separator = True
+        doc.pages[page_no - 1].split_before = True
         grouping.refresh_groups(doc)
         self._refresh_all()
         self.log(f"已在第 {page_no} 页前新增拆分点")
@@ -623,9 +629,9 @@ class App:
             )
             return
         self._busy = True
-        prog = ProgressDialog(self.root, "复核拆分边界（本地 OCR）")
+        prog = ProgressDialog(self.root, "复核拆分 / 智能补拆（本地 OCR）")
         try:
-            statuses = autoname.boundary_review(
+            statuses = autoname.smart_split_review(
                 doc, self.renderers[str(doc.path)], engine,
                 progress_cb=lambda i, n: prog.set(i, n, "复核拆分"),
                 cancel_cb=lambda: prog.canceled,
@@ -633,6 +639,19 @@ class App:
         finally:
             self._busy = False
             prog.destroy()
+        # 双重验证一致（页码重置+标题特征）的页面自动补拆——可撤销。
+        # 拆分边界记录在页面自身（split_before），内容页不会被排除出导出。
+        auto_pages = [s.next_page for s in statuses
+                      if s.status == "auto_split" and s.next_page]
+        if auto_pages:
+            self._push_undo()
+            for p in auto_pages:
+                if 2 <= p <= doc.page_count:
+                    doc.pages[p - 1].split_before = True
+            grouping.refresh_groups(doc)
+            self._refresh_all()
+            self.log(f"智能补拆：第 {','.join(map(str, auto_pages))} 页起为新文档"
+                     "（页码重置+标题特征双信号一致，Ctrl+Z 可撤销）")
         BoundaryDialog(self.root, self, doc, statuses)
 
     # -- 页面操作 --------------------------------------------------------------
@@ -872,6 +891,8 @@ class BoundaryDialog(tk.Toplevel):
                 icon, fg = "✓", "#1e8449"
             elif s.status == "warn":
                 icon, fg = "⚠", "#d68910"
+            elif s.status == "auto_split":
+                icon, fg = "✓", "#1e8449"
             else:
                 icon, fg = "＋", "#2e86c1"
             ttk.Label(frame, text=icon, width=2, foreground=fg).grid(row=row, column=0, padx=2, pady=3)
@@ -883,6 +904,8 @@ class BoundaryDialog(tk.Toplevel):
                                  command=lambda p=s.next_page, l=lbl: self._split(p, l))
                 btn.grid(row=row, column=3, padx=2, pady=3)
                 self.action_lbls[id(lbl)] = lbl
+            elif s.status == "auto_split":
+                lbl.configure(text="已自动补拆", foreground="#1e8449")
         ttk.Button(self, text="关闭", command=self.destroy).pack(pady=6)
 
     def _split(self, page_no: int, lbl):

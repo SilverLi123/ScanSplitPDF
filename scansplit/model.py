@@ -48,7 +48,8 @@ class PageState:
     src_index: int  # 1 起始
     rotation: int = 0  # 目标旋转角度 0/90/180/270（导出时写入 /Rotate）
     blank: Optional[BlankResult] = None
-    separator: bool = False  # 当前是否作为分隔页（拆分点）
+    separator: bool = False  # 当前是否作为分隔页（该页本身是空白分隔页，不进入任何组）
+    split_before: bool = False  # 该页是新文档起点（拆分边界，页本身保留在组内）
 
     def snapshot(self) -> dict:
         return {
@@ -58,6 +59,7 @@ class PageState:
             if self.blank
             else None,
             "separator": self.separator,
+            "split_before": self.split_before,
         }
 
     @staticmethod
@@ -65,6 +67,7 @@ class PageState:
         ps = PageState(src_index=d["src_index"])
         ps.rotation = d["rotation"]
         ps.separator = d["separator"]
+        ps.split_before = bool(d.get("split_before", False))
         if d["blank"]:
             v, c, s = d["blank"]
             ps.blank = BlankResult(verdict=v, confidence=c, signals=s)
@@ -140,6 +143,11 @@ class ScanDocument:
     @property
     def separators(self) -> set[int]:
         return {p.src_index for p in self.pages if p.separator}
+
+    @property
+    def split_starts(self) -> set[int]:
+        """新文档起点页集合（拆分边界，页本身保留在组内）。"""
+        return {p.src_index for p in self.pages if p.split_before}
 
     def snapshot(self) -> dict:
         return {

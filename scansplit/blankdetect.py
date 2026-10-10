@@ -35,6 +35,8 @@ class DetectParams:
     bbox_frac_content: float = 0.05  # 判内容的内容包围盒面积比下限
     grad_blank_max_pct: float = 0.35  # 判空白的梯度比上限（%）
     grad_content_min_pct: float = 0.8  # 判内容的梯度比下限（%）
+    ink_floor_blank_pct: float = 0.005  # 判空白的清洗后残留墨迹下限（%）：超过说明有被腐蚀掉的稀疏真实内容
+    dark_run_blank_frac: float = 0.01  # 判空白的最长深色水平段占页宽比例上限：超过说明有文字笔画
     edge_ink_max: float = 0.20  # 边缘条带墨迹比（仅作展示信号）
     margin_lr: float = 0.08  # 左右裁剪比例
     margin_tb: float = 0.05  # 上下裁剪比例
@@ -94,6 +96,27 @@ def _grad_ratio(gray_s: np.ndarray) -> float:
     return float(((dx >= GRAD_LEVEL).sum() + (dy >= GRAD_LEVEL).sum()) / n * 100.0)
 
 
+def _max_dark_h_run_frac(dark: np.ndarray) -> float:
+    """最长深色水平连续段占图宽比例。
+
+    文字笔画的水平连续段远长于扫描噪点（实测：一行文字 ~30px vs 噪点 ≤3px），
+    用于识别"墨迹比被形态学腐蚀到极低、但确实存在文字"的稀疏内容页。
+    """
+    if not dark.any():
+        return 0.0
+    w = dark.shape[1]
+    best = 0
+    for row in dark:
+        idx = np.flatnonzero(row)
+        if idx.size == 0:
+            continue
+        for seg in np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1):
+            length = int(seg[-1] - seg[0] + 1)
+            if length > best:
+                best = length
+    return best / max(w, 1)
+
+
 def analyze_gray(gray: np.ndarray, params: DetectParams) -> dict:
     """从灰度图提取空白检测信号。gray: uint8 2D，0=黑 255=白。"""
     crop = _crop_margins(gray, params)
@@ -104,6 +127,7 @@ def analyze_gray(gray: np.ndarray, params: DetectParams) -> dict:
     dark = crop < DARK_LEVEL
     ink_raw = float(ink.mean() * 100.0) if ink.size else 0.0
     dark_raw = float(dark.mean() * 100.0) if dark.size else 0.0
+    dark_run_frac = _max_dark_h_run_frac(dark)
 
     # 形态学在 2x 下采样上进行（比不随分辨率变化，速度 4x）
     ink_s = ink[::2, ::2]
@@ -143,6 +167,7 @@ def analyze_gray(gray: np.ndarray, params: DetectParams) -> dict:
         "dark_ratio": round(dark_ratio, 4),
         "ink_raw": round(ink_raw, 4),
         "dark_raw": round(dark_raw, 4),
+        "dark_run_frac": round(dark_run_frac, 4),
         "grad_ratio": round(grad_ratio, 3),
         "bbox_frac": round(bbox_frac, 4),
         "edge_ink": round(edge_ink, 2),
@@ -164,6 +189,15 @@ def classify(signals: dict, params: DetectParams, has_text: bool = False) -> Bla
         and ink <= params.ink_threshold_pct
         and grad <= params.grad_blank_max_pct
     ):
+        # 护栏一：形态学清洗后仍残留墨迹，说明并非真正空白（保守优先）。
+        # 护栏二：存在明显的深色水平连续段（文字笔画远长于噪点）——典型场景
+        # 是整页只有一行文字/页码，墨迹比被腐蚀到远低于阈值但内容真实存在。
+        # 两者命中其一即降级"疑似"由人工确认，绝不自动判空白。
+        if (
+            ink > params.ink_floor_blank_pct
+            or signals.get("dark_run_frac", 0.0) > params.dark_run_blank_frac
+        ):
+            return BlankResult(verdict=MAYBE, confidence=0.5, signals=signals)
         # 空白：置信度随墨迹比升高而下降
         conf = max(0.6, 1.0 - 0.8 * (ink / max(params.ink_threshold_pct, 1e-6)))
         return BlankResult(verdict=BLANK, confidence=round(min(conf, 0.99), 3), signals=signals)

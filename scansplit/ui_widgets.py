@@ -24,6 +24,7 @@ BADGE_STYLES = {
     "blank": ("#2e86c1", "#ffffff"),
     "maybe": ("#d68910", "#ffffff"),
     "rotate": ("#5d6d7e", "#ffffff"),
+    "split": ("#8e44ad", "#ffffff"),
 }
 
 
@@ -91,6 +92,8 @@ class ThumbnailStrip(ttk.Frame):
         out = []
         if page.separator:
             out.append(("分隔", "separator"))
+        if page.split_before:
+            out.append(("新文档", "split"))
         if page.blank is not None:
             if page.blank.verdict == "blank":
                 out.append(("空白", "blank"))

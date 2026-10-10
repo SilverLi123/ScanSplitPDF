@@ -7,7 +7,7 @@ import pytest
 from pypdf import PdfWriter
 
 from scansplit import autoname, verify
-from scansplit.autoname import analyze_directions, auto_name_groups, boundary_review
+from scansplit.autoname import analyze_directions, auto_name_groups, boundary_review, smart_split_review
 from scansplit.grouping import refresh_groups
 from scansplit.loader import open_document
 from scansplit.model import ScanDocument
@@ -246,3 +246,66 @@ def test_no_ocr_engine_text_layer_fallback(tmp_path, make_text):
     assert len(results) == 1
     assert "2026 ANNUAL REPORT" in doc.groups[0].title
     assert "Registrar Office" in doc.groups[0].unit
+
+
+def test_smart_split_review_page_number_reset(tmp_path):
+    """无空白页场景智能补拆：两份连续扫描（无空白页），第 2 份页码从 1 重开
+    且首页有标题 → 双信号一致 auto_split；其他页不应产生自动拆分。"""
+    img1 = ocrimg.make_cn_document(
+        "关于开展教学检查的通知",
+        ["各学院、各部门：", "现将有关事项通知如下。"],
+        unit=None, page_no=1,
+    )
+    img2 = ocrimg.make_cn_document(
+        "",
+        ["二、检查内容", "1. 课堂教学情况；", "2. 实验教学情况。"],
+        unit=None, page_no=2,
+    )
+    img3 = ocrimg.make_cn_document(
+        "2026年度实验室安全检查报告",
+        ["为进一步加强实验室安全管理，现将有关情况报告如下。"],
+        unit=None, page_no=1,
+    )
+    img4 = ocrimg.make_cn_document(
+        "",
+        ["二、检查结果", "1. 总体情况良好。", "2. 部分问题已整改。"],
+        unit=None, page_no=2,
+    )
+    p = _build_cn_scan(tmp_path / "smart.pdf", [img1, img2, img3, img4])
+    doc = _doc(p)  # 无分隔页 → 单组 1-4
+    refresh_groups(doc)
+    renderer = PageRenderer(p)
+    try:
+        statuses = smart_split_review(doc, renderer, OcrEngine.get())
+    finally:
+        renderer.close()
+    by_page = {s.next_page: s for s in statuses}
+    # 第 3 页：页码重置(1) + 标题特征 → 自动补拆
+    assert 3 in by_page and by_page[3].status == "auto_split"
+    assert by_page[3].page_num == 1
+    # 第 2、4 页：无重置、无标题 → 不出现
+    assert 2 not in by_page and 4 not in by_page
+    # 拆分可安全应用：拆分边界记录在起点页自身，组刷新不丢页
+    doc.pages[2].split_before = True
+    refresh_groups(doc)
+    assert [(g.start, g.end) for g in doc.groups] == [(1, 2), (3, 4)]
+
+
+def test_smart_split_review_no_page_number_no_autosplit(tmp_path):
+    """无印刷页码时绝不自动拆：仅有标题特征 → suggest_split（人工确认）。"""
+    img1 = ocrimg.make_cn_document(
+        "关于开展教学检查的通知", ["各学院、各部门："], unit=None)
+    img2 = ocrimg.make_cn_document(
+        "2026年度实验室安全检查报告", ["现将有关情况报告如下。"], unit=None)
+    p = _build_cn_scan(tmp_path / "nopn.pdf", [img1, img2])
+    doc = _doc(p)
+    refresh_groups(doc)
+    renderer = PageRenderer(p)
+    try:
+        statuses = smart_split_review(doc, renderer, OcrEngine.get())
+    finally:
+        renderer.close()
+    by_page = {s.next_page: s for s in statuses}
+    # 第 2 页有标题特征但无页码信号 → 仅建议，不自动拆
+    assert by_page[2].status == "suggest_split"
+

@@ -55,11 +55,13 @@ def make_cn_document(
     skew_deg: float = 0.0,
     landscape: bool = False,
     table_grid: bool = False,
+    page_no: int | None = None,
 ) -> Image.Image:
     """生成一份虚构公文图像。
 
     title: 单行字符串或多行标题列表（多行时逐行居中拼接）。
     blur: 高斯模糊半径（模拟扫描模糊）。skew_deg: 倾斜角度（模拟扫描倾斜）。
+    page_no: 页脚居中印刷页码（模拟"第 N 页"，用于页码重置拆分信号测试）。
     """
     w, h = size
     if landscape:
@@ -108,6 +110,13 @@ def make_cn_document(
         if f2:
             dw = d.textlength(date, font=f2)
             d.text((w - dw - 120, h - int(body_size * 3.2)), date, fill="black", font=f2)
+
+    if page_no is not None:
+        f = _font(body_size - 4)
+        if f:
+            pn = f"第 {page_no} 页"
+            pw = d.textlength(pn, font=f)
+            d.text(((w - pw) / 2, h - int(body_size * 1.5)), pn, fill="black", font=f)
 
     if blur:
         img = img.filter(ImageFilter.GaussianBlur(blur))

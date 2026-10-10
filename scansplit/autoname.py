@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from . import naming, ocrfields
+from . import naming, ocrfields, pagenum
 from .model import ScanDocument
 
 CONFIRM_THRESHOLD = 0.55  # 低于此置信度标记"待确认"
@@ -46,8 +46,9 @@ class BoundaryStatus:
     separator_page: int | None  # None 表示"建议新增拆分点"
     next_page: int | None
     title_score: float
-    status: str  # ok | warn | suggest_split
+    status: str  # ok | warn | suggest_split | auto_split
     note: str
+    page_num: int | None = None  # 该页识别到的印刷页码（无则 None）
 
 
 def _page_text_lines(reader, page_idx0: int) -> list:
@@ -312,4 +313,88 @@ def boundary_review(
             ))
         if progress_cb:
             progress_cb(done, total)
+    return out
+
+
+def smart_split_review(
+    doc: ScanDocument,
+    renderer,
+    engine,
+    progress_cb=None,
+    cancel_cb=None,
+) -> list[BoundaryStatus]:
+    """智能补拆复核：无空白页分隔场景的自动拆分（页码 + 标题双重验证）。
+
+    对每个非分隔页 OCR 一次（复用回正识别），同时提取：
+    1) 标题特征分数（ocrfields.title_likeness）；
+    2) 页面印刷页码（pagenum.extract_page_number，页脚优先、兼容页眉）。
+
+    双重验证规则（保守优先，绝不凭单一信号自动改动分组）：
+    - 页码重置 + 标题特征 → status="auto_split"（UI 自动补拆，可撤销）；
+    - 仅其一 → status="suggest_split"（人工确认，一键补拆）；
+    - 已有分隔页后的首页 → ok / warn（语义同 boundary_review）。
+    """
+    seps = doc.separators
+    starts = set(doc.split_starts)  # 已是文档起点的页不再重复评估
+    scan_pages = [p for p in range(1, doc.page_count + 1) if p not in seps and p not in starts]
+    after_sep: set[int] = set(starts)
+    for s in sorted(seps):
+        nxt = s + 1
+        while nxt in seps:
+            nxt += 1
+        if nxt <= doc.page_count:
+            after_sep.add(nxt)
+
+    numbers: dict[int, int | None] = {}
+    scores: dict[int, float] = {}
+    total = len(scan_pages)
+    for done, p in enumerate(scan_pages, start=1):
+        if cancel_cb and cancel_cb():
+            break
+        lines: list = []
+        h = 1.0
+        try:
+            lines, _w, h, _img = _ocr_page_rotation_aware(renderer, p - 1, engine, 1000)
+            scores[p] = ocrfields.title_likeness(lines, _w, h)
+        except Exception:
+            scores[p] = 0.0
+        numbers[p] = pagenum.extract_page_number(lines, h) if lines else None
+        if progress_cb:
+            progress_cb(done, total)
+
+    resets = set(pagenum.reset_points(numbers))
+    out: list[BoundaryStatus] = []
+    strong = CONFIRM_THRESHOLD + 0.1
+    for p in scan_pages:
+        if p == 1:
+            continue  # 第 1 页永远是文档起点，无需评估；仅作为页码比较基准
+        t_sig = scores.get(p, 0.0) >= strong
+        n_sig = p in resets
+        num = numbers.get(p)
+        if p in after_sep:
+            if t_sig:
+                out.append(BoundaryStatus(
+                    separator_page=p - 1, next_page=p, title_score=scores[p],
+                    status="ok", note=f"第 {p} 页具备标题特征（{scores[p]:.2f}），拆分可信",
+                ))
+            else:
+                out.append(BoundaryStatus(
+                    separator_page=p - 1, next_page=p, title_score=scores[p],
+                    status="warn", note=f"第 {p} 页无标题特征（{scores[p]:.2f}），拆分点可能不准确，请人工确认",
+                ))
+        elif t_sig and n_sig:
+            out.append(BoundaryStatus(
+                separator_page=None, next_page=p, title_score=scores[p],
+                status="auto_split", page_num=num,
+                note=f"第 {p} 页页码重置（识别页码 {num}）且具备标题特征（{scores[p]:.2f}），双信号一致",
+            ))
+        elif t_sig or n_sig:
+            if t_sig:
+                note = f"第 {p} 页具备标题特征（{scores[p]:.2f}），未见页码重置，建议人工确认后拆分"
+            else:
+                note = f"第 {p} 页页码重置（识别页码 {num}），标题特征不足（{scores[p]:.2f}），建议人工确认后拆分"
+            out.append(BoundaryStatus(
+                separator_page=None, next_page=p, title_score=scores[p],
+                status="suggest_split", note=note, page_num=num,
+            ))
     return out

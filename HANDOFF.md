@@ -77,13 +77,14 @@ OCR 组件是本机已装的（RapidOCR + ONNX Runtime + 模型随仓库/包分�
 |------|------|--------|
 | `main.py` | 入口（含 `--selftest`） | 打包路径处理 |
 | `loader.py` | 打开/检查 PDF | 加密（仅空密码）、签名、批注警告在这里 |
-| `blankdetect.py` | 空白页检测 | 多信号（墨迹比/深色比/梯度比/包围盒）+ 三级判定（空白/疑似/有内容）；信号在形态学清洗后的 mask 上算；印章/浅签名 → 疑似（保守） |
-| `grouping.py` | 分隔页 → 文档组 | 纯函数；连续空白合并、首尾空白不产生空组、内部空白保留 |
+| `blankdetect.py` | 空白页检测 | 多信号（墨迹比/深色比/梯度比/包围盒）+ 三级判定（空白/疑似/有内容）；信号在形态学清洗后的 mask 上算；印章/浅签名 → 疑似（保守）；v1.7 起带稀疏内容页护栏（残留墨迹 ink_floor + 最长深色水平段 dark_run_frac） |
+| `grouping.py` | 分隔页 → 文档组 | 纯函数；连续空白合并、首尾空白不产生空组、内部空白保留；v1.7 起 `compute_groups(separators, n, split_starts)` 支持拆分边界（新文档起点，不吞页） |
+| `pagenum.py` | 印刷页码提取（v1.7） | 页脚优先/页眉回退；整行模式匹配（纯数字/第X页/X/Y/—X—/Page X），防落款日期误判；reset_points 给页码重置候选。只与标题特征双信号一致才自动拆分 |
 | `render.py` | 页面渲染 | PageRenderer，**必须在同一线程使用（Tk 主线程）**；LRU 缓存 key=(idx0, bucket, width, total_rot)；512MB 字节预算淘汰；`close()` 清缓存 |
 | `ocr.py` | OCR 引擎封装 | OcrEngine（常规，含角度分类 cls）/ OcrEngineNoCls（use_angle_cls=False）；模型完整性校验；**cls 会把 90/180/270° 文字自动翻转识别**（方向分析的根源坑，见 §7） |
 | `ocrfields.py` | 标题/单位字段提取 | 纯几何+格式启发式；标题多行拼接；单位分文头/落款/正文提及；LABELED_UNIT_RE 表格标注行；`merge_unit_candidates(first, last, seal)` |
 | `ocrseal.py` | 公章（红章）文字提取 | 红色像素隔离 → 圆环检测 → 极坐标展开弧形字 → OCR；来源"印章"封顶 0.7 置信度 |
-| `autoname.py` | 命名编排、方向分析、边界复核 | `_ocr_page_rotation_aware` 返回 (lines, w, h, img)；侧放页面自动按回正方向识别（**只用于识别，绝不自动改旋转**）；印章来源的 unit 强制 need_confirm |
+| `autoname.py` | 命名编排、方向分析、边界复核 | `_ocr_page_rotation_aware` 返回 (lines, w, h, img)；侧放页面自动按回正方向识别（**只用于识别，绝不自动改旋转**）；印章来源的 unit 强制 need_confirm；v1.7 起 `smart_split_review` 为"复核拆分/补拆"入口（页码+标题双重验证），旧 `boundary_review` 保留兼容 |
 | `rotation.py` | 旋转目标角度管理 | 只写 `/Rotate`；orientation_suggestions 跳过空白分隔页 |
 | `naming.py` | 文件名模板/非法字符/防覆盖/单位历史 | 空名回退逻辑 |
 | `exporter.py` | 批量导出 | 预检、逐份保真校验、取消、失败不影响其余 |
@@ -129,6 +130,7 @@ OCR 准确率报告。
 | v1.4 | 2026-10-10 | 用户报 3 个 bug：缩略图滚动不重绘；"填报单位：教务办公室"误识别成"自动化学院"（表格标注行规则+噪声过滤）；旋转摆正崩溃（撤销快照 dict/FieldCandidate 形态兼容） |
 | v1.5 | 2026-10-10 | 新增公章（红章）文字提取 ocrseal.py：红色隔离+圆环极坐标展开弧形字；来源"印章"强制待确认 |
 | v1.6 | 2026-10-10 | 体验优化：工具栏分 ①拆分②命名③导出 三段（未就绪置灰 + 状态栏"下一步"提示）；分组面板"整组识别方向"（按组过滤候选页，显式传 doc）；导出完成"打开输出目录"；空状态使用引导页；测试 100→101，补 Tk 创建抖动重试兜底 |
+| v1.7 | 2026-10-10 | 智能补拆（无空白页场景自动化）：新增 pagenum.py（印刷页码提取+页码重置信号）；autoname.smart_split_review 双重验证（页码重置+标题特征双信号一致才自动补拆，单信号仅提示）；**拆分边界 split_before 概念**（记录在起点页自身，内容页不被吞）；修复稀疏内容页误判空白（一行文字页墨迹比被腐蚀到 0.01% 低于阈值 → 新增残留墨迹+最长深色水平段双护栏，降级"疑似"）；修复复核拆分在无空白页场景丢前一页的缺陷；测试 101→111 |
 
 ---
 
@@ -156,6 +158,16 @@ OCR 准确率报告。
 13. **cp314 快速创建/销毁多个 Tk 根偶发 `tcl_findLibrary` 抖动**（v1.6 后在 UI 冒烟测试中
     频繁出现）：tests/test_ui_smoke.py 统一走 `_make_root()` 创建并重试兜底；新 UI 测试
     不要直接 `tk.Tk()`。
+14. **separator 与 split_before 语义完全不同，不可混用**：`separator`（空白分隔页）会把
+    该页**排除出所有分组**（导出时丢弃该页）——只适用于真正的空白页；内容页之间的拆分
+    必须用 `split_before`（新文档起点，页保留在组内，model.PageState +
+    grouping.compute_groups 的 split_starts 参数）。v1.7 前的 add_split_before 把前一页
+    标成分隔页，在无空白页场景会导致丢页，已修复。
+15. **稀疏内容页会被形态学腐蚀成"准空白"**：整页只有一行文字时，清洗后墨迹比可低到
+    0.01%（远低于 0.4% 阈值），单靠墨迹比必然误判。blankdetect.classify 已加双护栏
+    （`ink_floor_blank_pct` 清洗后残留 + `dark_run_frac` 最长深色水平段占页宽比，
+    文字笔画 ~2.6% vs 噪点 0.3%）→ 此类页面降级"疑似"。调整这两个参数前先跑
+    test_blankdetect 全部用例。
 
 ---
 

@@ -98,3 +98,16 @@ def test_group_names_preserved_across_refresh(make_scan):
     refresh_groups(doc)
     # 原组 (1,1) 变成了 (2,2)… 名称不应错误迁移到不同的页范围
     assert all(g.title == "" for g in doc.groups)
+
+
+def test_compute_groups_split_starts_keep_pages():
+    """拆分边界（split_before）不吞页：第 3 页起新文档，页面全部保留。"""
+    from scansplit.grouping import compute_groups
+
+    assert compute_groups(set(), 4, {3}) == [(1, 2), (3, 4)]
+    # 与空白分隔页混用
+    assert compute_groups({5}, 6, {3}) == [(1, 2), (3, 4), (6, 6)]
+    # 首页作为拆分起点无效果（第 1 页本来就是文档起点）
+    assert compute_groups(set(), 2, {1}) == [(1, 2)]
+    # 连续拆分起点合并为多个非空组
+    assert compute_groups(set(), 5, {3, 4}) == [(1, 2), (3, 3), (4, 5)]

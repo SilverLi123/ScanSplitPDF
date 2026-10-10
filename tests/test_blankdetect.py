@@ -109,3 +109,21 @@ def test_signals_reported():
     r = detect_page(_gray("blank"), DetectParams())
     for key in ("ink_ratio", "dark_ratio", "bbox_frac", "edge_ink", "mean"):
         assert key in r.signals
+
+
+def test_sparse_line_page_maybe_not_blank():
+    """整页仅一行文字（清洗后墨迹比被腐蚀到远低于阈值）→ 疑似而非空白。
+
+    回归：v1.7 前，此类"稀疏内容页"被误判为空白候选（墨迹比 0.01% < 0.4%
+    阈值），一旦用户确认会整页丢失。护栏：最长深色水平段（文字笔画）
+    与清洗后残留墨迹任一超限即降级疑似。
+    """
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (1240, 1754), "white")
+    d = ImageDraw.Draw(img)
+    for x in (300, 700):  # 模拟一行里的两个"词块"（水平连续段远长于噪点，总墨迹低于内容下限）
+        d.rectangle([x, 900, x + 60, 910], fill=(30, 30, 30))
+    r = detect_page(np.asarray(img.convert("L")), DetectParams())
+    assert r.verdict == MAYBE
+    assert r.signals["dark_run_frac"] > 0.01
