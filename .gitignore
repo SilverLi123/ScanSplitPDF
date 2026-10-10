@@ -15,3 +15,5 @@ htmlcov/
 *.swp
 Thumbs.db
 Desktop.ini
+stress_v19/
+pytest_*.txt

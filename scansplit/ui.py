@@ -18,6 +18,7 @@ from .loader import LoadError
 from .model import ScanDocument, Workspace
 from .ocr import OcrEngine
 from .render import PageRenderer, RenderError
+from .tasks import TaskManager
 from .ui_widgets import (
     GroupPanelArea,
     LogPanel,
@@ -45,6 +46,10 @@ class App:
         self.undo_stack: list[dict] = []
         self.redo_stack: list[dict] = []
         self._busy = False
+        # v1.9 后台任务：单工作线程 + Queue/root.after 回传（UI 不冻结）
+        self.tasks = TaskManager(root, self.log)
+        self.tasks.progress_hook = self._on_task_progress
+        self._prog = None
 
         self._build_ui()
         try:
@@ -174,8 +179,23 @@ class App:
         )
         self._update_step_state(len(docs), blanks + maybes > 0, n_groups, n_conf)
 
-    def _update_step_state(self, n_docs: int, has_blank_analysis: bool, n_groups: int, n_conf: int):
-        """按工作流阶段启用/置灰工具栏按钮，并在状态栏给出“下一步”提示。"""
+    def _update_step_state(
+        self,
+        n_docs: int | None = None,
+        has_blank_analysis: bool | None = None,
+        n_groups: int | None = None,
+        n_conf: int | None = None,
+    ):
+        """按工作流阶段启用/置灰工具栏按钮，并在状态栏给出“下一步”提示。
+        参数缺省时从工作区现算（后台任务收尾等场景直接调用）。"""
+        if n_docs is None:
+            docs = self.ws.documents
+            blanks = sum(1 for d in docs for p in d.pages if p.blank and p.blank.verdict == "blank")
+            maybes = sum(1 for d in docs for p in d.pages if p.blank and p.blank.verdict == "maybe")
+            n_docs = len(docs)
+            has_blank_analysis = blanks + maybes > 0
+            n_groups = sum(len(d.groups) for d in docs)
+            n_conf = sum(1 for d in docs for g in d.groups if g.need_confirm)
         readiness = {
             "detect": n_docs > 0,
             "group": n_docs > 0 and has_blank_analysis,
@@ -234,8 +254,50 @@ class App:
             self.undo_stack.pop(0)
         self.redo_stack.clear()
 
+    # -- 后台任务辅助（v1.9） ---------------------------------------------------
+
+    def _on_task_progress(self, title, done, total, phase):
+        """主线程进度回调：懒创建进度框并刷新（来自 TaskManager 轮询）。"""
+        try:
+            if self._prog is None or not self._prog.winfo_exists():
+                self._prog = ProgressDialog(self.root, title or "处理中")
+            self._prog.set(done, total, phase)
+        except tk.TclError:
+            pass  # 窗口正在关闭
+
+    def _end_progress(self):
+        if self._prog is not None:
+            try:
+                self._prog.destroy()
+            except tk.TclError:
+                pass
+            self._prog = None
+
+    def _task_finish(self):
+        """on_done 回调统一收尾：关进度框、解除忙碌、刷新按钮状态。"""
+        self._end_progress()
+        self._busy = False
+        self._update_step_state()
+        self.update_status()
+
+    def _doc_still_open(self, doc) -> bool:
+        """文档对象仍在工作区（防移除文档后旧任务结果写回）。"""
+        return any(d is doc for d in self.ws.documents)
+
+    def _restore_ws_snapshot(self, snap: dict):
+        """取消/异常后恢复工作区（已移除的文档自然跳过，绝不跨文档写入）。"""
+        self.ws.restore(snap)
+
+    def _start_task(self, kind, work, on_done, title) -> bool:
+        if not self.tasks.start(kind, work, on_done, title=title):
+            messagebox.showinfo("请稍候", "当前已有任务在后台运行，请等待完成或先取消。")
+            return False
+        self._busy = True
+        self._update_step_state()
+        return True
+
     def undo(self, from_key: bool = False):
-        if self._busy or (from_key and self._editing()):
+        if self._busy or self.tasks.busy or (from_key and self._editing()):
             return
         if not self.undo_stack:
             self.log("没有可撤销的操作。")
@@ -246,7 +308,7 @@ class App:
         self.log("已撤销上一步操作。")
 
     def redo(self, from_key: bool = False):
-        if self._busy or (from_key and self._editing()):
+        if self._busy or self.tasks.busy or (from_key and self._editing()):
             return
         if not self.redo_stack:
             self.log("没有可重做的操作。")
@@ -350,56 +412,80 @@ class App:
     def detect_blank(self):
         if self._busy:
             return
-        docs = self.ws.documents
+        docs = list(self.ws.documents)
         if not docs:
             messagebox.showinfo("检测空白页", "请先打开 PDF 文件。")
             return
         self._push_undo()
-        self._busy = True
+        snap = self.ws.snapshot()
+        params = self.detect_params
         total = sum(d.page_count for d in docs)
-        counter = {"done": 0}
-        prog = ProgressDialog(self.root, "检测空白页")
-        try:
-            for doc in docs:
-                renderer = self.renderers[str(doc.path)]
 
-                def has_text(i: int, reader=doc.reader) -> bool:
-                    try:
-                        return len((reader.pages[i].extract_text() or "").strip()) > 10
-                    except Exception:
-                        return False
+        def work(progress, log, cancel):
+            # 渲染器在 worker 线程内自建自毁（线程归属约束，不碰主线程渲染器）
+            out = []
+            done_base = 0
+            for d in docs:
+                renderer = PageRenderer(d.path)
+                try:
+                    def has_text(i, reader=d.reader) -> bool:
+                        try:
+                            return len((reader.pages[i].extract_text() or "").strip()) > 10
+                        except Exception:
+                            return False
 
-                def cb(i, n, d=doc):
-                    counter["done"] += 1
-                    prog.set(counter["done"], total, f"检测 {d.name} 第 {i}/{n} 页")
+                    def cb(i, n, dd=d):
+                        progress(done_base + i, total, f"检测 {dd.name} 第 {i}/{n} 页")
 
-                results = blankdetect.detect_document(
-                    renderer, doc.page_count, self.detect_params, has_text,
-                    cb, lambda: prog.canceled,
-                )
-                for page, res in zip(doc.pages, results):
-                    page.blank = res
-                doc.status = "analyzed"
-                if prog.canceled:
+                    res = blankdetect.detect_document(
+                        renderer, d.page_count, params, has_text, cb, cancel,
+                    )
+                finally:
+                    renderer.close()
+                out.append((d, res))
+                done_base += d.page_count
+                if cancel():
                     break
-        finally:
-            self._busy = False
-            prog.destroy()
-        n_blank = sum(1 for d in docs for p in d.pages if p.blank and p.blank.verdict == "blank")
-        n_maybe = sum(1 for d in docs for p in d.pages if p.blank and p.blank.verdict == "maybe")
-        self._refresh_all()
-        # 分文件明细日志：避免多文档时汇总数与当前文件页数对不上造成困惑
-        for d in docs:
-            db = sum(1 for p in d.pages if p.blank and p.blank.verdict == "blank")
-            dm = sum(1 for p in d.pages if p.blank and p.blank.verdict == "maybe")
-            self.log(f"{d.name}：空白候选 {db} 页、疑似 {dm} 页（共 {d.page_count} 页）")
-        self.log(f"空白检测完成（全部文件合计）：空白候选 {n_blank} 页、疑似 {n_maybe} 页。")
-        messagebox.showinfo(
-            "检测完成",
-            f"空白候选 {n_blank} 页（蓝色“空白”徽章），疑似空白 {n_maybe} 页（橙色“疑似”徽章）。\n\n"
-            "下一步：点击“自动分组”把空白候选页作为拆分点；\n"
-            "疑似页面请在缩略图上右键人工确认（标记/取消分隔页）。",
-        )
+            return out
+
+        def on_done(results, canceled, error):
+            self._task_finish()
+            if error:
+                self._restore_ws_snapshot(snap)
+                self._refresh_all()
+                tail = error.splitlines()[-1] if error else "未知错误"
+                self.log(f"空白检测失败：{tail}（已回滚，无半更新状态）")
+                messagebox.showerror("检测空白页", f"检测失败：{tail}")
+                return
+            if canceled:
+                self._restore_ws_snapshot(snap)
+                self._refresh_all()
+                self.log("空白检测已取消，未保存任何结果。")
+                return
+            for doc, res in results:
+                if not self._doc_still_open(doc):
+                    self.log(f"{doc.name} 已从工作区移除，检测结果丢弃。")
+                    continue
+                for page, r in zip(doc.pages, res):
+                    page.blank = r
+                doc.status = "analyzed"
+            self._refresh_all()
+            n_blank = sum(1 for d in docs for p in d.pages if p.blank and p.blank.verdict == "blank")
+            n_maybe = sum(1 for d in docs for p in d.pages if p.blank and p.blank.verdict == "maybe")
+            # 分文件明细日志：避免多文档时汇总数与当前文件页数对不上造成困惑
+            for d in docs:
+                db = sum(1 for p in d.pages if p.blank and p.blank.verdict == "blank")
+                dm = sum(1 for p in d.pages if p.blank and p.blank.verdict == "maybe")
+                self.log(f"{d.name}：空白候选 {db} 页、疑似 {dm} 页（共 {d.page_count} 页）")
+            self.log(f"空白检测完成（全部文件合计）：空白候选 {n_blank} 页、疑似 {n_maybe} 页。")
+            messagebox.showinfo(
+                "检测完成",
+                f"空白候选 {n_blank} 页（蓝色“空白”徽章），疑似空白 {n_maybe} 页（橙色“疑似”徽章）。\n\n"
+                "下一步：点击“自动分组”把空白候选页作为拆分点；\n"
+                "疑似页面请在缩略图上右键人工确认（标记/取消分隔页）。",
+            )
+
+        self._start_task("detect", work, on_done, title="检测空白页")
 
     def auto_group_all(self):
         if self._busy:
@@ -466,7 +552,7 @@ class App:
     def ocr_name(self):
         if self._busy:
             return
-        docs = self.ws.documents
+        docs = list(self.ws.documents)
         if not docs:
             messagebox.showinfo("OCR 自动命名", "请先打开 PDF 文件。")
             return
@@ -485,47 +571,71 @@ class App:
                 return
             text_layer_only = True
         self._push_undo()
-        self._busy = True
+        snap = self.ws.snapshot()
         total_g = sum(len(d.groups) for d in docs)
-        counter = {"done": 0}
-        prog = ProgressDialog(self.root, "OCR 自动命名（本地）")
-        try:
-            for doc in docs:
-                renderer = self.renderers[str(doc.path)]
+        use_ocr = not text_layer_only
 
-                def cb(i, n, d=doc):
-                    counter["done"] += 1
-                    prog.set(counter["done"], total_g, f"命名 {d.name} 第 {i}/{n} 组")
-
+        def work(progress, log, cancel):
+            # 渲染器在 worker 线程内自建自毁；OCR 引擎为懒加载单例，
+            # 仅由本工作线程使用（主线程不做 OCR），无并发冲突。
+            done_base = 0
+            for d in docs:
+                if not d.groups:
+                    continue
+                renderer = PageRenderer(d.path) if use_ocr else None
                 try:
+                    def cb(i, n, dd=d):
+                        progress(done_base + i, total_g, f"命名 {dd.name} 第 {i}/{n} 组")
+
                     autoname.auto_name_groups(
-                        doc, renderer, engine=None if text_layer_only else engine,
-                        progress_cb=cb, cancel_cb=lambda: prog.canceled,
+                        d, renderer, engine=engine if use_ocr else None,
+                        progress_cb=cb, cancel_cb=cancel,
                     )
-                except Exception as e:
-                    self.log(f"命名失败 {doc.name}：{e}")
-                for g in doc.groups:
-                    if g.unit.strip():
-                        self.unit_history.add(g.unit)
-                if prog.canceled:
+                finally:
+                    if renderer is not None:
+                        renderer.close()
+                done_base += len(d.groups)
+                if cancel():
                     break
-        finally:
-            self._busy = False
-            prog.destroy()
-        self._refresh_all()
-        n_conf = sum(1 for d in docs for g in d.groups if g.need_confirm)
-        if text_layer_only:
-            self.log(f"文本层提取完成：共 {total_g} 组，待确认 {n_conf} 组（结果见右侧面板）。")
-            return
-        self.log(f"OCR 自动命名完成：待确认 {n_conf} 组。")
-        if n_conf:
-            messagebox.showinfo(
-                "OCR 自动命名完成",
-                f"共 {total_g} 组，其中 {n_conf} 组存在不确定字段（右侧面板橙色“待确认”标记）。\n"
-                "请人工确认或修改标题/单位后再导出。",
-            )
-        else:
-            messagebox.showinfo("OCR 自动命名完成", "全部组的标题/单位已提取，无待确认项。")
+            return True
+
+        def on_done(_result, canceled, error):
+            self._task_finish()
+            if error:
+                self._restore_ws_snapshot(snap)
+                self._refresh_all()
+                tail = error.splitlines()[-1] if error else "未知错误"
+                self.log(f"OCR 自动命名失败：{tail}（已回滚，无半更新状态）")
+                messagebox.showerror("OCR 自动命名", f"命名失败：{tail}")
+                return
+            if canceled:
+                self._restore_ws_snapshot(snap)
+                self._refresh_all()
+                self.log("OCR 自动命名已取消，未保存任何修改。")
+                return
+            # 文档被移除的组不进历史
+            for doc in docs:
+                if self._doc_still_open(doc):
+                    for g in doc.groups:
+                        if g.unit.strip():
+                            self.unit_history.add(g.unit)
+            self._refresh_all()
+            n_conf = sum(1 for d in docs if self._doc_still_open(d)
+                         for g in d.groups if g.need_confirm)
+            if text_layer_only:
+                self.log(f"文本层提取完成：共 {total_g} 组，待确认 {n_conf} 组（结果见右侧面板）。")
+                return
+            self.log(f"OCR 自动命名完成：待确认 {n_conf} 组。")
+            if n_conf:
+                messagebox.showinfo(
+                    "OCR 自动命名完成",
+                    f"共 {total_g} 组，其中 {n_conf} 组存在不确定字段（右侧面板橙色“待确认”标记）。\n"
+                    "请人工确认或修改标题/单位后再导出。",
+                )
+            else:
+                messagebox.showinfo("OCR 自动命名完成", "全部组的标题/单位已提取，无待确认项。")
+
+        self._start_task("ocrname", work, on_done, title="OCR 自动命名（本地）")
 
     def direction_analyze(self):
         if self._busy:
@@ -554,28 +664,46 @@ class App:
         # 几何建议限定在候选页内（组级分析时不显示组外页面）
         sugg = {p: a for p, a in rotation.orientation_suggestions(doc).items() if p in candidates}
         engine = OcrEngine.get()
-        results = []
-        ocr_pages: list[int] = []
-        if engine.available and candidates:
-            # 页面尺寸一致不代表内容正放（横版表格常以侧放方式嵌在纵向页里），
-            # 因此对所有候选页做 OCR 方向分析，而不只分析几何不一致的页面。
-            self._busy = True
-            prog = ProgressDialog(self.root, "识别方向（本地 OCR 方向对比）")
+        if not engine.available:
+            self.log("OCR 不可用，仅按几何尺寸提示方向差异。")
+            self._direction_show_results(doc, candidates, sugg, results=[], scope=scope)
+            return
+        if not candidates:
+            self._direction_show_results(doc, candidates, sugg, results=[], scope=scope)
+            return
+
+        def work(progress, log, cancel):
+            # 所有候选页做 OCR 方向分析（页面尺寸一致不代表内容正放）
+            renderer = PageRenderer(doc.path)  # worker 线程内自建自毁
             try:
-                results = autoname.analyze_directions(
-                    doc, self.renderers[str(doc.path)], candidates,
-                    progress_cb=lambda i, n: prog.set(i, n, "识别方向"),
-                    cancel_cb=lambda: prog.canceled,
+                return autoname.analyze_directions(
+                    doc, renderer, candidates,
+                    progress_cb=lambda i, n: progress(i, n, "识别方向"),
+                    cancel_cb=cancel,
                 )
             finally:
-                self._busy = False
-                prog.destroy()
-            ocr_pages = [
-                r.page for r in results
-                if r.suggested_angle not in (None, 0)
-            ]
-        elif not engine.available:
-            self.log("OCR 不可用，仅按几何尺寸提示方向差异。")
+                renderer.close()
+
+        def on_done(results, canceled, error):
+            self._task_finish()
+            if error:
+                tail = error.splitlines()[-1] if error else "未知错误"
+                self.log(f"方向分析失败：{tail}")
+                messagebox.showerror("识别方向", f"方向分析失败：{tail}")
+                return
+            if canceled:
+                self.log("方向分析已取消。")
+                return
+            self._direction_show_results(doc, candidates, sugg, results=results, scope=scope)
+
+        if not self._start_task("direction", work, on_done, title="识别方向（本地 OCR 方向对比）"):
+            return
+
+    def _direction_show_results(self, doc, candidates, sugg, results, scope: str = ""):
+        ocr_pages: list[int] = [
+            r.page for r in results
+            if r.suggested_angle not in (None, 0)
+        ]
         # OCR 判定内容侧放的页面：询问是否一键摆正（可撤销，仍可手动调整）
         if ocr_pages:
             by_page = {r.page: r for r in results}
@@ -635,32 +763,48 @@ class App:
                 "该功能依赖本地 OCR，当前不可用。\n请按 README 离线安装 OCR 组件后重试。",
             )
             return
-        self._busy = True
-        prog = ProgressDialog(self.root, "复核拆分 / 智能补拆（本地 OCR）")
-        try:
-            statuses = autoname.smart_split_review(
-                doc, self.renderers[str(doc.path)], engine,
-                progress_cb=lambda i, n: prog.set(i, n, "复核拆分"),
-                cancel_cb=lambda: prog.canceled,
-            )
-        finally:
-            self._busy = False
-            prog.destroy()
-        # 双重验证一致（页码重置+标题特征）的页面自动补拆——可撤销。
-        # 拆分边界记录在页面自身（split_before），内容页不会被排除出导出。
-        auto_pages = [s.next_page for s in statuses
-                      if s.status == "auto_split" and s.next_page]
-        if auto_pages:
-            self._push_undo()
-            for p in auto_pages:
-                if 2 <= p <= doc.page_count:
-                    doc.pages[p - 1].split_before = True
-            grouping.refresh_groups(doc)
-            self._refresh_all()
-            self._log_migrate_notes(doc)
-            self.log(f"智能补拆：第 {','.join(map(str, auto_pages))} 页起为新文档"
-                     "（页码重置+标题特征双信号一致，Ctrl+Z 可撤销）")
-        BoundaryDialog(self.root, self, doc, statuses)
+
+        def work(progress, log, cancel):
+            renderer = PageRenderer(doc.path)  # worker 线程内自建自毁
+            try:
+                return autoname.smart_split_review(
+                    doc, renderer, engine,
+                    progress_cb=lambda i, n: progress(i, n, "复核拆分"),
+                    cancel_cb=cancel,
+                )
+            finally:
+                renderer.close()
+
+        def on_done(statuses, canceled, error):
+            self._task_finish()
+            if error:
+                tail = error.splitlines()[-1] if error else "未知错误"
+                self.log(f"复核拆分失败：{tail}")
+                messagebox.showerror("复核拆分", f"复核失败：{tail}")
+                return
+            if canceled:
+                self.log("复核拆分已取消，未做任何修改。")
+                return
+            if not self._doc_still_open(doc):
+                self.log(f"{doc.name} 已从工作区移除，复核结果丢弃。")
+                return
+            # 双重验证一致（页码重置+标题特征）的页面自动补拆——可撤销。
+            # 拆分边界记录在页面自身（split_before），内容页不会被排除出导出。
+            auto_pages = [s.next_page for s in statuses
+                          if s.status == "auto_split" and s.next_page]
+            if auto_pages:
+                self._push_undo()
+                for p in auto_pages:
+                    if 2 <= p <= doc.page_count:
+                        doc.pages[p - 1].split_before = True
+                grouping.refresh_groups(doc)
+                self._refresh_all()
+                self._log_migrate_notes(doc)
+                self.log(f"智能补拆：第 {','.join(map(str, auto_pages))} 页起为新文档"
+                         "（页码重置+标题特征双信号一致，Ctrl+Z 可撤销）")
+            BoundaryDialog(self.root, self, doc, statuses)
+
+        self._start_task("boundary", work, on_done, title="复核拆分 / 智能补拆（本地 OCR）")
 
     # -- 页面操作 --------------------------------------------------------------
 
@@ -732,7 +876,7 @@ class App:
     def export_all(self):
         if self._busy:
             return
-        docs = self.ws.documents
+        docs = list(self.ws.documents)
         if not docs:
             messagebox.showinfo("导出", "请先打开 PDF 文件。")
             return
@@ -763,40 +907,58 @@ class App:
                 return
             opts.strict = False
         self._busy = True
-        prog = ProgressDialog(self.root, "导出")
-        opts.on_log = self.log
-        opts.on_progress = lambda done, total, phase: prog.set(done, total, phase)
-        opts.cancel_check = lambda: prog.canceled
-        try:
-            report = exporter.export_documents(docs, opts)
-        finally:
-            self._busy = False
-            prog.destroy()
-        for doc in docs:
-            for g in doc.groups:
-                if g.unit.strip():
-                    self.unit_history.add(g.unit)
-        self.settings["output_dir"] = out_dir
-        self.settings["template"] = template
-        self._save_settings()
-        ok, fail = len(report.succeeded), len(report.failed)
-        integrity_ok = all(
-            report.src_sha_before.get(k) == report.src_sha_after.get(k)
-            for k in report.src_sha_before
-            if k in report.src_sha_after
-        )
-        coverage_ok = not report.coverage_issues
-        msg = (
-            f"导出完成：成功 {ok} 份，失败 {fail} 份。\n"
-            f"源文件完整性：{'全部一致（SHA-256 校验通过）' if integrity_ok else '异常！请查看日志'}\n"
-            f"页面覆盖率：{'每个有效原页恰好导出一次' if coverage_ok else '异常！存在漏页/重复页，请查看日志'}"
-        )
-        if report.canceled:
-            msg += "\n（已取消，未导出的组不受影响）"
-        self.log(f"导出完成：成功 {ok} 份，失败 {fail} 份。")
-        if fail:
-            self.log(f"导出失败 {fail} 份，详情见上方日志。")
-        ExportDoneDialog(self.root, out_dir, msg)
+        self._update_step_state()
+
+        def work(progress, log, cancel):
+            # worker 线程：export_documents 自建 pypdf 读写对象，不触碰 Tk/渲染器
+            worker_opts = exporter.ExportOptions(
+                template=template, out_dir=out_dir, strict=opts.strict,
+                on_log=log, on_progress=progress, cancel_check=cancel,
+            )
+            return exporter.export_documents(docs, worker_opts)
+
+        def on_done(report, canceled, error):
+            self._task_finish()
+            if error:
+                tail = error.splitlines()[-1] if error else "未知错误"
+                self.log(f"导出失败：{tail}")
+                messagebox.showerror("导出", f"导出过程异常：{tail}\n\n已成功导出的文件保留，源文件未受影响。")
+                return
+            # 报告由 worker 产生，此处仅读（主线程收尾）
+            for doc in docs:
+                if self._doc_still_open(doc):
+                    for g in doc.groups:
+                        if g.unit.strip():
+                            self.unit_history.add(g.unit)
+            self.settings["output_dir"] = out_dir
+            self.settings["template"] = template
+            self._save_settings()
+            ok, fail = len(report.succeeded), len(report.failed)
+            integrity_ok = all(
+                report.src_sha_before.get(k) == report.src_sha_after.get(k)
+                for k in report.src_sha_before
+                if k in report.src_sha_after
+            )
+            coverage_ok = not report.coverage_issues
+            msg = (
+                f"导出完成：成功 {ok} 份，失败 {fail} 份。\n"
+                f"源文件完整性：{'全部一致（SHA-256 校验通过）' if integrity_ok else '异常！请查看日志'}\n"
+                f"页面覆盖率：{'每个有效原页恰好导出一次' if coverage_ok else '异常！存在漏页/重复页，请查看日志'}"
+            )
+            if canceled or report.canceled:
+                done_names = "、".join(r.filename + ".pdf" for r in report.succeeded) or "（无）"
+                msg += (
+                    "\n（已取消，未导出的组不受影响）\n"
+                    f"已验证完成并保留的文件：\n{done_names}"
+                )
+            self.log(f"导出完成：成功 {ok} 份，失败 {fail} 份。")
+            if canceled or report.canceled:
+                self.log(f"导出已取消，已完成文件：{done_names}")
+            if fail:
+                self.log(f"导出失败 {fail} 份，详情见上方日志。")
+            ExportDoneDialog(self.root, out_dir, msg)
+
+        self._start_task("export", work, on_done, title="导出")
 
     # -- 设置 -------------------------------------------------------------------
 
@@ -816,6 +978,13 @@ class App:
         settings.save_settings(self.settings)
 
     def on_close(self):
+        # 后台任务安全终止：先发取消标志，再限时等待 worker 退出，
+        # 避免关窗时 worker 仍在写状态或触碰已销毁的 Tk。
+        if self.tasks.busy:
+            self.tasks.cancel()
+            finished = self.tasks.cancel_and_join(3.0)
+            if not finished:
+                self.log("后台任务未能在 3 秒内退出，强制关闭窗口。")
         try:
             self._save_settings()
         except Exception:

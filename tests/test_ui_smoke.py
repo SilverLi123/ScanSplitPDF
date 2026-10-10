@@ -1,6 +1,8 @@
 """UI 冒烟测试：无 mainloop 驱动完整工作流
-（导入 → 检测 → 分组 → 命名 → 撤销/重做 → 导出），并验证导出保真与源文件不变。"""
+（导入 → 检测 → 分组 → 命名 → 撤销/重做 → 导出），并验证导出保真与源文件不变。
+v1.9：后台任务系统——泵事件循环驱动 worker 完成，并覆盖取消回滚/忙碌守卫/关窗终止。"""
 
+import time
 from pathlib import Path
 
 import pytest
@@ -44,8 +46,21 @@ class FakeProgress:
     def set(self, done, total, phase=""):
         self.done, self.total = done, total
 
+    def winfo_exists(self):
+        return True
+
     def destroy(self):
         pass
+
+
+def pump_until_idle(app, timeout=30.0):
+    """泵 Tk 事件循环直到后台任务收尾完成（v1.9 异步任务的测试驱动器）。"""
+    deadline = time.time() + timeout
+    while app.tasks.busy or app._busy:
+        app.root.update()
+        if time.time() > deadline:
+            raise AssertionError("后台任务未在限时内完成")
+        time.sleep(0.01)
 
 
 @pytest.fixture
@@ -55,6 +70,13 @@ def ui_env(monkeypatch):
     monkeypatch.setattr(ui, "ProgressDialog", FakeProgress)
     monkeypatch.setattr(ui.messagebox, "showinfo", lambda *a, **k: None)
     monkeypatch.setattr(ui.messagebox, "showwarning", lambda *a, **k: None)
+    errors = []
+
+    def _fake_showerror(title, msg=None, **k):
+        errors.append(f"{title}: {msg}")
+
+    monkeypatch.setattr(ui.messagebox, "showerror", _fake_showerror)
+    ui._showerror_log = errors  # 测试可断言"无错误弹窗"
     monkeypatch.setattr(ui.messagebox, "askyesno", lambda *a, **k: True)
     monkeypatch.setattr(ui.messagebox, "askokcancel", lambda *a, **k: True)
     monkeypatch.setattr("scansplit.settings.save_settings", lambda s: None)
@@ -82,8 +104,9 @@ def test_full_workflow(tmp_path, make_scan, ui_env, monkeypatch):
         assert doc.page_count == 5
         assert [(g.start, g.end) for g in doc.groups] == [(1, 5)]
 
-        # 空白检测
+        # 空白检测（v1.9 起为后台任务，泵事件循环至完成）
         app.detect_blank()
+        pump_until_idle(app)
         blanks = [p.src_index for p in doc.pages if p.blank and p.blank.verdict == "blank"]
         assert 1 in blanks and 4 in blanks
 
@@ -105,6 +128,7 @@ def test_full_workflow(tmp_path, make_scan, ui_env, monkeypatch):
 
         # OCR 命名（扫描件无文本层：有 OCR 则识别，无 OCR 则留空待确认）
         app.ocr_name()
+        pump_until_idle(app)
 
         # 命名后的撤销快照必须可序列化（回归：dict 型候选曾致 AttributeError 崩溃）
         app.rotate_pages_in_group(0, 90)
@@ -113,6 +137,7 @@ def test_full_workflow(tmp_path, make_scan, ui_env, monkeypatch):
 
         # 导出（目录已 monkeypatch；空字段时 preflight 提示 → 测试中放行）
         app.export_all()
+        pump_until_idle(app, timeout=60)
         pdfs = sorted(out_dir.glob("*.pdf"))
         assert len(pdfs) == 2
 
@@ -300,3 +325,120 @@ def test_field_level_confirm_in_panel(ui_env, tmp_path, make_scan):
             app.on_close()
         except Exception:
             root.destroy()
+
+
+# -- v1.9 后台任务系统专项 ---------------------------------------------------------
+
+
+def _slow_detect(monkeypatch, hold):
+    """把 blankdetect.detect_document 换成"阻塞到取消标志置位"的假实现，
+    保证取消/关窗测试的确定性（真实检测对 5 页样本太快，无法卡在中间）。"""
+    import scansplit.blankdetect as bd
+
+    def fake(renderer, page_count, params, has_text, progress_cb, cancel_check):
+        progress_cb(0, page_count)  # 与真实进度回调签名一致：(当前页, 总页数)
+        deadline = time.time() + 10
+        while not cancel_check() and time.time() < deadline:
+            time.sleep(0.01)
+        return [None] * page_count
+
+    monkeypatch.setattr(bd, "detect_document", fake)
+    return bd
+
+
+def test_detect_cancel_rolls_back(tmp_path, make_scan, ui_env, monkeypatch):
+    """取消检测不留半更新状态：所有页 blank 保持 None、状态不变。"""
+    from scansplit.ui import App
+
+    _slow_detect(monkeypatch, hold=None)
+    scan = make_scan("cancel.pdf", ["text", "text", "text"])
+    root = _make_root()
+    try:
+        app = App(root)
+        app.import_files([str(scan)])
+        doc = app._active_doc()
+        app.detect_blank()
+        assert app._busy  # 任务已启动（挂起在假检测里等待取消标志）
+        app.tasks.cancel()
+        pump_until_idle(app)
+        assert all(p.blank is None for p in doc.pages)
+        assert doc.status != "analyzed"
+        assert not app._busy and not app.tasks.busy
+        assert app.tasks.last_error is None, app.tasks.last_error
+        assert not ui_env._showerror_log, ui_env._showerror_log
+    finally:
+        try:
+            app.on_close()
+        except Exception:
+            root.destroy()
+
+
+def test_busy_guard_blocks_conflict_ops(tmp_path, make_scan, ui_env, monkeypatch):
+    """任务运行期间：重复触发检测被拦（不产生第二个任务），undo/redo 被守卫。"""
+    from scansplit.ui import App
+
+    _slow_detect(monkeypatch, hold=None)
+    scan = make_scan("busy.pdf", ["text", "text"])
+    root = _make_root()
+    try:
+        app = App(root)
+        app.import_files([str(scan)])
+        app.detect_blank()
+        thread1 = app.tasks._thread
+        app.detect_blank()  # 忙碌中重复触发：应被 _busy 守卫直接 return
+        assert app.tasks._thread is thread1  # 没有第二个任务
+        app.undo()
+        app.redo()
+        app.tasks.cancel()
+        pump_until_idle(app)
+        assert not app.tasks.busy
+    finally:
+        try:
+            app.on_close()
+        except Exception:
+            root.destroy()
+
+
+def test_doc_removed_discards_result(tmp_path, make_scan, ui_env):
+    """文档移除后，旧任务结果按对象身份丢弃（_doc_still_open 防跨文档写入）。"""
+    from scansplit.ui import App
+
+    scan = make_scan("rm.pdf", ["text"])
+    root = _make_root()
+    try:
+        app = App(root)
+        app.import_files([str(scan)])
+        doc = app._active_doc()
+        assert app._doc_still_open(doc)
+        app.remove_doc(0)
+        assert not app._doc_still_open(doc)
+        other = make_scan("rm2.pdf", ["text"])
+        app.import_files([str(other)])
+        assert not app._doc_still_open(doc)  # 新导入的其他文档不能"顶替"旧对象
+    finally:
+        try:
+            app.on_close()
+        except Exception:
+            root.destroy()
+
+
+def test_on_close_joins_running_task(tmp_path, make_scan, ui_env, monkeypatch):
+    """关窗时后台任务在运行：先取消并 join，窗口关闭后 worker 已退出。"""
+    from scansplit.ui import App
+
+    _slow_detect(monkeypatch, hold=None)
+    scan = make_scan("close.pdf", ["text", "text"])
+    root = _make_root()
+    try:
+        app = App(root)
+        app.import_files([str(scan)])
+        app.detect_blank()
+        assert app.tasks.busy
+        app.on_close()  # 内部 cancel_and_join（超时 3 秒）并 destroy root
+        assert not app.tasks.busy  # worker 已在关窗前退出
+    except Exception:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        raise
