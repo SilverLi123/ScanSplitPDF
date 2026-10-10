@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -66,19 +67,36 @@ class App:
 
         tools = ttk.Frame(root, padding=(6, 4))
         tools.pack(fill="x")
-        for text, cmd in [
-            ("打开 PDF…", self.open_dialog),
-            ("检测空白页", self.detect_blank),
-            ("自动分组", self.auto_group_all),
-            ("OCR 自动命名（本地）", self.ocr_name),
-            ("识别方向", self.direction_analyze),
-            ("复核拆分", self.boundary_review_action),
-            ("撤销", self.undo),
-            ("重做", self.redo),
-            ("设置…", self.open_settings),
-            ("导出全部…", self.export_all),
-        ]:
-            ttk.Button(tools, text=text, command=cmd).pack(side="left", padx=2)
+        # 工具栏按工作流分三段（参考 pdf-split-and-rename 的步骤化流程）：
+        # ①拆分 → ②命名/检查 → ③导出；未就绪的按钮自动置灰（见 _update_step_state）。
+        self.tool_btns: dict[str, ttk.Button] = {}
+
+        def tool_section(title: str, cmds: list[tuple[str, str, object]]):
+            ttk.Label(tools, text=title, foreground="#5d6d7e",
+                      font=("Segoe UI", 9, "bold")).pack(side="left", padx=(10, 2))
+            for key, text, cmd in cmds:
+                b = ttk.Button(tools, text=text, command=cmd)
+                b.pack(side="left", padx=2)
+                self.tool_btns[key] = b
+
+        tool_section("① 拆分", [
+            ("open", "打开 PDF…", self.open_dialog),
+            ("detect", "检测空白页", self.detect_blank),
+            ("group", "自动分组", self.auto_group_all),
+        ])
+        tool_section("② 命名 / 检查", [
+            ("ocr", "OCR 自动命名（本地）", self.ocr_name),
+            ("direction", "识别方向", self.direction_analyze),
+            ("review", "复核拆分", self.boundary_review_action),
+        ])
+        tool_section("③ 导出", [
+            ("export", "导出全部…", self.export_all),
+        ])
+        tool_section("其他", [
+            ("undo", "撤销", self.undo),
+            ("redo", "重做", self.redo),
+            ("settings", "设置…", self.open_settings),
+        ])
 
         paned = ttk.PanedWindow(root, orient="horizontal")
         paned.pack(fill="both", expand=True, padx=4, pady=2)
@@ -106,8 +124,14 @@ class App:
 
         bottom = ttk.Frame(root, padding=(6, 0, 6, 4))
         bottom.pack(fill="x")
+        status_row = ttk.Frame(bottom)
+        status_row.pack(fill="x")
         self.status_var = tk.StringVar()
-        ttk.Label(bottom, textvariable=self.status_var, anchor="w").pack(fill="x")
+        ttk.Label(status_row, textvariable=self.status_var, anchor="w").pack(
+            side="left", fill="x", expand=True)
+        self.hint_var = tk.StringVar()
+        ttk.Label(status_row, textvariable=self.hint_var, foreground="#1a5276",
+                  font=("Segoe UI", 9, "bold")).pack(side="right")
         self.log_panel = LogPanel(bottom)
         self.log_panel.pack(fill="x", pady=(2, 0))
 
@@ -148,6 +172,33 @@ class App:
             f"文件 {len(docs)} · 共 {total_pages} 页 · 空白候选 {blanks} · 疑似 {maybes}"
             f" · 分组 {n_groups} · 待确认 {n_conf}{cur}"
         )
+        self._update_step_state(len(docs), blanks + maybes > 0, n_groups, n_conf)
+
+    def _update_step_state(self, n_docs: int, has_blank_analysis: bool, n_groups: int, n_conf: int):
+        """按工作流阶段启用/置灰工具栏按钮，并在状态栏给出“下一步”提示。"""
+        readiness = {
+            "detect": n_docs > 0,
+            "group": n_docs > 0 and has_blank_analysis,
+            "ocr": n_docs > 0 and n_groups > 0,
+            "direction": n_docs > 0 and n_groups > 0,
+            "review": n_docs > 0 and n_groups > 0,
+            "export": n_docs > 0 and n_groups > 0,
+        }
+        for key, ready in readiness.items():
+            btn = self.tool_btns.get(key)
+            if btn is not None:
+                btn.state(["!disabled"] if ready else ["disabled"])
+        if not n_docs:
+            hint = "下一步：打开 PDF（可拖入窗口）"
+        elif not has_blank_analysis:
+            hint = "下一步：检测空白页"
+        elif not n_groups:
+            hint = "下一步：自动分组"
+        elif n_conf:
+            hint = "下一步：确认橙色“待确认”字段，然后导出"
+        else:
+            hint = "下一步：识别方向 / 复核拆分（可选），然后导出全部"
+        self.hint_var.set(hint)
 
     def _refresh_all(self):
         self._rebuild_file_list()
@@ -162,7 +213,7 @@ class App:
             self.groups.set_document(doc)
         else:
             self.thumbs.set_document(None, None)
-            self.preview.clear()
+            self.preview.show_guide()
             self.groups.set_document(None)
         self.update_status()
 
@@ -470,14 +521,31 @@ class App:
         if not doc:
             messagebox.showinfo("识别方向", "请先打开 PDF 文件。")
             return
-        sugg = rotation.orientation_suggestions(doc)
+        candidates = [p for p in range(1, doc.page_count + 1) if p not in doc.separators]
+        self._direction_analyze_pages(doc, candidates)
+
+    def direction_analyze_group(self, gi: int, doc=None):
+        """分组面板入口：只对某一组内的页面做方向分析（显式传 doc，防切换文档误操作）。"""
+        if self._busy:
+            return
+        doc = doc or self._active_doc()
+        if not doc or gi >= len(doc.groups):
+            messagebox.showinfo("识别方向", "请先打开 PDF 文件。")
+            return
+        group = doc.groups[gi]
+        candidates = [p for p in group.pages if p not in doc.separators]
+        self._direction_analyze_pages(
+            doc, candidates, scope=f"文档 {gi + 1}（第 {group.start}-{group.end} 页）")
+
+    def _direction_analyze_pages(self, doc, candidates: list[int], scope: str = ""):
+        # 几何建议限定在候选页内（组级分析时不显示组外页面）
+        sugg = {p: a for p, a in rotation.orientation_suggestions(doc).items() if p in candidates}
         engine = OcrEngine.get()
         results = []
         ocr_pages: list[int] = []
-        if engine.available:
+        if engine.available and candidates:
             # 页面尺寸一致不代表内容正放（横版表格常以侧放方式嵌在纵向页里），
-            # 因此对所有非分隔页做 OCR 方向分析，而不只分析几何不一致的页面。
-            candidates = [p for p in range(1, doc.page_count + 1) if p not in doc.separators]
+            # 因此对所有候选页做 OCR 方向分析，而不只分析几何不一致的页面。
             self._busy = True
             prog = ProgressDialog(self.root, "识别方向（本地 OCR 方向对比）")
             try:
@@ -493,7 +561,7 @@ class App:
                 r.page for r in results
                 if r.suggested_angle not in (None, 0)
             ]
-        else:
+        elif not engine.available:
             self.log("OCR 不可用，仅按几何尺寸提示方向差异。")
         # OCR 判定内容侧放的页面：询问是否一键摆正（可撤销，仍可手动调整）
         if ocr_pages:
@@ -527,7 +595,7 @@ class App:
             else:
                 self.log("未发现几何方向差异的页面。")
             return
-        DirectionDialog(self.root, self, doc, pages, results, sugg)
+        DirectionDialog(self.root, self, doc, pages, results, sugg, scope=scope)
 
     def apply_rotation(self, mapping: dict[int, int], doc=None):
         doc = doc or self._active_doc()
@@ -692,9 +760,10 @@ class App:
         )
         if report.canceled:
             msg += "\n（已取消，未导出的组不受影响）"
-        messagebox.showinfo("导出完成", msg)
+        self.log(f"导出完成：成功 {ok} 份，失败 {fail} 份。")
         if fail:
             self.log(f"导出失败 {fail} 份，详情见上方日志。")
+        ExportDoneDialog(self.root, out_dir, msg)
 
     # -- 设置 -------------------------------------------------------------------
 
@@ -727,11 +796,12 @@ class App:
 
 
 class DirectionDialog(tk.Toplevel):
-    def __init__(self, master, app: App, doc, pages, results, sugg):
+    def __init__(self, master, app: App, doc, pages, results, sugg, scope: str = ""):
         super().__init__(master)
         self.app = app
         self.doc = doc
-        self.title(f"识别方向 — {doc.name}")
+        title_scope = f" — {scope}" if scope else f" — {doc.name}"
+        self.title(f"识别方向{title_scope}")
         self.resizable(False, False)
         ttk.Label(self, text="疑似需要旋转的页面（几何不一致或 OCR 判定内容侧放，常见于横版表格）——请选择旋转角度：",
                   padding=8).pack(anchor="w")
@@ -899,3 +969,25 @@ class SettingsDialog(tk.Toplevel):
         self.app._save_settings()
         self.app.log("设置已保存。新阈值将在下次“检测空白页”时生效。")
         self.destroy()
+
+
+class ExportDoneDialog(tk.Toplevel):
+    """导出完成结果：附“打开输出目录”一键入口（Windows 资源管理器）。"""
+
+    def __init__(self, master, out_dir: str, msg: str):
+        super().__init__(master)
+        self.out_dir = out_dir
+        self.title("导出完成")
+        self.resizable(False, False)
+        self.transient(master)
+        ttk.Label(self, text=msg, padding=16, wraplength=440, justify="left").pack(anchor="w")
+        btns = ttk.Frame(self, padding=(16, 0, 16, 12))
+        btns.pack(fill="x")
+        ttk.Button(btns, text="打开输出目录", command=self._open).pack(side="left")
+        ttk.Button(btns, text="关闭", command=self.destroy).pack(side="right")
+
+    def _open(self):
+        try:
+            os.startfile(self.out_dir)  # Windows 专属：资源管理器打开目录
+        except Exception:
+            pass

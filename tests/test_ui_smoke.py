@@ -19,6 +19,22 @@ def _tk_available() -> bool:
 pytestmark = pytest.mark.skipif(not _tk_available(), reason="无 Tk/显示环境")
 
 
+def _make_root():
+    """cp314 下快速创建/销毁多个 Tk 根偶发 tcl_findLibrary 抖动，重试一次兜底。"""
+    import time
+    import tkinter as tk
+
+    for attempt in range(3):
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            return root
+        except tk.TclError:
+            if attempt == 2:
+                raise
+            time.sleep(0.3)
+
+
 class FakeProgress:
     def __init__(self, *a, **k):
         self.canceled = False
@@ -56,8 +72,7 @@ def test_full_workflow(tmp_path, make_scan, ui_env, monkeypatch):
     monkeypatch.setattr(ui_env.filedialog, "askdirectory", lambda **k: str(out_dir))
 
     src_hash = verify.file_sha256(scan)
-    root = tk.Tk()
-    root.withdraw()
+    root = _make_root()
     try:
         app = App(root)
         # 导入
@@ -120,8 +135,7 @@ def test_preview_zoom_fit_api(ui_env, tmp_path, make_scan):
     from scansplit.ui import App
 
     scan = make_scan("prev.pdf", ["text", "text"])
-    root = tk.Tk()
-    root.withdraw()
+    root = _make_root()
     try:
         app = App(root)
         app.import_files([str(scan)])
@@ -154,8 +168,7 @@ def test_thumb_scroll_redraws(ui_env, tmp_path, make_scan):
     from scansplit.ui import App
 
     scan = make_scan("many.pdf", ["text"] * 12)
-    root = tk.Tk()
-    root.withdraw()
+    root = _make_root()
     try:
         app = App(root)
         app.import_files([str(scan)])
@@ -179,8 +192,7 @@ def test_remove_doc_and_empty_state(ui_env, tmp_path, make_scan):
     from scansplit.ui import App
 
     scan = make_scan("one.pdf", ["text"])
-    root = tk.Tk()
-    root.withdraw()
+    root = _make_root()
     try:
         app = App(root)
         app.import_files([str(scan)])
@@ -191,6 +203,41 @@ def test_remove_doc_and_empty_state(ui_env, tmp_path, make_scan):
         app._refresh_all()  # 空状态刷新不报错
         app.undo()
         app.redo()
+    finally:
+        try:
+            app.on_close()
+        except Exception:
+            root.destroy()
+
+
+def test_step_state_and_guide(ui_env, tmp_path, make_scan):
+    """v1.6：工具栏分步置灰/启用 + 空状态引导页可用。"""
+    import tkinter as tk
+
+    from scansplit.ui import App
+
+    root = _make_root()
+    try:
+        app = App(root)
+        # 无文档：检测/分组/命名/导出全部置灰
+        app._update_step_state(0, False, 0, 0)
+        for key in ("detect", "group", "ocr", "direction", "review", "export"):
+            assert app.tool_btns[key].instate(["disabled"]), key
+        assert "打开 PDF" in app.hint_var.get()
+        # 已分组：后续步骤启用，提示导出/确认
+        app._update_step_state(1, True, 2, 0)
+        for key in ("detect", "group", "ocr", "direction", "review", "export"):
+            assert app.tool_btns[key].instate(["!disabled"]), key
+        # 有待确认字段时提示确认
+        app._update_step_state(1, True, 2, 1)
+        assert "待确认" in app.hint_var.get()
+        # 空状态引导页绘制不报错
+        app.preview.show_guide()
+        # 带文档时 show() 正常回归（引导页不影响预览）
+        scan = make_scan("guide.pdf", ["text"])
+        app.import_files([str(scan)])
+        app.on_page_select(1, preview=True)
+        assert app.preview._photo is not None
     finally:
         try:
             app.on_close()

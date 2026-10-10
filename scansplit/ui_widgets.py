@@ -305,6 +305,32 @@ class PreviewPane(ttk.Frame):
         self.page_lbl.configure(text="第 - / - 页")
         self.rot_lbl.configure(text="")
 
+    def show_guide(self):
+        """无文档时的空状态引导：4 步工作流 + 常用快捷键。"""
+        self.clear()
+        cw = max(self.canvas.winfo_width(), 720)
+        ch = max(self.canvas.winfo_height(), 560)
+        self.canvas.configure(scrollregion=(0, 0, cw, ch))
+        cx = cw // 2
+        y = ch // 2 - 120
+        self.canvas.create_text(cx, y, text="ScanSplit PDF 使用流程",
+                                fill="#ffffff", font=("Segoe UI", 15, "bold"))
+        steps = [
+            "① 打开 PDF —— 点击“打开 PDF…”或直接把文件拖入窗口（可多选）",
+            "② 检测空白页 → 自动分组 —— 空白页自动作为拆分点，可右键微调",
+            "③ OCR 自动命名 → 识别方向 —— 本地离线识别，橙色字段请人工确认",
+            "④ 导出全部 —— 无损保真导出，可随时撤销（Ctrl+Z）",
+        ]
+        for s in steps:
+            y += 38
+            self.canvas.create_text(cx, y, text=s, fill="#e8e8e8", font=("Segoe UI", 11))
+        y += 52
+        self.canvas.create_text(
+            cx, y,
+            text="快捷键：Ctrl+O 打开 · Ctrl+E 导出 · Ctrl+Z / Ctrl+Y 撤销/重做 · ←/→ 翻页 · Delete 标记分隔页",
+            fill="#b0b0b0", font=("Segoe UI", 9),
+        )
+
     def show(self, doc, renderer, page_no: int, zoom: float | None = None):
         if doc is None:
             self.clear()
@@ -404,6 +430,8 @@ class GroupPanel(ttk.LabelFrame):
         self.confirm_lbl = ttk.Label(head, text="", padding=(5, 0))
         self.confirm_lbl.pack(side="left", padx=6)
         ttk.Button(head, text="预览", width=5, command=lambda: self.app.on_page_select(group.start, preview=True)).pack(side="right")
+        ttk.Button(head, text="整组识别方向", width=12,
+                   command=lambda: self.app.direction_analyze_group(gi, self.doc)).pack(side="right", padx=2)
         ttk.Button(head, text="整组+90°", width=8, command=lambda: self.app.rotate_pages_in_group(gi, 90)).pack(side="right", padx=2)
 
         self.title_var = tk.StringVar(value=group.title)

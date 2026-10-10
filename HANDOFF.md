@@ -90,7 +90,7 @@ OCR 组件是本机已装的（RapidOCR + ONNX Runtime + 模型随仓库/包分�
 | `verify.py` | 保真校验 | 内容流哈希 + 图像哈希 + 页面映射；SHA-256 |
 | `model.py` | 数据模型 + 撤销快照 | Workspace.snapshot/restore 是撤销最小单元；**Group 的候选字段有两种形态**（见 §7 坑 9） |
 | `settings.py` | 设置持久化 | zoom/fit_mode 也要保存恢复 |
-| `ui.py` | 主窗口编排 | 撤销/重做、进度对话框、对话框的 doc 绑定（防切换文档误操作，见 §7 坑 4） |
+| `ui.py` | 主窗口编排 | 撤销/重做、进度对话框、对话框的 doc 绑定（防切换文档误操作，见 §7 坑 4）；v1.6 起工具栏按钮经 `self.tool_btns` 管理、`_update_step_state` 按工作流阶段置灰/启用，`direction_analyze_group` 支持组级方向分析 |
 | `ui_widgets.py` | 缩略图条/分组面板/预览 | GroupPanel 按 **dict 风格**消费候选（`c.get("text")`）；缩略图滚动必须 redraw |
 
 `tests/`：14 个测试文件，100 用例。合成数据生成：`tests/samplegen.py`（PDF 级）、
@@ -128,6 +128,7 @@ OCR 准确率报告。
 | v1.3 | 2026-10-09 | bug 复查轮 6 项修复：渲染缓存 512MB 字节预算、对话框 doc 绑定、方向建议跳过分隔页、方向分析无结果反馈、zoom/fit_mode 持久化、编辑时 Ctrl+Z 守卫 |
 | v1.4 | 2026-10-10 | 用户报 3 个 bug：缩略图滚动不重绘；"填报单位：教务办公室"误识别成"自动化学院"（表格标注行规则+噪声过滤）；旋转摆正崩溃（撤销快照 dict/FieldCandidate 形态兼容） |
 | v1.5 | 2026-10-10 | 新增公章（红章）文字提取 ocrseal.py：红色隔离+圆环极坐标展开弧形字；来源"印章"强制待确认 |
+| v1.6 | 2026-10-10 | 体验优化：工具栏分 ①拆分②命名③导出 三段（未就绪置灰 + 状态栏"下一步"提示）；分组面板"整组识别方向"（按组过滤候选页，显式传 doc）；导出完成"打开输出目录"；空状态使用引导页；测试 100→101，补 Tk 创建抖动重试兜底 |
 
 ---
 
@@ -152,6 +153,9 @@ OCR 准确率报告。
 12. **Windows 控制台 + Git Bash 打包**：build.bat 含中文注释，从 Git Bash 经 cmd 调用会因
     编码错乱而失败；直接运行 `.venv\Scripts\python -m PyInstaller scansplit.spec --noconfirm`
     即可。robocopy 部署要 `MSYS_NO_PATHCONV=1`，/MIR 在 Git Bash 里要用 /E /PURGE。
+13. **cp314 快速创建/销毁多个 Tk 根偶发 `tcl_findLibrary` 抖动**（v1.6 后在 UI 冒烟测试中
+    频繁出现）：tests/test_ui_smoke.py 统一走 `_make_root()` 创建并重试兜底；新 UI 测试
+    不要直接 `tk.Tk()`。
 
 ---
 
