@@ -15,6 +15,40 @@ from .model import ScanDocument
 
 CONFIRM_THRESHOLD = 0.55  # 低于此置信度标记"待确认"
 
+# 允许自动确认的单位来源（须有可靠结构证据）：
+# 落款=日期锚定/右下角落款区；文头=红头/页眉或"填报单位："标注；文本层=PDF 内嵌文字。
+# "正文"仅是正文提及（置信度 ×0.6 的弱信号，如句子截断片段），无结构证据，
+# v1.9 起不得仅凭置信度过阈值就自动确认（P1 修复：噪声"为进一步完善各部"0.562 曾过线）。
+# "印章"来源本就强制待确认（可靠性有限），不在此列。
+UNIT_AUTO_CONFIRM_SOURCES = {"落款", "文头", "文本层"}
+
+
+def _unit_auto_confirm(res: NameResult) -> bool:
+    """单位字段是否允许自动确认。
+
+    规则（v1.9 P1 修复）：
+    1. 候选来源必须具有可靠结构证据（UNIT_AUTO_CONFIRM_SOURCES）；
+    2. 置信度不低于 CONFIRM_THRESHOLD；
+    3. 无歧义：若存在另一可靠来源候选、文本不同、且置信度接近（差 < 0.05），
+       交人工裁决。
+    标题字段的确认逻辑不受本函数影响。
+    """
+    best_u = res.best_unit
+    if not best_u or not best_u.text.strip():
+        return False
+    if best_u.source not in UNIT_AUTO_CONFIRM_SOURCES:
+        return False
+    if best_u.confidence < CONFIRM_THRESHOLD:
+        return False
+    for c in res.unit_candidates[1:]:
+        if (
+            c.source in UNIT_AUTO_CONFIRM_SOURCES
+            and c.text.strip() != best_u.text.strip()
+            and best_u.confidence - c.confidence < 0.05
+        ):
+            return False
+    return True
+
 
 @dataclass
 class NameResult:
@@ -172,19 +206,17 @@ def auto_name_groups(
         g.unit_candidates = [c.to_dict() for c in res.unit_candidates]
         # 字段级确认状态（v1.8）：标题与单位分别按置信度判定，
         # 人工编辑单字段只影响该字段的确认状态。
+        # v1.9 P1 修复：单位自动确认增加结构证据来源校验 + 歧义检查
+        # （_unit_auto_confirm），正文噪声不再凭置信度过线直接落盘。
+        # 人工已确认状态不会被此处清除：本函数只在 OCR 命名时写入，
+        # 已有人工编辑的组由 UI 层守卫（本流程启动前提示）。
         g.title_confirmed = bool(
             res.title_candidates
             and best_t
             and best_t.text.strip()
             and best_t.confidence >= CONFIRM_THRESHOLD
         )
-        g.unit_confirmed = bool(
-            res.unit_candidates
-            and best_u
-            and best_u.text.strip()
-            and best_u.confidence >= CONFIRM_THRESHOLD
-            and best_u.source != "印章"  # 印章文字可靠性有限，须人工确认
-        )
+        g.unit_confirmed = _unit_auto_confirm(res)
         results.append(res)
         if progress_cb:
             progress_cb(gi + 1, total)

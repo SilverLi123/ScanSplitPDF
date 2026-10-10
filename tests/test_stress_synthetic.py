@@ -83,3 +83,101 @@ def test_separator_and_end_blanks_split_correctly(make_scan):
         assert [(g.start, g.end) for g in groups] == [(1, 1), (3, 4), (6, 6)]
     finally:
         renderer.close()
+
+
+def test_internal_blank_page_retained_in_export_mapping(make_scan, tmp_path):
+    """内部空白页（压力样本 p23/p58 场景）不得从导出校验集合消失。
+
+    自动分组会把内部空白页标记为分隔页（从输出中排除）——这是当前行为；
+    但人工取消分隔标记后，该页必须重新进入导出映射并出现在输出 PDF 中。
+    本测试按"标准答案"逐页核对输出映射。
+    """
+    from pypdf import PdfReader
+
+    from scansplit import exporter, grouping, verify
+    from scansplit.model import ScanDocument
+    from scansplit.loader import open_document
+
+    scan = make_scan("ib_export.pdf", ["text", "text", "blank", "text", "text"])
+    reader, _ = open_document(scan)
+    doc = ScanDocument(scan, reader, [])
+
+    # 阶段1：自动分组把内部空白页 p3 标记为分隔页 → 输出映射 [1,2,4,5]
+    doc.pages[2].separator = True
+    grouping.refresh_groups(doc)
+    assert doc.separators == {3}
+    opts = exporter.ExportOptions(template="{title}_{unit}", out_dir=tmp_path, strict=False)
+    doc.groups[0].title, doc.groups[0].unit = "文档A", "单位A"
+    doc.groups[1].title, doc.groups[1].unit = "文档B", "单位B"
+    report = exporter.export_documents([doc], opts)
+    assert len(report.succeeded) == 2 and not report.failed
+    page_map = sorted(p for r in report.succeeded for p in r.pages)
+    assert page_map == [1, 2, 4, 5]  # p3 被排除（当前行为基线）
+    assert not report.coverage_issues  # 覆盖率以"非分隔页"为全集，仍通过
+
+    # 阶段2：人工取消分隔标记（压力测试复核路径）→ p3 必须回到输出
+    doc.pages[2].separator = False
+    grouping.refresh_groups(doc)
+    assert [(g.start, g.end) for g in doc.groups] == [(1, 5)]
+    doc.groups[0].title, doc.groups[0].unit = "完整文档", "单位C"
+    out2 = tmp_path / "full"
+    out2.mkdir()
+    opts2 = exporter.ExportOptions(template="{title}_{unit}", out_dir=out2, strict=False)
+    report2 = exporter.export_documents([doc], opts2)
+    assert len(report2.succeeded) == 1 and not report2.failed
+    page_map2 = report2.succeeded[0].pages
+    assert page_map2 == [1, 2, 3, 4, 5]  # 逐页映射：内部空白页保留
+    assert not report2.coverage_issues
+    # 双重校验：输出 PDF 实际页数与映射一致，verify_mapping 无错误
+    out_pdf = report2.succeeded[0].path
+    assert len(PdfReader(str(out_pdf)).pages) == 5
+    assert verify.verify_mapping(scan, out_pdf, page_map2) == []
+
+
+def test_internal_blank_page_retained_in_export_mapping(make_scan, tmp_path):
+    """内部空白页（压力样本 p23/p58 场景）不得从导出校验集合消失。
+
+    自动分组会把内部空白页标记为分隔页（从输出中排除）——这是当前行为；
+    但人工取消分隔标记后，该页必须重新进入导出映射并出现在输出 PDF 中。
+    本测试按"标准答案"逐页核对输出映射。
+    """
+    from pypdf import PdfReader
+
+    from scansplit import exporter, grouping, verify
+    from scansplit.model import ScanDocument
+    from scansplit.loader import open_document
+
+    scan = make_scan("ib_export.pdf", ["text", "text", "blank", "text", "text"])
+    reader, _ = open_document(scan)
+    doc = ScanDocument(scan, reader, [])
+
+    # 阶段1：自动分组把内部空白页 p3 标记为分隔页 → 输出映射 [1,2,4,5]
+    doc.pages[2].separator = True
+    grouping.refresh_groups(doc)
+    assert doc.separators == {3}
+    opts = exporter.ExportOptions(template="{title}_{unit}", out_dir=tmp_path, strict=False)
+    doc.groups[0].title, doc.groups[0].unit = "文档A", "单位A"
+    doc.groups[1].title, doc.groups[1].unit = "文档B", "单位B"
+    report = exporter.export_documents([doc], opts)
+    assert len(report.succeeded) == 2 and not report.failed
+    page_map = sorted(p for r in report.succeeded for p in r.pages)
+    assert page_map == [1, 2, 4, 5]  # p3 被排除（当前行为基线）
+    assert not report.coverage_issues  # 覆盖率以"非分隔页"为全集，仍通过
+
+    # 阶段2：人工取消分隔标记（压力测试复核路径）→ p3 必须回到输出
+    doc.pages[2].separator = False
+    grouping.refresh_groups(doc)
+    assert [(g.start, g.end) for g in doc.groups] == [(1, 5)]
+    doc.groups[0].title, doc.groups[0].unit = "完整文档", "单位C"
+    out2 = tmp_path / "full"
+    out2.mkdir()
+    opts2 = exporter.ExportOptions(template="{title}_{unit}", out_dir=out2, strict=False)
+    report2 = exporter.export_documents([doc], opts2)
+    assert len(report2.succeeded) == 1 and not report2.failed
+    page_map2 = report2.succeeded[0].pages
+    assert page_map2 == [1, 2, 3, 4, 5]  # 逐页映射：内部空白页保留
+    assert not report2.coverage_issues
+    # 双重校验：输出 PDF 实际页数与映射一致，verify_mapping 无错误
+    out_pdf = report2.succeeded[0].path
+    assert len(PdfReader(str(out_pdf)).pages) == 5
+    assert verify.verify_mapping(scan, out_pdf, page_map2) == []

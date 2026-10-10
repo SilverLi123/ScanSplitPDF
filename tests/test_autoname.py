@@ -324,3 +324,83 @@ def test_smart_split_review_cancel_safe(tmp_path):
     finally:
         renderer.close()
     assert statuses == []
+
+
+# -- v1.9 P1 修复：单位自动确认须有可靠结构证据（正文噪声不得过线） -------------
+
+
+def _fc(text, conf, source, reason=""):
+    from scansplit.ocrfields import FieldCandidate
+
+    return FieldCandidate(text, conf, source, reason)
+
+
+def _res(unit_candidates):
+    r = autoname.NameResult(group_index=0)
+    r.unit_candidates = unit_candidates
+    return r
+
+
+def test_body_noise_unit_not_auto_confirmed():
+    """压力样本 P1 场景：正文截断噪声 0.562 过 0.55 阈值，也不得自动确认。"""
+    r = _res([
+        _fc("为进一步完善各部", 0.562, "正文", "首页正文提及"),
+        _fc("相关责任部", 0.556, "正文", "首页正文提及"),
+    ])
+    assert autoname._unit_auto_confirm(r) is False
+
+
+def test_signature_unit_still_auto_confirmed():
+    """正确落款（日期锚定/右下角，有结构证据）仍可自动确认。"""
+    r = _res([
+        _fc("综合事务办公室", 0.741, "落款", "页面下方区域"),
+        _fc("为进一步完善各部", 0.562, "正文", "首页正文提及"),
+    ])
+    assert autoname._unit_auto_confirm(r) is True
+
+
+def test_labeled_table_unit_auto_confirmed():
+    """表格明确"填报单位："标注（文头）仍可自动确认。"""
+    r = _res([
+        _fc("科研管理办公室", 0.822, "文头", "表格填报单位标注"),
+        _fc("责任部", 0.451, "正文", "首页正文提及"),
+    ])
+    assert autoname._unit_auto_confirm(r) is True
+
+
+def test_text_layer_unit_auto_confirmed():
+    """文本层来源（0.85，结构可靠）仍可自动确认。"""
+    r = _res([
+        _fc("信息工程学院", 0.85, "文本层", "末页文本层提取"),
+        _fc("为进一步完善各部", 0.562, "正文", "首页正文提及"),
+    ])
+    assert autoname._unit_auto_confirm(r) is True
+
+
+def test_ambiguous_reliable_candidates_require_manual():
+    """两个可靠来源候选文本不同且置信度接近（差<0.05）→ 待确认，交人工裁决。"""
+    r = _res([
+        _fc("教学质量办公室", 0.70, "落款", "位于日期上方"),
+        _fc("教学质量处", 0.68, "文头", "表格填报单位标注"),
+    ])
+    assert autoname._unit_auto_confirm(r) is False
+
+
+def test_ambiguous_body_candidate_does_not_block_confirm():
+    """正文候选接近不构成歧义（正文本就不可自动确认，不阻断可靠候选）。"""
+    r = _res([
+        _fc("后勤保障办公室", 0.696, "落款", "页面下方区域"),
+        _fc("为进一步完善各部", 0.68, "正文", "首页正文提及"),
+    ])
+    assert autoname._unit_auto_confirm(r) is True
+
+
+def test_below_threshold_unit_not_confirmed():
+    """可靠来源但置信度不足 → 待确认。"""
+    r = _res([_fc("某单位", 0.50, "落款", "页面下方区域")])
+    assert autoname._unit_auto_confirm(r) is False
+
+
+def test_empty_unit_not_confirmed():
+    r = _res([])
+    assert autoname._unit_auto_confirm(r) is False
