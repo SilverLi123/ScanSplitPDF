@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from . import naming, ocrfields, pagenum
+from . import naming, ocr_cache, ocrfields, pagenum
 from .model import ScanDocument
 
 CONFIRM_THRESHOLD = 0.55  # 低于此置信度标记"待确认"
@@ -108,7 +108,7 @@ def _ocr_page_rotation_aware(renderer, idx0: int, engine, width_px: int):
     自动设置页面旋转。img 为与 lines 对应的渲染图像（印章提取用）。
     """
     img = renderer.render(idx0, width_px=width_px, bucket="ocr")
-    lines = engine.recognize(img)
+    lines = ocr_cache.recognize_cached(engine, "cls", renderer, idx0, width_px)
     w, h = img.size
     kind, _frac = ocrfields.line_orientation(lines)
     if kind != "vertical":
@@ -121,7 +121,7 @@ def _ocr_page_rotation_aware(renderer, idx0: int, engine, width_px: int):
     best_lines, best_wh, best_img, best_q = None, None, img, -1.0
     for angle in (90, 270):
         img2 = renderer.render(idx0, width_px=width_px, user_rotation=angle, bucket="ocr-rot")
-        ls = raw.recognize(img2)
+        ls = ocr_cache.recognize_cached(raw, "nocls", renderer, idx0, width_px, angle)
         q = ocrfields.direction_quality({angle: ls})[angle]["quality"]
         if q > best_q:
             best_lines, best_wh, best_img, best_q = ls, img2.size, img2, q
@@ -254,7 +254,7 @@ def analyze_directions(
             if not raw.available:
                 raise RuntimeError(raw.error or "方向分析 OCR 引擎不可用")
             img = renderer.render(p - 1, width_px=1000, user_rotation=0, bucket="ocr4")
-            lines0 = raw.recognize(img)
+            lines0 = ocr_cache.recognize_cached(raw, "nocls", renderer, p - 1, 1000, 0)
             res.qualities[0] = ocrfields.direction_quality({0: lines0})[0]
             kind, frac = ocrfields.line_orientation(lines0)
             cands = (90, 270) if kind == "vertical" else (0, 180)
@@ -264,7 +264,8 @@ def analyze_directions(
                 img = renderer.render(
                     p - 1, width_px=1000, user_rotation=angle, bucket="ocr4"
                 )
-                lines = raw.recognize(img)
+                lines = ocr_cache.recognize_cached(
+                    raw, "nocls", renderer, p - 1, 1000, angle)
                 res.qualities[angle] = ocrfields.direction_quality({angle: lines})[angle]
             best, _ = ocrfields.best_direction({a: res.qualities[a] for a in cands})
             res.suggested_angle = best
