@@ -23,6 +23,9 @@ class ExportOptions:
     on_log: object = None  # callable(str)
     on_progress: object = None  # callable(done, total, phase)
     cancel_check: object = None  # callable() -> bool
+    # 严格导出模式（v1.8 默认开启）：空标题/空单位/存在待确认字段时
+    # preflight 返回阻断项。非严格模式仅用于测试文件，须由用户显式选择。
+    strict: bool = True
 
 
 @dataclass
@@ -31,6 +34,7 @@ class ExportResult:
     doc_name: str
     filename: str = ""
     path: Path | None = None
+    pages: list = field(default_factory=list)  # 实际导出的源页码（1 起始）
     ok: bool = False
     error: str = ""
 
@@ -41,6 +45,7 @@ class ExportReport:
     logs: list[str] = field(default_factory=list)
     src_sha_before: dict = field(default_factory=dict)  # path -> sha256
     src_sha_after: dict = field(default_factory=dict)
+    coverage_issues: dict = field(default_factory=dict)  # doc_name -> [问题]
     canceled: bool = False
 
     @property
@@ -83,8 +88,50 @@ def preflight(docs: list[ScanDocument], opts: ExportOptions) -> list[str]:
                 issues.append(f"{doc.name} 文档{gi + 1}（第{g.start}-{g.end}页）：标题为空")
             if needs_unit and not g.unit.strip():
                 issues.append(f"{doc.name} 文档{gi + 1}（第{g.start}-{g.end}页）：单位为空白")
+            if opts.strict and g.need_confirm:
+                issues.append(
+                    f"{doc.name} 文档{gi + 1}（第{g.start}-{g.end}页）："
+                    "存在待确认字段（标题/单位），严格模式下阻止导出"
+                )
             if g.start < 1 or g.end > doc.page_count or g.start > g.end:
                 issues.append(f"{doc.name} 文档{gi + 1}：页码范围无效（{g.start}-{g.end}）")
+    return issues
+
+
+def coverage_issues(doc: ScanDocument, results: list[ExportResult]) -> list[str]:
+    """全局页面覆盖率校验（v1.8）：每个有效原页（组内页）必须恰好导出一次。
+
+    漏导、重复导出、导出了组外页均视为问题。空白页只要未标记为分隔页，
+    就属于某个分组、必须出现在输出中（防止"内部空白页被误删"）。
+    """
+    expected = sorted(p for g in doc.groups for p in g.pages)
+    exported: list[int] = []
+    for r in results:
+        if r.ok:
+            exported.extend(r.pages or r.group.pages)
+    issues: list[str] = []
+    counts: dict[int, int] = {}
+    for p in exported:
+        counts[p] = counts.get(p, 0) + 1
+    dupes = sorted(p for p, c in counts.items() if c > 1)
+    missing = sorted(set(expected) - set(counts))
+    extra = sorted(set(counts) - set(expected))
+    if missing:
+        issues.append(
+            f"{doc.name}：以下原页未导出（漏页）："
+            + "、".join(str(p) for p in missing[:20])
+            + ("……" if len(missing) > 20 else "")
+        )
+    if dupes:
+        issues.append(
+            f"{doc.name}：以下原页被导出多次（重复）："
+            + "、".join(str(p) for p in dupes[:20])
+        )
+    if extra:
+        issues.append(
+            f"{doc.name}：以下页不在任何分组内却被导出："
+            + "、".join(str(p) for p in extra[:20])
+        )
     return issues
 
 
@@ -124,6 +171,7 @@ def _export_one(
             writer.add_page(page)
         with open(tmp_path, "wb") as f:
             writer.write(f)
+        result.pages = list(range(group.start, group.end + 1))
         # 页码核对
         check = PdfReader(str(tmp_path))
         if len(check.pages) != group.page_count:
@@ -164,6 +212,7 @@ def export_documents(
     for doc in docs:
         report.src_sha_before[str(doc.path)] = verify.file_sha256(doc.path)
         _log(report, opts, f"开始导出 {doc.name}（{len(doc.groups)} 份）")
+        doc_result_start = len(report.results)
         for gi, group in enumerate(doc.groups):
             if report.canceled:
                 break
@@ -179,6 +228,21 @@ def export_documents(
             _log(report, opts, f"[严重] 源文件 {doc.name} 在处理前后哈希不一致！")
         else:
             _log(report, opts, f"源文件 {doc.name} 完整性校验通过（SHA-256 一致）")
+        # 全局页面覆盖率校验（v1.8）：每个有效原页恰好导出一次。
+        # 用户主动取消导致的漏页属预期行为，不算校验失败。
+        if report.canceled:
+            _log(report, opts, f"{doc.name} 导出被取消，跳过页面覆盖率校验。")
+        else:
+            doc_issues = coverage_issues(doc, report.results[doc_result_start:])
+            if doc_issues:
+                report.coverage_issues[doc.name] = doc_issues
+                for msg in doc_issues:
+                    _log(report, opts, f"[严重] 页面覆盖率校验：{msg}")
+            else:
+                _log(
+                    report, opts,
+                    f"页面覆盖率校验通过：{doc.name} 全部 {sum(g.page_count for g in doc.groups)} 个有效页恰好导出一次",
+                )
 
     n_ok = len(report.succeeded)
     n_fail = len(report.failed)

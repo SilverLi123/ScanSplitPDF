@@ -268,3 +268,35 @@ def test_add_split_before_keeps_pages(ui_env, tmp_path, make_scan):
             app.on_close()
         except Exception:
             root.destroy()
+
+
+def test_field_level_confirm_in_panel(ui_env, tmp_path, make_scan):
+    """v1.8 回归：面板里编辑标题只确认标题，单位的待确认状态不被整组清除。"""
+    from scansplit.ui import App
+    from scansplit.ui_widgets import GroupPanel
+
+    scan = make_scan("fl.pdf", ["text", "text"])
+    root = _make_root()
+    try:
+        app = App(root)
+        app.import_files([str(scan)])
+        doc = app._active_doc()
+        g = doc.groups[0]
+        g.title, g.unit = "旧标题", "旧单位"
+        g.title_confirmed = False  # 模拟 OCR 低置信
+        g.unit_confirmed = False
+        panel = GroupPanel(root, app, doc, 0, g, [])
+        panel.title_var.set("新标题")  # 触发 write trace
+        assert g.title == "新标题"
+        assert g.title_confirmed is True
+        assert g.unit_confirmed is False
+        assert g.need_confirm is True  # 单位仍待确认（旧行为：整组被清除）
+        panel.unit_var.set("新单位")
+        assert g.unit == "新单位"
+        assert g.unit_confirmed is True
+        assert g.need_confirm is False
+    finally:
+        try:
+            app.on_close()
+        except Exception:
+            root.destroy()

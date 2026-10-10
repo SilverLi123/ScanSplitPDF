@@ -57,3 +57,57 @@ def test_page_state_split_before_roundtrip_and_compat():
     # v1.6 旧快照无 split_before 键 → 默认 False，不崩
     old = {"src_index": 1, "rotation": 90, "blank": None, "separator": False}
     assert PageState.restore(old).split_before is False
+
+
+def test_field_level_confirm_defaults():
+    """v1.8：字段级确认——无 OCR 结果的空白组不产生待确认噪音。"""
+    g = Group(start=1, end=1)
+    assert g.title_confirmed is True and g.unit_confirmed is True
+    assert g.need_confirm is False
+
+
+def test_field_level_confirm_independent_edit():
+    """v1.8 回归：编辑标题只确认标题，单位待确认状态不受影响（整组清除缺陷）。"""
+    g = Group(start=1, end=1, title="旧标题", unit="旧单位")
+    # 模拟 OCR 后：标题低置信、单位低置信
+    g.title_confirmed = False
+    g.unit_confirmed = False
+    assert g.need_confirm is True
+    # 用户只编辑标题
+    g.title = "新标题"
+    g.title_confirmed = True
+    assert g.need_confirm is True  # 单位仍未确认
+    assert g.title_confirmed is True and g.unit_confirmed is False
+    # 再编辑单位 → 整组确认
+    g.unit = "新单位"
+    g.unit_confirmed = True
+    assert g.need_confirm is False
+
+
+def test_field_level_confirm_legacy_setter():
+    """旧代码整组赋值 g.need_confirm = x 仍然可用（setter 映射两个字段）。"""
+    g = Group(start=1, end=1)
+    g.need_confirm = True
+    assert g.title_confirmed is False and g.unit_confirmed is False
+    g.need_confirm = False
+    assert g.title_confirmed is True and g.unit_confirmed is True
+
+
+def test_field_level_confirm_snapshot_roundtrip():
+    g = Group(start=1, end=2, title="T", unit="U")
+    g.title_confirmed = True
+    g.unit_confirmed = False
+    g2 = Group.restore(g.snapshot())
+    assert g2.title_confirmed is True
+    assert g2.unit_confirmed is False
+    assert g2.need_confirm is True
+
+
+def test_field_level_confirm_old_snapshot_compat():
+    """v1.7 旧快照只有 need_confirm 键 → 按整组语义还原到两个字段。"""
+    old = {"start": 1, "end": 1, "title": "T", "unit": "U", "need_confirm": True}
+    g = Group.restore(old)
+    assert g.title_confirmed is False and g.unit_confirmed is False
+    old2 = {"start": 1, "end": 1, "need_confirm": False}
+    g2 = Group.restore(old2)
+    assert g2.title_confirmed is True and g2.unit_confirmed is True

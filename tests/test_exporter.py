@@ -5,7 +5,13 @@ import pytest
 from pypdf import PdfReader
 
 from scansplit import verify
-from scansplit.exporter import ExportOptions, export_documents, preflight
+from scansplit.exporter import (
+    ExportOptions,
+    ExportResult,
+    coverage_issues,
+    export_documents,
+    preflight,
+)
 from scansplit.grouping import refresh_groups
 from scansplit.loader import open_document
 from scansplit.model import Group, ScanDocument
@@ -181,6 +187,88 @@ def test_encrypted_pdf_refused(tmp_path, make_scan):
         w.write(f)
     with pytest.raises(Exception):
         open_document(enc_path)
+
+
+# -- v1.8 严格导出模式 ----------------------------------------------------------
+
+
+def test_strict_preflight_blocks_unconfirmed_fields(tmp_path, make_scan):
+    """严格模式：待确认字段为阻断项；非严格模式放行（仅建议测试文件）。"""
+    pdf = make_scan("st.pdf", ["text", "blank", "text"])
+    doc = _load_doc(pdf)
+    doc.pages[1].separator = True
+    refresh_groups(doc)
+    for g in doc.groups:
+        g.title, g.unit = "标题", "单位"
+        g.title_confirmed = False  # 模拟 OCR 低置信
+    strict_issues = preflight([doc], ExportOptions(out_dir=tmp_path / "out", strict=True))
+    assert any("待确认" in i for i in strict_issues)
+    soft_issues = preflight([doc], ExportOptions(out_dir=tmp_path / "out", strict=False))
+    assert not any("待确认" in i for i in soft_issues)
+    # 空标题在两种模式下都拦截
+    doc.groups[0].title = ""
+    issues = preflight([doc], ExportOptions(out_dir=tmp_path / "out", strict=False))
+    assert any("标题为空" in i for i in issues)
+
+
+def test_strict_preflight_all_confirmed_passes(tmp_path, make_scan):
+    pdf = make_scan("st2.pdf", ["text"])
+    doc = _load_doc(pdf)
+    doc.groups = [Group(start=1, end=1, title="A", unit="B")]
+    assert preflight([doc], ExportOptions(out_dir=tmp_path / "out", strict=True)) == []
+
+
+# -- v1.8 全局页面覆盖率校验 -----------------------------------------------------
+
+
+def test_coverage_detects_missing_and_duplicate_pages(make_scan):
+    pdf = make_scan("cov.pdf", ["text"] * 6)
+    doc = _load_doc(pdf)
+    doc.groups = [Group(start=1, end=3, title="A", unit="B"), Group(start=5, end=6, title="C", unit="D")]
+    # 只导出了第一组 → 第 5、6 页漏导
+    results = [ExportResult(group=doc.groups[0], doc_name=doc.name, ok=True, pages=[1, 2, 3])]
+    issues = coverage_issues(doc, results)
+    assert any("未导出" in i and "5" in i for i in issues)
+    # 重复导出同一组
+    results2 = [
+        ExportResult(group=doc.groups[0], doc_name=doc.name, ok=True, pages=[1, 2, 3]),
+        ExportResult(group=doc.groups[0], doc_name=doc.name, ok=True, pages=[1, 2, 3]),
+    ]
+    issues2 = coverage_issues(doc, results2)
+    assert any("重复" in i for i in issues2)
+    assert any("未导出" in i and "5" in i for i in issues2)
+
+
+def test_internal_blank_page_not_dropped(tmp_path, make_scan):
+    """v1.8 回归：文档内部空白页（未标记分隔页）必须随组导出，不得被误删。"""
+    pdf = make_scan("ib.pdf", ["text", "blank", "text"])
+    doc = _load_doc(pdf)
+    refresh_groups(doc)  # 无分隔页 → 单组 (1,3)，含内部空白页
+    assert [(g.start, g.end) for g in doc.groups] == [(1, 3)]
+    doc.groups[0].title, doc.groups[0].unit = "含空白页文档", "测试单位"
+    report = export_documents([doc], ExportOptions(out_dir=tmp_path / "out"))
+    assert len(report.succeeded) == 1
+    r = report.succeeded[0]
+    assert len(PdfReader(str(r.path)).pages) == 3  # 空白页在输出里
+    assert not report.coverage_issues  # 覆盖率校验通过：3 页恰好各导出一次
+    # 空白页内容与源一致（未被替换/丢失）
+    src = PdfReader(str(pdf))
+    out = PdfReader(str(r.path))
+    assert verify.page_fingerprint(src.pages[1])["contents_sha"] == \
+        verify.page_fingerprint(out.pages[1])["contents_sha"]
+
+
+def test_export_report_coverage_logged(tmp_path, make_scan, capsys):
+    """正常导出时日志含覆盖率校验通过说明。"""
+    pdf = make_scan("cl.pdf", ["text", "blank", "text"])
+    doc = _load_doc(pdf)
+    doc.pages[1].separator = True
+    refresh_groups(doc)
+    for g in doc.groups:
+        g.title, g.unit = f"T{g.start}", "U"
+    report = export_documents([doc], ExportOptions(out_dir=tmp_path / "out"))
+    assert not report.coverage_issues
+    assert any("覆盖率校验通过" in line for line in report.logs)
 
 
 @pytest.mark.slow

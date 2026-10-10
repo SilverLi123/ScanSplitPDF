@@ -48,7 +48,7 @@ OCR 提取每份的标题与发文单位，按 `标题——单位.pdf` 命名�
 | 虚拟环境 | `D:\vibe-coding\scansplit-pdf\.venv`（依赖见 requirements.lock.txt） |
 | 关键依赖 | pypdf 6.19（读写）、pypdfium2 5.14（渲染）、rapidocr_onnxruntime 1.2.3（OCR，官方 PP-OCRv3 模型）、opencv-python、numpy、PIL、PyInstaller 6.22.3（打包，仅构建时需要） |
 | 运行 | `run.bat` 或 `.venv\Scripts\python -m scansplit.main` |
-| 测试 | `.venv\Scripts\python -m pytest`（当前 100 passed，约 70s；无 OCR/无中文字体的机器上相关用例自动跳过） |
+| 测试 | `.venv\Scripts\python -m pytest`（当前 133 passed，约 85s；无 OCR/无中文字体的机器上相关用例自动跳过） |
 | 打包 | `build.bat`（PyInstaller onedir）→ `dist\ScanSplitPDF\ScanSplitPDF.exe` |
 | 自检 | `dist\ScanSplitPDF\ScanSplitPDF.exe --selftest`（模型 SHA-256、检测/渲染依赖） |
 | 部署 | `D:\ScanSplitPDF\`（先 taskkill 正在运行的 ScanSplitPDF.exe，再 robocopy 镜像；见 §9） |
@@ -78,7 +78,7 @@ OCR 组件是本机已装的（RapidOCR + ONNX Runtime + 模型随仓库/包分�
 | `main.py` | 入口（含 `--selftest`） | 打包路径处理 |
 | `loader.py` | 打开/检查 PDF | 加密（仅空密码）、签名、批注警告在这里 |
 | `blankdetect.py` | 空白页检测 | 多信号（墨迹比/深色比/梯度比/包围盒）+ 三级判定（空白/疑似/有内容）；信号在形态学清洗后的 mask 上算；印章/浅签名 → 疑似（保守）；v1.7 起带稀疏内容页护栏（残留墨迹 ink_floor + 最长深色水平段 dark_run_frac） |
-| `grouping.py` | 分隔页 → 文档组 | 纯函数；连续空白合并、首尾空白不产生空组、内部空白保留；v1.7 起 `compute_groups(separators, n, split_starts)` 支持拆分边界（新文档起点，不吞页） |
+| `grouping.py` | 分隔页 → 文档组 | 纯函数；连续空白合并、首尾空白不产生空组、内部空白保留；v1.7 起 `compute_groups(separators, n, split_starts)` 支持拆分边界（新文档起点，不吞页）；v1.8 起 `refresh_groups` 做人工编辑迁移：唯一对应迁移标题/单位/确认状态，歧义（一对多）保留候选+标记待确认，说明写入 `doc.group_migrate_notes` |
 | `pagenum.py` | 印刷页码提取（v1.7） | 页脚优先/页眉回退；整行模式匹配（纯数字/第X页/X/Y/—X—/Page X），防落款日期误判；reset_points 给页码重置候选。只与标题特征双信号一致才自动拆分 |
 | `render.py` | 页面渲染 | PageRenderer，**必须在同一线程使用（Tk 主线程）**；LRU 缓存 key=(idx0, bucket, width, total_rot)；512MB 字节预算淘汰；`close()` 清缓存 |
 | `ocr.py` | OCR 引擎封装 | OcrEngine（常规，含角度分类 cls）/ OcrEngineNoCls（use_angle_cls=False）；模型完整性校验；**cls 会把 90/180/270° 文字自动翻转识别**（方向分析的根源坑，见 §7） |
@@ -87,14 +87,14 @@ OCR 组件是本机已装的（RapidOCR + ONNX Runtime + 模型随仓库/包分�
 | `autoname.py` | 命名编排、方向分析、边界复核 | `_ocr_page_rotation_aware` 返回 (lines, w, h, img)；侧放页面自动按回正方向识别（**只用于识别，绝不自动改旋转**）；印章来源的 unit 强制 need_confirm；v1.7 起 `smart_split_review` 为"复核拆分/补拆"入口（页码+标题双重验证），旧 `boundary_review` 保留兼容 |
 | `rotation.py` | 旋转目标角度管理 | 只写 `/Rotate`；orientation_suggestions 跳过空白分隔页 |
 | `naming.py` | 文件名模板/非法字符/防覆盖/单位历史 | 空名回退逻辑 |
-| `exporter.py` | 批量导出 | 预检、逐份保真校验、取消、失败不影响其余 |
-| `verify.py` | 保真校验 | 内容流哈希 + 图像哈希 + 页面映射；SHA-256 |
-| `model.py` | 数据模型 + 撤销快照 | Workspace.snapshot/restore 是撤销最小单元；**Group 的候选字段有两种形态**（见 §7 坑 9） |
+| `exporter.py` | 批量导出 | 预检（v1.8 严格模式默认开启：空标题/空单位/待确认字段为阻断项）、逐份保真校验、取消、失败不影响其余；v1.8 起导出后做**全局页面覆盖率校验**（每个有效原页恰好导出一次，漏页/重复页报 [严重]，用户取消则跳过） |
+| `verify.py` | 保真校验 | v1.8 起双指纹：解码内容流哈希 + 原始编码流哈希 + 解码/原始图像哈希 + 页面映射 + SHA-256；**读取异常 fail-closed**（指纹 errors 非空即判失败，绝不静默放行）；区分"解码数据一致"与"原始编码流字节一致"（重编码会报不一致） |
+| `model.py` | 数据模型 + 撤销快照 | Workspace.snapshot/restore 是撤销最小单元；**Group 的候选字段有两种形态**（见 §7 坑 9）；v1.8 起 `need_confirm` 为派生属性（= 标题或单位任一未确认），字段级状态 `title_confirmed`/`unit_confirmed`（默认 True，OCR 命名按置信度回落；setter 兼容旧整组赋值与旧快照） |
 | `settings.py` | 设置持久化 | zoom/fit_mode 也要保存恢复 |
 | `ui.py` | 主窗口编排 | 撤销/重做、进度对话框、对话框的 doc 绑定（防切换文档误操作，见 §7 坑 4）；v1.6 起工具栏按钮经 `self.tool_btns` 管理、`_update_step_state` 按工作流阶段置灰/启用，`direction_analyze_group` 支持组级方向分析 |
 | `ui_widgets.py` | 缩略图条/分组面板/预览 | GroupPanel 按 **dict 风格**消费候选（`c.get("text")`）；缩略图滚动必须 redraw |
 
-`tests/`：14 个测试文件，100 用例。合成数据生成：`tests/samplegen.py`（PDF 级）、
+`tests/`：14 个测试文件，133 用例。合成数据生成：`tests/samplegen.py`（PDF 级）、
 `tests/ocrimg.py`（图像级，含 `make_seal` 公章合成）。`tools/`：模型清单生成、
 OCR 准确率报告。
 
@@ -119,7 +119,7 @@ OCR 准确率报告。
 
 ---
 
-## 6. 版本历史（v0.1 → v1.5）
+## 6. 版本历史（v0.1 → v1.8）
 
 | 版本 | 日期 | 内容 |
 |------|------|------|
@@ -131,6 +131,7 @@ OCR 准确率报告。
 | v1.5 | 2026-10-10 | 新增公章（红章）文字提取 ocrseal.py：红色隔离+圆环极坐标展开弧形字；来源"印章"强制待确认 |
 | v1.6 | 2026-10-10 | 体验优化：工具栏分 ①拆分②命名③导出 三段（未就绪置灰 + 状态栏"下一步"提示）；分组面板"整组识别方向"（按组过滤候选页，显式传 doc）；导出完成"打开输出目录"；空状态使用引导页；测试 100→101，补 Tk 创建抖动重试兜底 |
 | v1.7 | 2026-10-10 | 智能补拆（无空白页场景自动化）：新增 pagenum.py（印刷页码提取+页码重置信号）；autoname.smart_split_review 双重验证（页码重置+标题特征双信号一致才自动补拆，单信号仅提示）；**拆分边界 split_before 概念**（记录在起点页自身，内容页不被吞）；修复稀疏内容页误判空白（一行文字页墨迹比被腐蚀到 0.01% 低于阈值 → 新增残留墨迹+最长深色水平段双护栏，降级"疑似"）；修复复核拆分在无空白页场景丢前一页的缺陷；测试 101→111 |
+| v1.8 | 2026-10-10 | 可靠性交付加固：①**字段级确认状态**（Group.title_confirmed/unit_confirmed，need_confirm 变派生属性）——修复"编辑标题就清除整组待确认"缺陷，印章单位仍强制待确认；②refresh_groups 人工编辑迁移（唯一对应迁移、歧义保留候选+待确认，绝不静默丢失，说明经 UI 日志转述）；③verify 双指纹（解码+原始编码流）与读取异常 fail-closed；④exporter 全局页面覆盖率校验（每个有效原页恰好导出一次，防内部空白页误删）+ **严格导出模式**（默认开启，空标题/空单位/待确认阻断，用户显式选择非严格模式仅限测试文件）；测试 116→133 |
 
 ---
 
@@ -168,6 +169,15 @@ OCR 准确率报告。
     （`ink_floor_blank_pct` 清洗后残留 + `dark_run_frac` 最长深色水平段占页宽比，
     文字笔画 ~2.6% vs 噪点 0.3%）→ 此类页面降级"疑似"。调整这两个参数前先跑
     test_blankdetect 全部用例。
+16. **need_confirm 是派生属性，不能当普通字段重新赋值后另行保存**（v1.8）：它 = 标题或
+    单位任一未确认。要改确认状态请操作 `title_confirmed`/`unit_confirmed`；整组赋值
+    `g.need_confirm = x` 走 setter（映射到两个字段），仅为旧代码兼容保留。快照兼容：
+    旧快照只有 need_confirm 键时按整组语义还原。
+17. **refresh_groups 的迁移只在"唯一对应"时安全**：新组↔旧组必须一对一（按页重叠判定）
+    才迁移标题/单位；一对多（拆组/并组）属歧义——不猜标题，合并候选并强制待确认。
+    迁移/歧义说明写入 `doc.group_migrate_notes`，UI 用 `_log_migrate_notes` 转述。
+    verify 的指纹含 errors 列表：**任何读取异常都 fail-closed 判失败**，不要把
+    errors 静默吞掉"优化"掉。
 
 ---
 

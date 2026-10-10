@@ -85,19 +85,25 @@ def test_maybe_pages_not_auto_separator(make_scan):
     assert [(g.start, g.end) for g in groups] == [(1, 3)]
 
 
-def test_group_names_preserved_across_refresh(make_scan):
-    pdf = make_scan("n.pdf", ["text", "blank", "text"])
+def test_group_names_migrate_on_unique_mapping(make_scan):
+    """v1.8：分组边界调整后，唯一对应关系的旧组人工命名应迁移（不静默丢失）。"""
+    pdf = make_scan("n.pdf", ["text", "text", "text"])
     reader, warnings = open_document(pdf)
     doc = ScanDocument(pdf, reader, warnings)
-    doc.pages[1].separator = True
+    doc.pages[2].separator = True
     groups = refresh_groups(doc)
     groups[0].title = "报告"
     groups[0].unit = "教务处"
-    doc.pages[1].separator = False
+    groups[0].title_confirmed = True  # 人工编辑
+    # 拆分点从第 3 页移到第 1 页：旧组 (1,2) 与新组 (2,3) 唯一对应
+    doc.pages[2].separator = False
     doc.pages[0].separator = True
     refresh_groups(doc)
-    # 原组 (1,1) 变成了 (2,2)… 名称不应错误迁移到不同的页范围
-    assert all(g.title == "" for g in doc.groups)
+    assert [(g.start, g.end) for g in doc.groups] == [(2, 3)]
+    g = doc.groups[0]
+    assert g.title == "报告" and g.unit == "教务处"
+    assert g.title_confirmed is True  # 人工确认状态随迁移保留
+    assert any("沿用原第 1-2 页分组" in n for n in doc.group_migrate_notes)
 
 
 def test_compute_groups_split_starts_keep_pages():
@@ -122,3 +128,54 @@ def test_separator_and_split_start_mixed_doc():
     assert groups == [(1, 2), (4, 4), (5, 6)]
     # 无一页丢失（(4,4) 单页组展开时注意去重）
     assert sorted({p for g in groups for p in g}) == [1, 2, 4, 5, 6]
+
+
+def test_migration_ambiguous_split_keeps_candidates(make_scan):
+    """v1.8：旧组被一拆为二时存在歧义——不猜标题，候选保留 + 待确认，绝不静默丢失。"""
+    pdf = make_scan("am.pdf", ["text"] * 6)
+    reader, warnings = open_document(pdf)
+    doc = ScanDocument(pdf, reader, warnings)
+    groups = refresh_groups(doc)  # 单组 (1,6)
+    groups[0].title = "长报告"
+    groups[0].unit = "教务处"
+    groups[0].title_candidates = [
+        {"text": "长报告", "confidence": 0.9, "source": "标题", "reason": ""}
+    ]
+    groups[0].unit_candidates = [
+        {"text": "教务处", "confidence": 0.8, "source": "落款", "reason": ""}
+    ]
+    # 第 4 页改为分隔页：旧组 (1,6) 拆成 (1,3) 与 (5,6)（第 4 页被排除），对应关系歧义
+    doc.pages[3].separator = True
+    refresh_groups(doc)
+    assert [(g.start, g.end) for g in doc.groups] == [(1, 3), (5, 6)]
+    for g in doc.groups:
+        assert g.title == "" and g.unit == ""  # 不替用户做主
+        assert g.title_confirmed is False and g.unit_confirmed is False
+        assert g.need_confirm is True
+        assert g.title_candidates and g.unit_candidates  # 候选保留供复核
+        assert g.title_candidates[0]["text"] == "长报告"
+    assert any("对应关系不唯一" in n for n in doc.group_migrate_notes)
+
+
+def test_migration_two_old_groups_merge_unique(make_scan):
+    """v1.8：两个旧组合并为一个新组（取消分隔页）——歧义时候选合并保留。"""
+    pdf = make_scan("mg.pdf", ["text", "text", "text"])
+    reader, warnings = open_document(pdf)
+    doc = ScanDocument(pdf, reader, warnings)
+    doc.pages[1].separator = True
+    groups = refresh_groups(doc)
+    assert [(g.start, g.end) for g in groups] == [(1, 1), (3, 3)]
+    groups[0].title = "前半"
+    groups[1].title = "后半"
+    groups[0].title_candidates = [{"text": "前半", "confidence": 0.9, "source": "标题", "reason": ""}]
+    groups[1].title_candidates = [{"text": "后半", "confidence": 0.9, "source": "标题", "reason": ""}]
+    # 取消分隔页 → 新组 (1,3) 同时重叠两个旧组 → 歧义
+    doc.pages[1].separator = False
+    refresh_groups(doc)
+    assert [(g.start, g.end) for g in doc.groups] == [(1, 3)]
+    g = doc.groups[0]
+    assert g.need_confirm is True
+    assert g.title == "" and g.unit == ""
+    assert {c["text"] for c in g.title_candidates} == {"前半", "后半"}
+    assert any("对应关系不唯一" in n for n in doc.group_migrate_notes)
+

@@ -170,12 +170,20 @@ def auto_name_groups(
             g.unit_conf = best_u.confidence if best_u else None
         g.title_candidates = [c.to_dict() for c in res.title_candidates]
         g.unit_candidates = [c.to_dict() for c in res.unit_candidates]
-        g.need_confirm = (
-            not res.title_candidates
-            or not res.unit_candidates
-            or (best_t and best_t.confidence < CONFIRM_THRESHOLD)
-            or (best_u and best_u.confidence < CONFIRM_THRESHOLD)
-            or (best_u and best_u.source == "印章")  # 印章文字可靠性有限，须人工确认
+        # 字段级确认状态（v1.8）：标题与单位分别按置信度判定，
+        # 人工编辑单字段只影响该字段的确认状态。
+        g.title_confirmed = bool(
+            res.title_candidates
+            and best_t
+            and best_t.text.strip()
+            and best_t.confidence >= CONFIRM_THRESHOLD
+        )
+        g.unit_confirmed = bool(
+            res.unit_candidates
+            and best_u
+            and best_u.text.strip()
+            and best_u.confidence >= CONFIRM_THRESHOLD
+            and best_u.source != "印章"  # 印章文字可靠性有限，须人工确认
         )
         results.append(res)
         if progress_cb:

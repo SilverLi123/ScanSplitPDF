@@ -473,8 +473,8 @@ class GroupPanel(ttk.LabelFrame):
         self.fname_lbl = ttk.Label(r3, text="", foreground="#1a6b3c", font=("Segoe UI", 9))
         self.fname_lbl.pack(side="left", padx=4)
 
-        self.title_var.trace_add("write", self._on_change)
-        self.unit_var.trace_add("write", self._on_change)
+        self.title_var.trace_add("write", lambda *a, f="title": self._on_change(f))
+        self.unit_var.trace_add("write", lambda *a, f="unit": self._on_change(f))
         self._loading = False
         self._update_filename()
         self._update_confirm_badge()
@@ -492,22 +492,34 @@ class GroupPanel(ttk.LabelFrame):
             s += " · 待确认"
         return s
 
-    def _on_change(self, *a):
+    def _on_change(self, field_name: str, *a):
+        """字段级确认（v1.8）：编辑哪个字段只确认哪个字段，
+        另一个字段的人工待确认状态不受影响。"""
         if self._loading:
             return
-        self.group.title = self.title_var.get().strip()
-        self.group.unit = self.unit_var.get().strip()
-        if self.group.need_confirm:
-            self.group.need_confirm = False  # 人工编辑即视为确认
-            self._update_confirm_badge()
-            self.app.update_status()
+        if field_name == "title":
+            self.group.title = self.title_var.get().strip()
+            self.group.title_confirmed = True
+        else:
+            self.group.unit = self.unit_var.get().strip()
+            self.group.unit_confirmed = True
+        self._update_confirm_badge()
+        self.app.update_status()
         self._update_filename()
 
     def _update_confirm_badge(self):
-        if self.group.need_confirm:
-            self.confirm_lbl.configure(text="待确认", background="#d68910", foreground="#ffffff")
-        else:
+        if not self.group.need_confirm:
             self.confirm_lbl.configure(text="已确认", background="#1e8449", foreground="#ffffff")
+        else:
+            pending = []
+            if not self.group.title_confirmed:
+                pending.append("标题")
+            if not self.group.unit_confirmed:
+                pending.append("单位")
+            self.confirm_lbl.configure(
+                text=f"{'、'.join(pending)}待确认",
+                background="#d68910", foreground="#ffffff",
+            )
 
     def _update_filename(self):
         name = naming.build_filename(

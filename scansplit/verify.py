@@ -28,8 +28,11 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _contents_bytes(page) -> bytes:
-    """页面全部内容流的原始字节（/Contents 为数组时按顺序拼接）。"""
+def _contents_bytes(page, errors: list[str] | None = None) -> bytes:
+    """页面全部内容流的解码字节（/Contents 为数组时按顺序拼接）。
+
+    读取异常时记录到 errors（fail-closed：调用方据此判失败），绝不静默放行。
+    """
     c = page.get("/Contents", None)
     if c is None:
         return b""
@@ -37,12 +40,52 @@ def _contents_bytes(page) -> bytes:
         if isinstance(c, ArrayObject):
             return b"".join(c[i].get_data() for i in range(len(c)))
         return c.get_data()
-    except Exception:
+    except Exception as e:
+        if errors is not None:
+            errors.append(f"内容流读取异常：{e}")
         return b""
 
 
-def _collect_images(res, depth: int = 0, seen: set | None = None) -> list[bytes]:
-    """收集页面资源里的嵌入图像原始字节（递归 Form XObject，深度受限）。"""
+def _raw_stream_bytes(obj, errors: list[str] | None = None) -> bytes | None:
+    """流的原始编码字节（未经过滤器解码）。不可得时返回 None（跳过该项校验）。"""
+    try:
+        target = obj.get_object() if hasattr(obj, "get_object") else obj
+        raw = getattr(target, "_data", None)
+        if isinstance(raw, (bytes, bytearray)):
+            return bytes(raw)
+    except Exception as e:
+        if errors is not None:
+            errors.append(f"原始流读取异常：{e}")
+    return None
+
+
+def _contents_raw_sha(page, errors: list[str] | None = None) -> str | None:
+    """内容流原始编码字节的哈希；任何组成流不可得时返回 None。"""
+    c = page.get("/Contents", None)
+    if c is None:
+        return _sha(b"")
+    try:
+        if isinstance(c, ArrayObject):
+            parts = []
+            for i in range(len(c)):
+                raw = _raw_stream_bytes(c[i], errors)
+                if raw is None:
+                    return None
+                parts.append(raw)
+            return _sha(b"".join(parts))
+        raw = _raw_stream_bytes(c, errors)
+        return _sha(raw) if raw is not None else None
+    except Exception as e:
+        if errors is not None:
+            errors.append(f"内容流原始字节读取异常：{e}")
+        return None
+
+
+def _collect_images(res, errors: list[str] | None = None, depth: int = 0, seen: set | None = None) -> list[bytes]:
+    """收集页面资源里的嵌入图像原始字节（递归 Form XObject，深度受限）。
+
+    读取异常记录到 errors（fail-closed），不再静默跳过。
+    """
     out: list[bytes] = []
     if res is None or depth > 3:
         return out
@@ -55,7 +98,9 @@ def _collect_images(res, depth: int = 0, seen: set | None = None) -> list[bytes]
     for name in names:
         try:
             obj = xo[name].get_object()
-        except Exception:
+        except Exception as e:
+            if errors is not None:
+                errors.append(f"图像资源读取异常：{e}")
             continue
         if id(obj) in seen:
             continue
@@ -67,30 +112,89 @@ def _collect_images(res, depth: int = 0, seen: set | None = None) -> list[bytes]
         if subtype == "/Image":
             try:
                 out.append(obj.get_data())
-            except Exception:
-                pass
+            except Exception as e:
+                if errors is not None:
+                    errors.append(f"图像解码读取异常：{e}")
         elif subtype == "/Form":
             try:
-                out.extend(_collect_images(obj.get("/Resources"), depth + 1, seen))
-            except Exception:
-                pass
+                out.extend(_collect_images(obj.get("/Resources"), errors, depth + 1, seen))
+            except Exception as e:
+                if errors is not None:
+                    errors.append(f"Form 资源读取异常：{e}")
+    return out
+
+
+def _image_raw_shas(res, errors: list[str] | None = None, depth: int = 0, seen: set | None = None) -> list[str] | None:
+    """嵌入图像原始编码字节哈希列表；任何图像原始流不可得时返回 None。"""
+    out: list[str] = []
+    if res is None or depth > 3:
+        return out
+    if seen is None:
+        seen = set()
+    try:
+        xo = res.get("/XObject")
+    except Exception as e:
+        if errors is not None:
+            errors.append(f"资源字典读取异常：{e}")
+        return None
+    if not xo:
+        return out
+    for name in list(xo.keys()):
+        try:
+            obj = xo[name].get_object()
+        except Exception as e:
+            if errors is not None:
+                errors.append(f"图像资源读取异常：{e}")
+            continue
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        try:
+            subtype = obj.get("/Subtype")
+        except Exception:
+            subtype = None
+        if subtype == "/Image":
+            raw = _raw_stream_bytes(obj, errors)
+            if raw is None:
+                return None
+            out.append(_sha(raw))
+        elif subtype == "/Form":
+            sub = _image_raw_shas(obj.get("/Resources"), errors, depth + 1, seen)
+            if sub is None:
+                return None
+            out.extend(sub)
     return out
 
 
 def page_fingerprint(page) -> dict:
-    """页面的内容指纹：尺寸 + 内容流哈希 + 嵌入图像哈希列表。"""
+    """页面的内容指纹：尺寸 + 解码内容流哈希 + 原始编码流哈希 + 嵌入图像哈希 + 读取异常。
+
+    errors 非空表示存在读取异常（fail-closed：校验方应判失败）。
+    """
+    errors: list[str] = []
     try:
         mb = page.mediabox
         mediabox = [round(float(mb.left), 1), round(float(mb.bottom), 1),
                     round(float(mb.right), 1), round(float(mb.top), 1)]
-    except Exception:
+    except Exception as e:
         mediabox = None
-    images = _collect_images(page.get("/Resources", None))
+        errors.append(f"页面尺寸读取异常：{e}")
+    try:
+        res = page.get("/Resources", None)
+    except Exception as e:
+        res = None
+        errors.append(f"资源字典读取异常：{e}")
+    images = _collect_images(res, errors)
+    image_raw_shas = _image_raw_shas(res, errors)
+    contents_raw_sha = _contents_raw_sha(page, errors)
     return {
         "mediabox": mediabox,
-        "contents_sha": _sha(_contents_bytes(page)),
+        "contents_sha": _sha(_contents_bytes(page, errors)),
+        "contents_raw_sha": contents_raw_sha,
         "image_shas": [_sha(d) for d in images],
+        "image_raw_shas": image_raw_shas,
         "image_count": len(images),
+        "errors": errors,
     }
 
 
@@ -120,9 +224,27 @@ def verify_mapping(src_path: str | Path, out_path: str | Path, page_map: list[in
         except Exception as e:
             issues.append(f"第 {out_idx + 1} 页（源第 {src_page} 页）指纹计算失败：{e}")
             continue
+        # fail-closed：任何读取异常直接判失败，绝不在信息不全时放行
+        if f_src["errors"] or f_out["errors"]:
+            detail = "；".join((f_src["errors"] + f_out["errors"])[:3])
+            issues.append(
+                f"第 {out_idx + 1} 页（源第 {src_page} 页）内容流/图像资源读取异常，"
+                f"无法确认保真：{detail}"
+            )
+            continue
         if f_src["contents_sha"] != f_out["contents_sha"]:
             issues.append(
-                f"第 {out_idx + 1} 页（源第 {src_page} 页）内容流不一致"
+                f"第 {out_idx + 1} 页（源第 {src_page} 页）解码内容流不一致"
+            )
+        elif (
+            f_src["contents_raw_sha"] is not None
+            and f_out["contents_raw_sha"] is not None
+            and f_src["contents_raw_sha"] != f_out["contents_raw_sha"]
+        ):
+            # 解码数据一致但原始编码流字节不同（如流被重新压缩/重组）
+            issues.append(
+                f"第 {out_idx + 1} 页（源第 {src_page} 页）原始编码流字节不一致"
+                "（解码数据一致，疑似被重编码）"
             )
         if f_src["image_count"] != f_out["image_count"]:
             issues.append(
@@ -131,7 +253,16 @@ def verify_mapping(src_path: str | Path, out_path: str | Path, page_map: list[in
             )
         elif sorted(f_src["image_shas"]) != sorted(f_out["image_shas"]):
             issues.append(
-                f"第 {out_idx + 1} 页（源第 {src_page} 页）嵌入图像数据不一致"
+                f"第 {out_idx + 1} 页（源第 {src_page} 页）解码图像数据不一致"
+            )
+        elif (
+            f_src["image_raw_shas"] is not None
+            and f_out["image_raw_shas"] is not None
+            and sorted(f_src["image_raw_shas"]) != sorted(f_out["image_raw_shas"])
+        ):
+            issues.append(
+                f"第 {out_idx + 1} 页（源第 {src_page} 页）嵌入图像原始编码流不一致"
+                "（解码数据一致，疑似被重编码）"
             )
         if f_src["mediabox"] != f_out["mediabox"] and f_src["mediabox"] is not None:
             issues.append(

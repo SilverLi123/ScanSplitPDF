@@ -84,7 +84,10 @@ class Group:
     unit_conf: float | None = None
     title_candidates: list = field(default_factory=list)  # [FieldCandidate]
     unit_candidates: list = field(default_factory=list)
-    need_confirm: bool = False  # 提取结果不确定 → UI 标记"待确认"
+    # 字段级确认状态（v1.8）：True = 该字段无需人工复核。
+    # 默认 True：无 OCR 结果时不产生"待确认"噪音；自动命名后按置信度回落。
+    title_confirmed: bool = True
+    unit_confirmed: bool = True
 
     @property
     def page_count(self) -> int:
@@ -93,6 +96,17 @@ class Group:
     @property
     def pages(self) -> list[int]:
         return list(range(self.start, self.end + 1))
+
+    @property
+    def need_confirm(self) -> bool:
+        """任一字段未确认即整组待确认（字段级状态的派生值）。"""
+        return not (self.title_confirmed and self.unit_confirmed)
+
+    @need_confirm.setter
+    def need_confirm(self, value: bool) -> None:
+        """兼容旧代码/旧快照的整组赋值：True = 两个字段都标记待确认。"""
+        self.title_confirmed = not value
+        self.unit_confirmed = not value
 
     def snapshot(self) -> dict:
         def _norm(cands: list) -> list:
@@ -104,14 +118,23 @@ class Group:
             "title_conf": self.title_conf, "unit_conf": self.unit_conf,
             "title_candidates": _norm(self.title_candidates),
             "unit_candidates": _norm(self.unit_candidates),
-            "need_confirm": self.need_confirm,
+            "title_confirmed": self.title_confirmed,
+            "unit_confirmed": self.unit_confirmed,
+            "need_confirm": self.need_confirm,  # 兼容旧版读取
         }
 
     @staticmethod
     def restore(d: dict) -> "Group":
         g = Group(start=d["start"], end=d["end"], title=d.get("title", ""),
                   unit=d.get("unit", ""), title_conf=d.get("title_conf"),
-                  unit_conf=d.get("unit_conf"), need_confirm=d.get("need_confirm", False))
+                  unit_conf=d.get("unit_conf"))
+        # 字段级确认状态；旧快照仅有 need_confirm 时按整组语义还原
+        tc = d.get("title_confirmed")
+        uc = d.get("unit_confirmed")
+        if tc is None or uc is None:
+            tc = uc = not d.get("need_confirm", False)
+        g.title_confirmed = bool(tc)
+        g.unit_confirmed = bool(uc)
         # 候选以 dict 形态存储（与 auto_name_groups 写入、UI 面板读取一致）
         g.title_candidates = [dict(x) for x in d.get("title_candidates", [])]
         g.unit_candidates = [dict(x) for x in d.get("unit_candidates", [])]
@@ -129,6 +152,7 @@ class ScanDocument:
             PageState(src_index=i + 1) for i in range(len(reader.pages))
         ]
         self.groups: list[Group] = []
+        self.group_migrate_notes: list[str] = []  # refresh_groups 的迁移/歧义说明
         self.status = "loaded"  # loaded | analyzed | grouped | exported | error
         self.error: Optional[str] = None
 

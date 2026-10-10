@@ -423,6 +423,11 @@ class App:
             "建议点击“复核拆分”对拆分边界做双重验证。",
         )
 
+    def _log_migrate_notes(self, doc):
+        """转述 refresh_groups 的迁移/歧义说明（v1.8：人工编辑不静默丢失）。"""
+        for note in getattr(doc, "group_migrate_notes", None) or []:
+            self.log(f"分组调整：{note}")
+
     def set_separator(self, pages: list[int], value: bool):
         doc = self._active_doc()
         if not doc:
@@ -433,6 +438,7 @@ class App:
                 doc.pages[p - 1].separator = value
         grouping.refresh_groups(doc)
         self._refresh_all()
+        self._log_migrate_notes(doc)
         self.log(f"第 {','.join(map(str, sorted(pages)))} 页：{'标记为分隔页' if value else '取消分隔标记'}")
 
     def add_split_before(self, page_no: int, doc=None):
@@ -444,6 +450,7 @@ class App:
         doc.pages[page_no - 1].split_before = True
         grouping.refresh_groups(doc)
         self._refresh_all()
+        self._log_migrate_notes(doc)
         self.log(f"已在第 {page_no} 页前新增拆分点")
 
     def show_blank_detail(self, page_no: int):
@@ -650,6 +657,7 @@ class App:
                     doc.pages[p - 1].split_before = True
             grouping.refresh_groups(doc)
             self._refresh_all()
+            self._log_migrate_notes(doc)
             self.log(f"智能补拆：第 {','.join(map(str, auto_pages))} 页起为新文档"
                      "（页码重置+标题特征双信号一致，Ctrl+Z 可撤销）")
         BoundaryDialog(self.root, self, doc, statuses)
@@ -739,17 +747,21 @@ class App:
         if not out_dir:
             return
         template = self.template_var.get() or naming.DEFAULT_TEMPLATE
-        opts = exporter.ExportOptions(template=template, out_dir=out_dir)
+        opts = exporter.ExportOptions(template=template, out_dir=out_dir, strict=True)
         issues = exporter.preflight(docs, opts)
         if issues:
+            # 严格模式（v1.8 默认）：空标题/空单位/待确认字段为阻断项，
+            # 仅在用户显式选择"非严格模式"后放行（面向测试文件）。
             if not messagebox.askyesno(
-                "导出前检查发现问题",
-                "以下问题可能导致导出失败或使用占位文件名：\n\n"
+                "严格导出检查未通过",
+                "以下分组存在阻断项（空标题、空单位或存在待确认字段）：\n\n"
                 + "\n".join(issues[:15])
                 + ("\n……" if len(issues) > 15 else "")
-                + "\n\n是否仍然继续导出？",
+                + "\n\n【正式导出】请先补全并确认标题/单位后重试。\n"
+                "是否改用【非严格模式】继续导出？（仅建议用于测试文件）",
             ):
                 return
+            opts.strict = False
         self._busy = True
         prog = ProgressDialog(self.root, "导出")
         opts.on_log = self.log
@@ -773,9 +785,11 @@ class App:
             for k in report.src_sha_before
             if k in report.src_sha_after
         )
+        coverage_ok = not report.coverage_issues
         msg = (
             f"导出完成：成功 {ok} 份，失败 {fail} 份。\n"
-            f"源文件完整性：{'全部一致（SHA-256 校验通过）' if integrity_ok else '异常！请查看日志'}"
+            f"源文件完整性：{'全部一致（SHA-256 校验通过）' if integrity_ok else '异常！请查看日志'}\n"
+            f"页面覆盖率：{'每个有效原页恰好导出一次' if coverage_ok else '异常！存在漏页/重复页，请查看日志'}"
         )
         if report.canceled:
             msg += "\n（已取消，未导出的组不受影响）"
