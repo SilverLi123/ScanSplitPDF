@@ -281,15 +281,66 @@ def merge_unit_candidates(first: list[FieldCandidate], last: list[FieldCandidate
 
 
 def direction_quality(lines_by_angle: dict[int, list[OcrLine]]) -> dict[int, dict]:
-    """各角度识别质量：行数 + 平均置信度。用于横向表格方向辅助判断。"""
-    out = {}
+    """各角度识别质量（v1.9 A1）。
+
+    目标：在四方向 OCR 结果中选出**真正被正确回正**的角度，而不是行数多或有
+    几行高分的方向。
+
+    旧公式 `avg * min(n,20)/20` 只看行数与平均分，无法区分"真文本"与"竖条碎片
+    误读"，导致 90°/180° 系统性混淆（C 样本 p19/41/45/59 真实 90° 被判 180°）。
+
+    实测反复暴露的关键事实（决定本公式形态）：
+      - **正确方向会读到真实的标题 / 表头等"实质文本行"**——长、宽、高置信度；
+      - **错误方向只能读到零散短碎片**（表格被逐列纵读，全是 1~2 字单元格值）。
+      因此最强判别信号不是"行数"或"平均分"（两者在伪方向上都会虚高），而是
+      **是否存在实质文本行**（长行 + 高置信度 + 主要连成横向）。
+
+    公式：
+      quality = avg * line_count_factor * orientation_factor * substance_factor
+
+      - line_count_factor = min(n,20)/20（保留原行数奖励，设上限防爆行刷分）；
+      - orientation_factor = 0.25 + 0.75 * horizontal_frac：横排行（宽≥高）占比。
+        正常文档正放时绝大多数行为横向；竖条误读时占比骤降，被压低。这是区分
+        "真横排" 与 "竖排/纵读伪方向" 的几何先验。
+      - substance_factor = 0.45 + 0.55 * substance：**实质文本行占比**。
+        实质行 = 文本 ≥4 字符 且 置信度 ≥0.6（真实的题名、表头、正文句）。
+        仅当某方向能读出成规模实质行时才给满权；纯碎片方向被压到 0.45。
+        **这是区分"正确方向（有真实标题）"与"伪方向（只有短碎片）"的关键**。
+        相比此前用"极短行惩罚"，改为"实质行奖励"更稳健：表格本身就有大量短
+        单元格值，惩罚短行会误伤**正确**的表格方向（stress81 曾因此 6 页翻转）。
+
+    quality 落在 [0,1]；同时输出各分项与 raw_quality 便于诊断。
+    """
+    out: dict[int, dict] = {}
     for angle, lines in lines_by_angle.items():
         n = len(lines)
         avg = sum(l.score for l in lines) / n if n else 0.0
+        raw = avg * min(n, 20) / 20.0
+        quality = 0.0
+        horiz = 0.0
+        substance = 0.0
+        orient_factor = 0.0
+        if n:
+            # 横排行占比（宽≥高）：正放文字几乎全是横向检测框
+            n_h = sum(1 for l in lines if l.width >= l.height)
+            horiz = n_h / n
+            orient_factor = 0.25 + 0.75 * horiz
+            # 实质文本行占比：≥4 字符且高置信度（题名/表头/正文句）
+            n_sub = sum(
+                1 for l in lines
+                if len(l.text.strip()) >= 4 and l.score >= 0.6
+            )
+            substance = n_sub / n
+            substance_factor = 0.45 + 0.55 * substance
+            quality = raw * orient_factor * substance_factor
         out[angle] = {
             "n_lines": n,
             "avg_score": round(avg, 3),
-            "quality": round(avg * min(n, 20) / 20.0, 3),
+            "raw_quality": round(raw, 3),
+            "horizontal_frac": round(horiz, 3),
+            "orientation_factor": round(orient_factor, 3),
+            "substance_frac": round(substance, 3),
+            "quality": round(quality, 3),
         }
     return out
 
@@ -314,14 +365,43 @@ def line_orientation(lines: list[OcrLine]) -> tuple[str, float]:
 
 
 def best_direction(qualities: dict[int, dict]) -> tuple[int | None, float]:
-    """最高质量方向；若各方向都无文字则返回 None。"""
-    best_angle, best = None, None
-    for angle, q in qualities.items():
-        if q["n_lines"] == 0:
-            continue
-        if best is None or q["quality"] > best:
-            best_angle, best = angle, q["quality"]
-    return best_angle, (best if best is not None else 0.0)
+    """最高质量方向；若各方向都无文字则返回 None。
+
+    v1.9 A1：加入**几何行向先验**作为平局裁决。四方向 quality 相同或接近时，
+    优先选择"检测框行向与页面一致"的角度（正放内容横行为主），避免 90°/180°
+    因质量接近而随机选错。
+    """
+    usable = {a: q for a, q in qualities.items() if q.get("n_lines", 0) > 0}
+    if not usable:
+        return None, 0.0
+    # 主排序：quality；平局用"横排行占比"（越大越像正放）
+    def _key(item):
+        a, q = item
+        return (q["quality"], q.get("horizontal_frac", 0.0))
+    best_angle, best_q = max(usable.items(), key=_key)
+    return best_angle, best_q["quality"]
+
+
+def direction_confidence(qualities: dict[int, dict]) -> float:
+    """方向判定置信度（v1.9 A1）：最佳与次佳质量差距 + 绝对质量。
+
+    返回 [0,1]。用于 UI 提示"方向是否可信"，而非仅给一个角度。
+    - 无可用方向 → 0.0；
+    - 仅一个方向有文字 → 较高置信度（但设上限，避免单信号过度自信）；
+    - 多方向竞争：按 quality 差距归一化。
+    """
+    usable = sorted(
+        (q["quality"] for q in qualities.values() if q.get("n_lines", 0) > 0),
+        reverse=True,
+    )
+    if not usable:
+        return 0.0
+    if len(usable) == 1:
+        return round(min(0.6 + usable[0] * 0.4, 0.95), 3)
+    top, second = usable[0], usable[1]
+    gap = top - second
+    margin = gap / top if top > 0 else 0.0
+    return round(min(0.5 + 0.5 * margin, 0.99) * (0.7 + 0.3 * min(top, 1.0)), 3)
 
 
 def title_likeness(lines: list[OcrLine], img_w: float, img_h: float) -> float:

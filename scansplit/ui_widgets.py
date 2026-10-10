@@ -99,8 +99,10 @@ class ThumbnailStrip(ttk.Frame):
                 out.append(("空白", "blank"))
             elif page.blank.verdict == "maybe":
                 out.append(("疑似", "maybe"))
-        if page.rotation % 360:
-            out.append((f"{page.rotation % 360}°", "rotate"))
+        err = page.effective_rotation % 360
+        if err:
+            tag = f"{err}°" + ("" if page.is_rotation_manual else "·自动")
+            out.append((tag, "rotate"))
         return out
 
     def _draw_page(self, p: int):
@@ -117,11 +119,12 @@ class ThumbnailStrip(ttk.Frame):
             )
         img_h = 0
         try:
-            img = renderer.render_thumb(p - 1, user_rotation=page.rotation)
+            rot = page.effective_rotation
+            img = renderer.render_thumb(p - 1, user_rotation=rot)
             w, h = img.size
             scale = 150.0 / max(w, 1)
             nw, nh = int(w * scale), int(h * scale)
-            key = (p, page.rotation)
+            key = (p, rot)
             if key not in self._photos:
                 pil = img.resize((nw, nh)) if (nw, nh) != img.size else img
                 self._photos[key] = ImageTk.PhotoImage(pil)
@@ -352,7 +355,7 @@ class PreviewPane(ttk.Frame):
             self.clear()
             return
         page = doc.pages[self._page_no - 1]
-        rot = page.rotation % 360
+        rot = page.effective_rotation % 360
         try:
             w_pt, h_pt = renderer.display_size_pt(self._page_no - 1, user_rotation=rot)
         except Exception as e:

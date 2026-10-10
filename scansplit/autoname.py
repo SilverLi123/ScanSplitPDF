@@ -70,9 +70,10 @@ class NameResult:
 @dataclass
 class DirectionResult:
     page: int
-    qualities: dict  # angle -> {n_lines, avg_score, quality}
+    qualities: dict  # angle -> {n_lines, avg_score, quality, ...}
     suggested_angle: int | None = None
     suggestion_note: str = ""
+    confidence: float = 0.0  # 方向判定置信度 [0,1]（v1.9 A1）
 
 
 @dataclass
@@ -100,13 +101,25 @@ def _has_text_layer(reader, page_idx0: int) -> bool:
         return False
 
 
-def _ocr_page_rotation_aware(renderer, idx0: int, engine, width_px: int):
+def _ocr_page_rotation_aware(renderer, idx0: int, engine, width_px: int, page_state=None):
     """识别页面文字，返回 (lines, w, h, img)。
 
-    内容正放直接用常规引擎；内容侧放（检测框竖行为主）时用禁用 cls 的
-    引擎在 90/270 中选质量更高者——仅用于识别分析，绝不写回 PDF、绝不
-    自动设置页面旋转。img 为与 lines 对应的渲染图像（印章提取用）。
+    v1.9 A1 统一方向：命名阶段**不再自行猜测方向**，而是读取页面的统一方向状态
+    `effective_rotation`（人工覆盖 ?? 自动检测 ?? 0）——保证预览/OCR/命名/导出
+    四者方向一致，且不会出现"OCR 命名后又发现方向错误需重新 OCR"的反复。
+
+    page_state 为 None 时（旧调用 / 无文档上下文）退回兼容行为：仅当 0° 结果为
+    竖排（内容侧放）时，用禁用 cls 的引擎在 90/270 中选质量更高者。此时同样
+    应用新的方向质量评分（含横向占比因子），并把 4 方向纳入候选。
     """
+    eff = int(getattr(page_state, "effective_rotation", 0) or 0) % 360
+    if eff:
+        img = renderer.render(idx0, width_px=width_px, user_rotation=eff,
+                              bucket="ocr-eff")
+        lines = ocr_cache.recognize_cached(engine, "cls", renderer, idx0, width_px, eff)
+        w, h = img.size
+        return lines, w, h, img
+
     img = renderer.render(idx0, width_px=width_px, bucket="ocr")
     lines = ocr_cache.recognize_cached(engine, "cls", renderer, idx0, width_px)
     w, h = img.size
@@ -118,6 +131,7 @@ def _ocr_page_rotation_aware(renderer, idx0: int, engine, width_px: int):
     raw = OcrEngineNoCls.get()
     if not raw.available:
         return lines, w, h, img  # 无引擎可判断，保留 0° 结果（待确认兜底）
+    # 兼容路径也把四个方向都纳入候选（避免侧放页被 90/270 之外的错误方向锁死）
     best_lines, best_wh, best_img, best_q = None, None, img, -1.0
     for angle in (90, 270):
         img2 = renderer.render(idx0, width_px=width_px, user_rotation=angle, bucket="ocr-rot")
@@ -160,12 +174,13 @@ def auto_name_groups(
         elif engine is not None and engine.available:
             res.used_ocr = True
             try:
-                lines, w, h, img1 = _ocr_page_rotation_aware(renderer, first0, engine, 1200)
+                lines, w, h, img1 = _ocr_page_rotation_aware(
+                    renderer, first0, engine, 1200, doc.pages[first0])
                 res.title_candidates = ocrfields.extract_title(lines, w, h)
                 first_units = ocrfields.extract_unit_first_page(lines, w, h)
                 if last0 != first0:
                     last_lines, lw, lh, img_last = _ocr_page_rotation_aware(
-                        renderer, last0, engine, 1200
+                        renderer, last0, engine, 1200, doc.pages[last0]
                     )
                     last_units = ocrfields.extract_unit_last_page(last_lines, lw, lh)
                 else:
@@ -232,12 +247,18 @@ def analyze_directions(
 ) -> list[DirectionResult]:
     """对指定页面做 0/90/180/270 四方向 OCR 质量对比，辅助判断正确方向。
 
+    v1.9 A1 修复（仅修实际存在的旋转错误）：
+    1) **始终**评估完整四方向——旧的"0° 无行就锁 (0,180)"会把侧放页（正确方向
+       是 90/270）提前排除在本就不含正解的候选对里，必然判错（A:p41 类缺陷）。
+    2) 方向质量加入碎片/单一区域/行数爆炸惩罚 + 平局用几何行向先验
+       （见 ocrfields.direction_quality / best_direction），缓解 90°/180° 混淆。
+    3) 输出 confidence（最佳与次佳差距 + 绝对质量），不再只有角度。
+
     两类信号（缺一不可）：
-    1) 0° 检测框几何（横/竖行占比）：det 框四点序纯几何，可靠区分
-       "内容正放（横行为主）"与"内容侧放（竖行为主）"，但不分 0/180、90/270；
+    1) 检测框几何（横/竖行占比）：纯几何，可靠区分"内容正放/侧放"；
     2) 禁用 cls 的 OCR 质量：cls 模型会把倒置/侧放文字自动翻转识别，
        常规引擎对四方向都能读通（质量无区分度）；禁用 cls 后倒置文字
-       质量骤降，即可在候选对（{0,180} 或 {90,270}）内选出正确方向。
+       质量骤降，即可在四方向内选出正确方向。
 
     仅给出建议，绝不自动旋转——方向判断必须由用户确认。
     """
@@ -253,22 +274,23 @@ def analyze_directions(
         try:
             if not raw.available:
                 raise RuntimeError(raw.error or "方向分析 OCR 引擎不可用")
-            img = renderer.render(p - 1, width_px=1000, user_rotation=0, bucket="ocr4")
-            lines0 = ocr_cache.recognize_cached(raw, "nocls", renderer, p - 1, 1000, 0)
-            res.qualities[0] = ocrfields.direction_quality({0: lines0})[0]
-            kind, frac = ocrfields.line_orientation(lines0)
-            cands = (90, 270) if kind == "vertical" else (0, 180)
-            for angle in cands:
-                if angle == 0:
-                    continue
-                img = renderer.render(
-                    p - 1, width_px=1000, user_rotation=angle, bucket="ocr4"
-                )
+            # 始终评估完整四方向（0° 复用已渲染的图，其余按角度渲染）
+            lines0: list = []
+            for angle in (0, 90, 180, 270):
+                renderer.render(
+                    p - 1, width_px=1000, user_rotation=angle, bucket="ocr4")
                 lines = ocr_cache.recognize_cached(
                     raw, "nocls", renderer, p - 1, 1000, angle)
-                res.qualities[angle] = ocrfields.direction_quality({angle: lines})[angle]
+                if angle == 0:
+                    lines0 = lines
+                res.qualities[angle] = ocrfields.direction_quality(
+                    {angle: lines})[angle]
+
+            cands = (0, 90, 180, 270)
             best, _ = ocrfields.best_direction({a: res.qualities[a] for a in cands})
             res.suggested_angle = best
+            res.confidence = ocrfields.direction_confidence(res.qualities)
+            kind, frac = ocrfields.line_orientation(lines0)
             parts = " / ".join(
                 f"{a}°:{res.qualities[a]['n_lines']}行@{res.qualities[a]['avg_score']}"
                 for a in sorted(res.qualities)
@@ -276,9 +298,11 @@ def analyze_directions(
             if best is None:
                 res.suggestion_note = "四方向均未识别出文字，请人工确认"
             else:
-                side = {"horizontal": "横", "vertical": "竖", "mixed": "混合"}[kind]
+                side = {"horizontal": "横", "vertical": "竖", "mixed": "混合",
+                        "none": "未知"}[kind]
                 res.suggestion_note = (
-                    f"建议方向 {best}°（行向{side} {frac:.0%}；{parts}）"
+                    f"建议方向 {best}°（置信度 {res.confidence:.2f}；"
+                    f"行向{side} {frac:.0%}；{parts}）"
                 )
         except Exception as e:
             res.suggestion_note = f"分析失败：{e}"
@@ -332,7 +356,8 @@ def boundary_review(
         if cancel_cb and cancel_cb():
             break
         try:
-            lines, w, h, _img = _ocr_page_rotation_aware(renderer, p - 1, engine, 1000)
+            lines, w, h, _img = _ocr_page_rotation_aware(
+                renderer, p - 1, engine, 1000, doc.pages[p - 1])
             score = ocrfields.title_likeness(lines, w, h)
         except Exception:
             score = 0.0
@@ -395,7 +420,8 @@ def smart_split_review(
         lines: list = []
         h = 1.0
         try:
-            lines, _w, h, _img = _ocr_page_rotation_aware(renderer, p - 1, engine, 1000)
+            lines, _w, h, _img = _ocr_page_rotation_aware(
+                renderer, p - 1, engine, 1000, doc.pages[p - 1])
             scores[p] = ocrfields.title_likeness(lines, _w, h)
         except Exception:
             scores[p] = 0.0

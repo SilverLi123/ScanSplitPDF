@@ -201,7 +201,10 @@ def _export_one(
                 report.canceled = True
                 raise InterruptedError("用户取消")
             page = reader.pages[src_page - 1]
-            target = doc.pages[src_page - 1].rotation
+            # 导出只依据统一方向状态 effective_rotation（人工覆盖 ?? 自动检测 ?? 0），
+            # 以**绝对目标角度**写入 /Rotate（apply_target_rotation 内部绝对值覆盖），
+            # 因此不存在二次旋转；且不重编码图片（pypdf 复制页面对象）。
+            target = doc.pages[src_page - 1].effective_rotation
             apply_target_rotation(page, target)
             writer.add_page(page)
         with open(tmp_path, "wb") as f:

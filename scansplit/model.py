@@ -46,7 +46,13 @@ class BlankResult:
 @dataclass
 class PageState:
     src_index: int  # 1 起始
-    rotation: int = 0  # 目标旋转角度 0/90/180/270（导出时写入 /Rotate）
+    # --- 统一页面方向状态（v1.9 A1）-----------------------------------------
+    # 三个来源分离存储，effective_rotation 为唯一派生的"最终方向"，
+    # 预览 / OCR / 标题单位提取 / 导出 全部只读取 effective_rotation。
+    original_rotation: int = 0        # PDF 源文件原有 /Rotate（只读，加载时记录）
+    detected_rotation: int | None = None   # 自动方向检测建议；None=未检测
+    detected_confidence: float = 0.0        # 自动检测置信度 [0,1]
+    user_override_rotation: int | None = None  # 人工设定；None=未人工干预
     blank: Optional[BlankResult] = None
     separator: bool = False  # 当前是否作为分隔页（该页本身是空白分隔页，不进入任何组）
     split_before: bool = False  # 该页是新文档起点（拆分边界，页本身保留在组内）
@@ -55,10 +61,46 @@ class PageState:
     # 仍由 separator 字段裁决（uncertain/internal_blank 默认保留）。
     blank_context: str = ""
 
+    # -- 统一方向：effective_rotation（派生只读） ----------------------------
+    @property
+    def effective_rotation(self) -> int:
+        """最终生效方向 = 人工覆盖 ?? 自动检测 ?? 0（均为顺时针角度）。
+
+        唯一真源：预览、OCR、命名、导出都必须读它，不得各自维护。
+        """
+        if self.user_override_rotation is not None:
+            return int(self.user_override_rotation) % 360
+        if self.detected_rotation is not None:
+            return int(self.detected_rotation) % 360
+        return 0
+
+    @property
+    def rotation(self) -> int:
+        """兼容旧 API：等价于 effective_rotation。"""
+        return self.effective_rotation
+
+    @rotation.setter
+    def rotation(self, value: int) -> None:
+        """旧 API 赋值视为**人工设定**（写入 user_override_rotation）。
+
+        这样既保持既有调用点语义（人工旋转 / 自动摆正确认后写入），
+        又与新的三来源模型一致：自动检测只写 detected_rotation，
+        绝不会覆盖人工结果。
+        """
+        self.user_override_rotation = int(value) % 360
+
+    @property
+    def is_rotation_manual(self) -> bool:
+        """方向是否已由人工确认（此时自动检测不得覆盖）。"""
+        return self.user_override_rotation is not None
+
     def snapshot(self) -> dict:
         return {
             "src_index": self.src_index,
-            "rotation": self.rotation,
+            "original_rotation": self.original_rotation,
+            "detected_rotation": self.detected_rotation,
+            "detected_confidence": self.detected_confidence,
+            "user_override_rotation": self.user_override_rotation,
             "blank": (self.blank.verdict, self.blank.confidence, dict(self.blank.signals))
             if self.blank
             else None,
@@ -70,7 +112,15 @@ class PageState:
     @staticmethod
     def restore(d: dict) -> "PageState":
         ps = PageState(src_index=d["src_index"])
-        ps.rotation = d["rotation"]
+        # 新快照：三来源字段；旧快照仅有 "rotation" → 视为人工覆盖（保持向后兼容）
+        if "user_override_rotation" in d or "detected_rotation" in d:
+            ps.original_rotation = int(d.get("original_rotation", 0) or 0) % 360
+            ps.detected_rotation = d.get("detected_rotation")
+            ps.detected_confidence = float(d.get("detected_confidence", 0.0) or 0.0)
+            ps.user_override_rotation = d.get("user_override_rotation")
+        else:
+            rot = d.get("rotation", 0) or 0
+            ps.user_override_rotation = int(rot) % 360 if rot else None
         ps.separator = d["separator"]
         ps.split_before = bool(d.get("split_before", False))
         ps.blank_context = d.get("blank_context", "")
@@ -157,6 +207,14 @@ class ScanDocument:
         self.pages: list[PageState] = [
             PageState(src_index=i + 1) for i in range(len(reader.pages))
         ]
+        # 记录源文件原有 /Rotate（只读；effective_rotation 的 0 基线不叠加它，
+        # 因为渲染器 render() 已自动叠加 stored_rotation——避免二次旋转）。
+        for ps in self.pages:
+            try:
+                ps.original_rotation = int(
+                    reader.pages[ps.src_index - 1].get("/Rotate", 0) or 0) % 360
+            except Exception:
+                ps.original_rotation = 0
         self.groups: list[Group] = []
         self.group_migrate_notes: list[str] = []  # refresh_groups 的迁移/歧义说明
         # 人工改过分隔标记的页码集合（v1.9 A0）：自动分组/上下文判定不得覆盖。

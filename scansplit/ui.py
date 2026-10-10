@@ -759,6 +759,14 @@ class App:
             if canceled:
                 self.log("方向分析已取消。")
                 return
+            # 记录自动检测结果（detected_rotation），**不覆盖**人工已确认方向。
+            for r in results:
+                if r.page < 1 or r.page > doc.page_count:
+                    continue
+                ps = doc.pages[r.page - 1]
+                if r.suggested_angle is not None:
+                    ps.detected_rotation = int(r.suggested_angle) % 360
+                    ps.detected_confidence = float(r.confidence)
             self._direction_show_results(doc, candidates, sugg, results=results, scope=scope)
 
         if not self._start_task("direction", work, on_done, title="识别方向（本地 OCR 方向对比）"):
