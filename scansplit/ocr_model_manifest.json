@@ -1,0 +1,10 @@
+{
+  "engine": "rapidocr_onnxruntime",
+  "note": "PaddleOCR 官方 PP-OCRv3 中文模型（ONNX），运行时绝不联网下载",
+  "files": {
+    "models/ch_PP-OCRv3_det_infer.onnx": "3439588c030faea393a54515f51e983d8e155b19a2e8aba7891934c1cf0de526",
+    "models/ch_PP-OCRv3_rec_infer.onnx": "897a3ededb38fee0dae2c1ccee38241f37df202c9509e3abca02e9217c5ee615",
+    "models/ch_ppocr_mobile_v2.0_cls_infer.onnx": "e47acedf663230f8863ff1ab0e64dd2d82b838fceb5957146dab185a89d6215c",
+    "config.yaml": "a61ac7c6f753b9840ae77306f31a4845788c530d8ebe950f0c5476e30b984917"
+  }
+}

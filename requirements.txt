@@ -1,0 +1,9 @@
+# 直接依赖（运行时）。完整锁定版本见 requirements.lock.txt
+pypdf==6.19.0
+pypdfium2==5.14.0
+numpy==2.5.3
+Pillow==12.3.0
+rapidocr-onnxruntime==1.2.3
+onnxruntime==1.31.0
+opencv-python==5.0.0.93
+PyYAML==6.0.3
