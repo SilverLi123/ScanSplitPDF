@@ -95,6 +95,41 @@ def preflight(docs: list[ScanDocument], opts: ExportOptions) -> list[str]:
                 )
             if g.start < 1 or g.end > doc.page_count or g.start > g.end:
                 issues.append(f"{doc.name} 文档{gi + 1}：页码范围无效（{g.start}-{g.end}）")
+        # 业务完整性：每个原页必须"已导出"或"经用户确认排除"（禁止静默丢页）
+        issues.extend(business_integrity_issues(doc))
+    return issues
+
+
+def business_integrity_issues(doc: ScanDocument) -> list[str]:
+    """业务完整性核对（v1.9 阶段 A0）：每个原始页必须被明确归类为
+    "已导出"（在某个分组内）或"经用户确认排除"（人工标记的分隔页）。
+
+    规则（保守，fail-closed）：
+    - 位于分组内的页 → 已导出，正常；
+    - 未在任何分组内的页（= 当前被标为分隔页而排除的页）：
+      * 若该页**被用户人工确认过**（src_index ∈ doc.manual_separator_pages）
+        或**上下文判定为 separator** → 视为"经确认排除"，允许；
+      * 否则（uncertain / 无上下文判定 / 视觉空白但未确认）→ **禁止静默排除**，
+        列为问题，阻断导出。
+    返回问题字符串列表（空 = 通过）。
+    """
+    in_group = {p for g in doc.groups for p in g.pages}
+    manual = getattr(doc, "manual_separator_pages", None) or set()
+    issues: list[str] = []
+    for st in doc.pages:
+        if st.src_index in in_group:
+            continue  # 已导出
+        # 未在分组内 → 被排除。必须有明确、经确认的排除依据。
+        confirmed = (
+            st.src_index in manual
+            or getattr(st, "blank_context", "") == "separator"
+        )
+        if not confirmed:
+            ctx = getattr(st, "blank_context", "") or "未判定"
+            issues.append(
+                f"{doc.name} 第 {st.src_index} 页未被导出，且没有经确认的排除依据"
+                f"（业务属性：{ctx}）——禁止静默丢页"
+            )
     return issues
 
 
@@ -234,15 +269,19 @@ def export_documents(
             _log(report, opts, f"{doc.name} 导出被取消，跳过页面覆盖率校验。")
         else:
             doc_issues = coverage_issues(doc, report.results[doc_result_start:])
+            biz_issues = business_integrity_issues(doc)
             if doc_issues:
                 report.coverage_issues[doc.name] = doc_issues
                 for msg in doc_issues:
                     _log(report, opts, f"[严重] 页面覆盖率校验：{msg}")
-            else:
+            elif not biz_issues:
                 _log(
                     report, opts,
                     f"页面覆盖率校验通过：{doc.name} 全部 {sum(g.page_count for g in doc.groups)} 个有效页恰好导出一次",
                 )
+            for msg in biz_issues:
+                report.coverage_issues.setdefault(doc.name, []).append(msg)
+                _log(report, opts, f"[严重] 业务完整性校验：{msg}")
 
     n_ok = len(report.succeeded)
     n_fail = len(report.failed)

@@ -82,8 +82,14 @@ def test_end_to_end_pipeline(e2e_scan, tmp_path):
         for page, res in zip(doc.pages, results):
             page.blank = res
 
-        # 2) 自动分组：[(1,2), (4,5)]
+        # 2) 自动分组（v1.9 阶段 A0：先做上下文判定，再按业务属性分组）
+        from scansplit import splitctx
+
+        splitctx.apply_context(
+            doc, splitctx.judge_blank_context(doc, renderer, OcrEngine.get()))
         grouping.auto_group(doc)
+        # 第 3 页空白后是文档 2 首页（页码缺省但具备强标题特征）→ 分隔空白
+        assert doc.pages[2].blank_context == splitctx.SEPARATOR
         assert [(g.start, g.end) for g in doc.groups] == [(1, 2), (4, 5)]
 
         # 3) OCR 自动命名

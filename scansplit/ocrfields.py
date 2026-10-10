@@ -331,3 +331,88 @@ def title_likeness(lines: list[OcrLine], img_w: float, img_h: float) -> float:
     max_h = max(l.height for l in lines)
     best = max(_title_line_score(l, img_w, img_h, max_h) for l in lines)
     return round(best, 3)
+
+
+# -- 文档首页结构特征（v1.9 阶段 A0，用于拆分上下文判定） ---------------------- #
+
+# 序号小节标题（"一、相关情况说明"/"2. 检查内容"）——文档中段的强特征。
+SECTION_HEAD_RE = re.compile(r"^[一二三四五六七八九十\d]+[、.．）)]")
+# 明确的"续"标记（续表 / 续页 / （续）/（续表）/(续页)）——内部继续的强特征。
+# 只认**独立**的"续"标记：需紧邻"表/页"或位于括号内，绝不匹配正文中的"后续/继续"等。
+CONTINUATION_RE = re.compile(r"续\s*[表页]|[（(]\s*续\s*[）)]|第\s*\d+\s*页\s*之?\s*续")
+# 主送机关/称谓行（"各有关单位："、"各学院、各部门："）——公文首页正文起始特征。
+RECIPIENT_LINE_RE = re.compile(r"^各.{0,16}[：:]$")
+# 文头（发文机关标识，如"XX大学文件"、"后勤保障处文件"）。
+# 真文头是**纯机关名**（可带 文件/函/简报/通知 后缀），不含阿拉伯数字/年份/书名号，
+# 也不含标题动词（关于/的/报告/方案等）。据此排除"2026年度实验室"这类含数字的行。
+_HEADER_LINE_RE = re.compile(
+    rf"^(?![^\s]{{0,6}}[\d〇○])[^\s，。；：、]{{2,20}}(?:{UNIT_SUFFIX})(?:文件|函|简报|通知)?$")
+_TITLE_VERB_RE = re.compile(r"关于|的通知|的报告|的方案|的请示|的批复|工作总结|实施方案")
+
+
+def first_page_structure(lines: list[OcrLine], img_w: float, img_h: float) -> dict:
+    """判断"这一页的顶部结构是否像一份文档的首面"。
+
+    只做**结构**判断（不依赖具体文字内容），输出可解释的信号供上下文判定组合：
+      - has_title   ：顶部带（y<0.32h）存在"大字号 + 居中"的标题行（排除序号行/日期/页码）；
+      - title_is_max：该标题行是否为全页最大字号行（首页标题通常最大）；
+      - has_header  ：标题之上存在文头（发文机关标识）；
+      - has_recipient：标题之后紧跟主送机关/称谓行（"各XX："）；
+      - has_section ：顶部带存在序号小节标题（"一、"/"2."）——续页常见；
+      - has_continuation：存在"续表/续页/（续）"标记——内部继续的强特征；
+      - title_text  ：标题行文字（便于人工核对）。
+
+    返回 dict；lines 为空时各布尔量为 False。
+    """
+    out = {
+        "has_title": False, "title_is_max": False, "has_header": False,
+        "has_recipient": False, "has_section": False, "has_continuation": False,
+        "title_text": "",
+    }
+    if not lines:
+        return out
+    hs = [l.height for l in lines]
+    med_h = sorted(hs)[len(hs) // 2]
+    max_h = max(hs)
+    top = sorted([l for l in lines if l.y0 < img_h * 0.32], key=lambda l: l.y0)
+
+    # 字号门槛：相对页高的**绝对**底线（标题通常 ≥2% 页高），
+    # 仅在页内行数足够（正文占多数）时再叠加"显著大于中位字号"的相对约束。
+    # 行数很少（如首页仅标题+一行正文）时中位数会被标题拉高，此时不加相对门槛，
+    # 否则真标题反而过不了自己的阈值（实测 doc2_p1 首页即为此类）。
+    abs_floor = img_h * 0.02
+    if len(lines) >= 5:
+        h_floor = max(med_h * 1.25, abs_floor)
+    else:
+        h_floor = abs_floor
+    cand = [l for l in top
+            if l.height >= h_floor
+            and abs(l.cx - img_w / 2) < img_w * 0.22
+            and not _is_date_or_pageno(l)
+            and not SECTION_HEAD_RE.match(l.text.strip())]
+    # 文头（"XX处文件"）与标题常同排；文头**本身不等于标题**（续页也会重印文头）。
+    # 只在存在"非文头"的标题候选时才认标题，避免把纯文头页误判为文档首面。
+    def _is_header(l: OcrLine) -> bool:
+        t = l.text.strip()
+        return bool(_HEADER_LINE_RE.match(t)) and not _TITLE_VERB_RE.search(t)
+
+    non_header = [l for l in cand if not _is_header(l)]
+    titled = [l for l in non_header if _title_pattern_score(l.text.strip()) >= 1.0]
+    pool = titled or non_header
+    title = max(pool, key=lambda l: l.height) if pool else None
+    if title is not None:
+        out["has_title"] = True
+        # 多行标题（如"2026年度实验室"+"安全检查报告"）：取同字号、居中、相邻的行拼接
+        group = [l for l in pool
+                 if abs(l.height - title.height) <= max(title.height, 1.0) * 0.35
+                 and abs(l.cx - img_w / 2) < img_w * 0.22
+                 and abs(l.y0 - title.y0) < img_h * 0.12]
+        group.sort(key=lambda l: l.y0)
+        out["title_text"] = "".join(l.text.strip() for l in group) or title.text.strip()
+        out["title_is_max"] = title.height >= max_h - 1.0
+    out["has_header"] = any(_is_header(l) for l in top)
+    out["has_recipient"] = any(RECIPIENT_LINE_RE.match(l.text.strip()) for l in top)
+    out["has_section"] = any(SECTION_HEAD_RE.match(l.text.strip()) for l in top)
+    out["has_continuation"] = any(CONTINUATION_RE.search(l.text.strip()) for l in top)
+    return out
+

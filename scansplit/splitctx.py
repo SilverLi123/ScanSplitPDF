@@ -1,0 +1,237 @@
+"""拆分上下文判定：把"单页视觉空白"升级为"页面业务属性"。
+
+背景（v1.9 阶段 A0）：
+- 单页像素检测（blankdetect）只能回答"这页看起来是不是空白"（视觉属性：
+  blank / maybe / content）；
+- 但它无法区分两种本质不同的空白：
+  * **分隔空白**：两份文档之间的空白页，导出时应删除（业务属性 separator）；
+  * **内部空白**：一份文档内部双面件的背面空白，必须保留（业务属性 internal_blank）。
+- 实测（四个 100 页样本，57 个空白候选）证明：内部空白与分隔空白的**单页像素统计
+  完全相同**（ink≈0、dark≈0、mean≈241.6），单页证据不可能区分；唯一可靠信号是
+  **上下文**——相邻内容页在文档中的位置与结构。
+
+多证据模型（全部语义化、非样本专用；**多证据矛盾则降级为 uncertain**）：
+
+证据 A（印刷页码重置）：
+  * 后一内容页印刷页码 == 1 → 强 separator 证据；
+  * 后一内容页印刷页码 > 1（延续页码）→ 强 internal 证据。
+  * 注意：**前一内容页的页码不可用作 internal 证据**——分隔空白的前一页本就是
+    上一份文档的末页，天然携带中段页码（实测 25/50 分隔页满足 prev_pn>1）。
+证据 B（后一内容页是否像"文档首面"结构）：
+  * 顶部带存在大字号居中标题行（has_title）→ 支持 separator；
+  * 标题即全页最大字号（title_is_max）或其后紧跟主送机关（has_recipient）
+    → 加强 separator；
+  * 存在"续表/续页/（续）"标记（has_continuation）→ 强 internal 证据。
+
+判定（保守优先；证据不足或矛盾一律 uncertain，默认保留）：
+  1. 后页页码 == 1 → separator；后页页码 > 1 → internal_blank；
+  2. 否则若存在"续表/续页/（续）"标记 → internal_blank；
+  3. 否则若后页具备文档首面结构（标题最大 / 有主送机关）→ separator；
+  4. 否则 → uncertain（保留，交人工/复核）。
+
+约束：本模块只读取渲染图做 OCR，**绝不修改 PDF**。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+# 业务属性枚举
+SEPARATOR = "separator"
+INTERNAL_BLANK = "internal_blank"
+UNCERTAIN = "uncertain"
+
+CTX_LABEL = {
+    SEPARATOR: "分隔页",
+    INTERNAL_BLANK: "内部空白（保留）",
+    UNCERTAIN: "空白-待确认（默认保留）",
+}
+
+
+@dataclass
+class ContextEvidence:
+    """单个空白候选页的上下文证据，供 UI 展示与测试断言。"""
+
+    page: int                                   # 1 起始
+    verdict: str = UNCERTAIN                    # separator/internal_blank/uncertain
+    next_content_page: int | None = None
+    prev_content_page: int | None = None
+    next_page_number: int | None = None         # 后一内容页识别到的印刷页码
+    prev_page_number: int | None = None         # 前一内容页识别到的印刷页码
+    next_title_likeness: float = 0.0
+    prev_title_likeness: float = 0.0
+    # 后一内容页的首页结构特征（见 ocrfields.first_page_structure）
+    next_structure: dict | None = None
+    reason: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "page": self.page, "verdict": self.verdict,
+            "next_content_page": self.next_content_page,
+            "prev_content_page": self.prev_content_page,
+            "next_page_number": self.next_page_number,
+            "prev_page_number": self.prev_page_number,
+            "next_title_likeness": round(self.next_title_likeness, 3),
+            "prev_title_likeness": round(self.prev_title_likeness, 3),
+            "next_structure": dict(self.next_structure or {}),
+            "reason": self.reason,
+        }
+
+
+def _nearest_content(doc, page_1based: int, step: int) -> int | None:
+    """从 page 出发沿 step 方向找最近的非空白页（用于取上下文）。"""
+    p = page_1based + step
+    while 1 <= p <= doc.page_count:
+        st = doc.pages[p - 1]
+        if not (st.blank is not None and st.blank.verdict == "blank"):
+            return p
+        p += step
+    return None
+
+
+def _page_ocr(renderer, engine, page_1based: int, cache: dict) -> tuple:
+    """对指定页做一次 0° 渲染 + OCR，返回 (lines, w, h)。
+
+    带页内缓存，避免同一上下文页被前后多个空白候选重复识别。
+    使用常规引擎（含 cls）：只用于读取"页码/首页结构"，不用于方向判断。
+    """
+    if page_1based in cache:
+        return cache[page_1based]
+    try:
+        img = renderer.render(page_1based - 1, width_px=1000, bucket="ctx")
+        lines = engine.recognize(img)
+        w, h = img.size
+    except Exception:
+        lines, w, h = [], 1.0, 1.0
+    cache[page_1based] = (lines, w, h)
+    return cache[page_1based]
+
+
+def judge_blank_context(
+    doc,
+    renderer,
+    engine,
+    blank_pages: list[int] | None = None,
+    progress_cb=None,
+    cancel_cb=None,
+) -> list[ContextEvidence]:
+    """对每个视觉空白候选页判定业务属性（separator / internal_blank / uncertain）。
+
+    blank_pages 缺省时取 doc 中所有 verdict==blank 的页。返回与输入同序的证据列表。
+    """
+    from . import ocrfields, pagenum  # 延迟导入，避免循环依赖
+
+    if blank_pages is None:
+        blank_pages = [st.src_index for st in doc.pages
+                       if st.blank is not None and st.blank.verdict == "blank"]
+
+    cache: dict = {}
+    out: list[ContextEvidence] = []
+    total = len(blank_pages)
+    for i, p in enumerate(blank_pages):
+        if cancel_cb and cancel_cb():
+            break
+        ev = ContextEvidence(page=p)
+        try:
+            nxt = _nearest_content(doc, p, +1)
+            prv = _nearest_content(doc, p, -1)
+            ev.next_content_page = nxt
+            ev.prev_content_page = prv
+
+            if nxt is None:
+                # 末尾空白（后面没有内容页）→ 文档边界，可排除
+                ev.verdict = SEPARATOR
+                ev.reason = "位于文件末尾，之后无内容页 → 视为末尾分隔空白"
+                out.append(ev)
+                if progress_cb:
+                    progress_cb(i + 1, total)
+                continue
+
+            lns, w, h = _page_ocr(renderer, engine, nxt, cache)
+            if lns:
+                ev.next_page_number = pagenum.extract_page_number(lns, h)
+                ev.next_title_likeness = ocrfields.title_likeness(lns, w, h)
+                ev.next_structure = ocrfields.first_page_structure(lns, w, h)
+
+            if prv is not None:
+                plns, pw, ph = _page_ocr(renderer, engine, prv, cache)
+                if plns:
+                    ev.prev_page_number = pagenum.extract_page_number(plns, ph)
+                    ev.prev_title_likeness = ocrfields.title_likeness(plns, pw, ph)
+
+            # --- 多位证据判定 ---
+            st = ev.next_structure or {}
+            nxt_is_first = ev.next_page_number == 1
+            nxt_mid = ev.next_page_number is not None and ev.next_page_number > 1
+            has_cont = bool(st.get("has_continuation"))
+            has_title = bool(st.get("has_title"))
+            strong_title = has_title and (st.get("title_is_max") or st.get("has_recipient"))
+
+            if nxt_is_first:
+                # 证据 A：后一内容页页码明确重置为 1 → 新文档首页
+                ev.verdict = SEPARATOR
+                ev.reason = "后一内容页印刷页码=1（新文档首页）→ 分隔空白"
+            elif nxt_mid:
+                # 证据 A：后一内容页为延续页码（>1）→ 文档已在进行中
+                ev.verdict = INTERNAL_BLANK
+                ev.reason = f"后一内容页延续页码={ev.next_page_number} → 内部空白，保留"
+            elif has_cont:
+                # 证据 B 矛盾：明确"续表/续页/（续）"标记 → 内部继续
+                ev.verdict = INTERNAL_BLANK
+                ev.reason = "后一内容页含“续表/续页/（续）”标记 → 内部空白，保留"
+            elif strong_title:
+                # 证据 B：后一内容页具备文档首面结构（标题最大 / 有主送机关）
+                why = "标题为全页最大字号" if st.get("title_is_max") else "标题后紧跟主送机关"
+                ev.verdict = SEPARATOR
+                ev.reason = f"后一内容页具备文档首面结构（{why}）：{st.get('title_text','')[:24]} → 分隔空白"
+            elif prv is None:
+                # 前面没有内容页（文件开头附近）→ 边界
+                ev.verdict = SEPARATOR
+                ev.reason = "位于文件开头，之前无内容页 → 视为边界空白"
+            else:
+                # 证据不足或互相矛盾：保守判 uncertain（默认保留），交人工/复核
+                ev.verdict = UNCERTAIN
+                parts = []
+                if has_title:
+                    parts.append("有标题但非最大字号且无主送机关")
+                if st.get("has_section"):
+                    parts.append("顶部含序号小节标题")
+                note = "、".join(parts) if parts else "无明确首页/延续信号"
+                ev.reason = (
+                    f"{note}（后页标题特征 {ev.next_title_likeness:.2f}）"
+                    "→ 证据不足，待人工确认，默认保留"
+                )
+        except Exception as e:  # OCR 失败 → 保守保留
+            ev.verdict = UNCERTAIN
+            ev.reason = f"上下文分析失败：{e}（默认保留）"
+        out.append(ev)
+        if progress_cb:
+            progress_cb(i + 1, total)
+    return out
+
+
+def apply_context(
+    doc,
+    evidences: list[ContextEvidence],
+    respect_manual: bool = True,
+) -> dict:
+    """把上下文判定结果写入 PageState。
+
+    - **绝不覆盖人工已确认的分隔状态**（respect_manual=True 时跳过
+      已被用户手工改过分隔标记的页；由调用方通过 doc 的 manual 集合传入）。
+    - 只有 verdict==separator 才置 separator=True；internal_blank/uncertain 一律保留
+      （separator=False，页留在文档内）。
+
+    返回 {verdict: 页列表} 统计，便于日志与测试。
+    """
+    by_page = {e.page: e for e in evidences}
+    counts = {SEPARATOR: [], INTERNAL_BLANK: [], UNCERTAIN: []}
+    manual = getattr(doc, "manual_separator_pages", None) or set()
+    for p, ev in by_page.items():
+        st = doc.pages[p - 1]
+        st.blank_context = ev.verdict
+        if respect_manual and p in manual:
+            continue  # 人工标记优先，不覆盖
+        st.separator = (ev.verdict == SEPARATOR)
+        counts[ev.verdict].append(p)
+    return {k: sorted(v) for k, v in counts.items()}

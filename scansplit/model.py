@@ -50,6 +50,10 @@ class PageState:
     blank: Optional[BlankResult] = None
     separator: bool = False  # 当前是否作为分隔页（该页本身是空白分隔页，不进入任何组）
     split_before: bool = False  # 该页是新文档起点（拆分边界，页本身保留在组内）
+    # 业务属性（v1.9 阶段 A0）：separator / internal_blank / uncertain。
+    # 由 splitctx 依据相邻内容页上下文判定；仅作记录与展示，实际"是否排除"
+    # 仍由 separator 字段裁决（uncertain/internal_blank 默认保留）。
+    blank_context: str = ""
 
     def snapshot(self) -> dict:
         return {
@@ -60,6 +64,7 @@ class PageState:
             else None,
             "separator": self.separator,
             "split_before": self.split_before,
+            "blank_context": self.blank_context,
         }
 
     @staticmethod
@@ -68,6 +73,7 @@ class PageState:
         ps.rotation = d["rotation"]
         ps.separator = d["separator"]
         ps.split_before = bool(d.get("split_before", False))
+        ps.blank_context = d.get("blank_context", "")
         if d["blank"]:
             v, c, s = d["blank"]
             ps.blank = BlankResult(verdict=v, confidence=c, signals=s)
@@ -153,6 +159,8 @@ class ScanDocument:
         ]
         self.groups: list[Group] = []
         self.group_migrate_notes: list[str] = []  # refresh_groups 的迁移/歧义说明
+        # 人工改过分隔标记的页码集合（v1.9 A0）：自动分组/上下文判定不得覆盖。
+        self.manual_separator_pages: set[int] = set()
         self.status = "loaded"  # loaded | analyzed | grouped | exported | error
         self.error: Optional[str] = None
 

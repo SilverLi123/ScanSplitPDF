@@ -57,7 +57,9 @@ def test_auto_group_and_manual_toggle(make_scan):
         p.blank = r
     assert blank_candidates(results) == {3, 5}
 
-    groups = auto_group(doc)
+    # v1.9 A0：auto_group 默认按上下文业务属性分组（无上下文结论 → 空白候选保留）。
+    # 显式用旧行为（context_aware=False）验证"空白候选作为分隔"的基础分组逻辑。
+    groups = auto_group(doc, context_aware=False)
     assert [(g.start, g.end) for g in groups] == [(1, 2), (4, 4), (6, 6)]
 
     # 手动取消第 5 页分隔（它是文档内部的空白页）

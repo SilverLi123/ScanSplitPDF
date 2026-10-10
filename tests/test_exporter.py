@@ -263,6 +263,7 @@ def test_export_report_coverage_logged(tmp_path, make_scan, capsys):
     pdf = make_scan("cl.pdf", ["text", "blank", "text"])
     doc = _load_doc(pdf)
     doc.pages[1].separator = True
+    doc.pages[1].blank_context = "separator"  # v1.9 A0：经确认的分隔页（业务属性）
     refresh_groups(doc)
     for g in doc.groups:
         g.title, g.unit = f"T{g.start}", "U"

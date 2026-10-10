@@ -13,7 +13,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import autoname, blankdetect, exporter, grouping, loader, naming, rotation, settings
+from . import autoname, blankdetect, exporter, grouping, loader, naming, rotation, settings, splitctx
 from .loader import LoadError
 from .model import ScanDocument, Workspace
 from .ocr import OcrEngine
@@ -490,7 +490,7 @@ class App:
     def auto_group_all(self):
         if self._busy:
             return
-        docs = self.ws.documents
+        docs = list(self.ws.documents)
         if not docs:
             messagebox.showinfo("自动分组", "请先打开 PDF 文件。")
             return
@@ -498,16 +498,81 @@ class App:
             messagebox.showinfo("自动分组", "尚未检测空白页。请先运行“检测空白页”。")
             return
         self._push_undo()
-        for doc in docs:
-            grouping.auto_group(doc)
-            doc.status = "grouped"
-            self.log(f"{doc.name}：分隔页 {sorted(doc.separators)}，分组 {len(doc.groups)} 份")
-        self._refresh_all()
-        messagebox.showinfo(
-            "自动分组完成",
-            "已按空白候选页拆分。可在缩略图上右键调整分隔页；\n"
-            "建议点击“复核拆分”对拆分边界做双重验证。",
-        )
+        snap = self.ws.snapshot()
+
+        # A0：上下文判定需要 OCR 才能区分「分隔空白」与「内部空白」。
+        # 引擎不可用时退回"保守模式"：仅把已明确带上下文结论的页作分隔，
+        # 其余空白候选一律保留（uncertain），绝不静默丢页。
+        engine = OcrEngine.get()
+        use_ocr = engine.available
+        total_pages = sum(d.page_count for d in docs)
+
+        def work(progress, log, cancel):
+            out = []  # [(doc, counts, ctx_counts)]
+            done_base = 0
+            for d in docs:
+                renderer = PageRenderer(d.path) if use_ocr else None
+                try:
+                    if use_ocr:
+                        def cb(i, n, dd=d):
+                            progress(done_base + i, total_pages,
+                                     f"分析 {dd.name} 拆分上下文 {i}/{n}")
+                        evs = splitctx.judge_blank_context(
+                            d, renderer, engine, progress_cb=cb, cancel_cb=cancel,
+                        )
+                        ctx_counts = splitctx.apply_context(d, evs)
+                    else:
+                        # OCR 不可用：不做上下文判定，空白候选一律保留（保守）
+                        ctx_counts = {splitctx.SEPARATOR: [],
+                                      splitctx.INTERNAL_BLANK: [],
+                                      splitctx.UNCERTAIN: []}
+                    grouping.auto_group(d, context_aware=True)
+                    out.append((d, ctx_counts))
+                finally:
+                    if renderer is not None:
+                        renderer.close()
+                done_base += d.page_count
+                if cancel():
+                    break
+            return out
+
+        def on_done(results, canceled, error):
+            self._task_finish()
+            if error:
+                self._restore_ws_snapshot(snap)
+                self._refresh_all()
+                tail = error.splitlines()[-1] if error else "未知错误"
+                self.log(f"自动分组失败：{tail}（已回滚，无半更新状态）")
+                messagebox.showerror("自动分组", f"自动分组失败：{tail}")
+                return
+            if canceled:
+                self._restore_ws_snapshot(snap)
+                self._refresh_all()
+                self.log("自动分组已取消，未保存任何结果。")
+                return
+            n_int = 0
+            n_unc = 0
+            for doc, ctx_counts in results:
+                if not self._doc_still_open(doc):
+                    continue
+                doc.status = "grouped"
+                n_int += len(ctx_counts.get(splitctx.INTERNAL_BLANK, []))
+                n_unc += len(ctx_counts.get(splitctx.UNCERTAIN, []))
+                self.log(f"{doc.name}：分隔页 {sorted(doc.separators)}，分组 {len(doc.groups)} 份")
+            self._refresh_all()
+            if not use_ocr:
+                self.log("OCR 不可用：已按保守模式分组（空白候选默认保留，需人工确认分隔）。")
+            tail = ""
+            if n_int or n_unc:
+                tail = (f"\n\n已保护 {n_int} 页内部空白、{n_unc} 页待确认空白（默认保留在文档内，"
+                        "未作为分隔页删除）。")
+            messagebox.showinfo(
+                "自动分组完成",
+                "已结合前后页上下文识别分隔点：内部空白与待确认页均保留在文档内。" + tail +
+                "\n可在缩略图上右键调整分隔页；建议点击“复核拆分”做双重验证。",
+            )
+
+        self._start_task("autogroup", work, on_done, title="自动分组（上下文判定）")
 
     def _log_migrate_notes(self, doc):
         """转述 refresh_groups 的迁移/歧义说明（v1.8：人工编辑不静默丢失）。"""

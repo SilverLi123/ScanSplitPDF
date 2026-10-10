@@ -110,13 +110,21 @@ def test_full_workflow(tmp_path, make_scan, ui_env, monkeypatch):
         blanks = [p.src_index for p in doc.pages if p.blank and p.blank.verdict == "blank"]
         assert 1 in blanks and 4 in blanks
 
-        # 自动分组
+        # 自动分组（v1.9 A0：结合上下文判定业务属性）
         app.auto_group_all()
+        pump_until_idle(app)
+        # 第 1 页为文件开头空白 → 边界分隔页；第 4 页无首页/延续证据 → 保留在文档内
+        assert doc.pages[0].separator is True
+        assert doc.pages[3].separator is False
+        assert [(g.start, g.end) for g in doc.groups] == [(2, 5)]
+
+        # 人工把第 4 页确认为分隔页（模拟用户复核）→ 拆为两组
+        app.set_separator([4], True)
         assert [(g.start, g.end) for g in doc.groups] == [(2, 3), (5, 5)]
 
-        # 撤销 → 回到单组；重做 → 恢复两组
+        # 撤销 → 回到自动分组结果；重做 → 恢复人工拆分
         app.undo()
-        assert [(g.start, g.end) for g in doc.groups] == [(1, 5)]
+        assert [(g.start, g.end) for g in doc.groups] == [(2, 5)]
         app.redo()
         assert [(g.start, g.end) for g in doc.groups] == [(2, 3), (5, 5)]
 
@@ -142,6 +150,7 @@ def test_full_workflow(tmp_path, make_scan, ui_env, monkeypatch):
         assert len(pdfs) == 2
 
         # 导出页数与映射校验（与源页一一对应）
+        # 分组为 (2,3) 与 (5,5)：分别导出 2 页与 1 页
         from pypdf import PdfReader
 
         counts = sorted(len(PdfReader(str(p)).pages) for p in pdfs)

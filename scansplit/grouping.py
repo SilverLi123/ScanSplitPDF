@@ -49,11 +49,31 @@ def maybe_candidates(results) -> set[int]:
     return {i + 1 for i, r in enumerate(results) if r.verdict == MAYBE}
 
 
-def auto_group(doc: ScanDocument) -> list[Group]:
-    """把所有空白候选页标记为分隔页并重算分组。"""
+def auto_group(doc: ScanDocument, context_aware: bool = True) -> list[Group]:
+    """把空白候选页标记为分隔页并重算分组。
+
+    v1.9 阶段 A0：引入"业务属性"判别。当 context_aware=True（默认）时，
+    只有已被上下文判定为 **separator**（或未经上下文判定但确属文档边界的）空白页
+    才置为分隔页；判定为 internal_blank / uncertain 的空白页**保留在文档内**，
+    避免静默丢页。context_aware=False 时退回旧行为（所有空白候选都作分隔页），
+    仅供兼容/测试使用。
+
+    人工已改过分隔标记的页（doc.manual_separator_pages）永不被自动结果覆盖。
+    """
+    manual = getattr(doc, "manual_separator_pages", None) or set()
     for p in doc.pages:
-        if p.blank is not None and p.blank.verdict == BLANK:
+        if p.blank is None or p.blank.verdict != BLANK:
+            continue
+        if p.src_index in manual:
+            continue  # 人工标记优先
+        if not context_aware:
             p.separator = True
+            continue
+        # 已做上下文判定：仅 separator 排除；internal_blank/uncertain 一律保留。
+        if p.blank_context == "separator":
+            p.separator = True
+        else:
+            p.separator = False
     return refresh_groups(doc)
 
 
