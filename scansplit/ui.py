@@ -1,9 +1,19 @@
-"""主界面：导入 → 空白检测 → 分组 → OCR 命名 → 方向/边界复核 → 无损导出。
+"""主界面：导入 → 自动检测与分组 → 复核拆分/补拆 → OCR 命名 → 校对 → 无损导出。
 
 工作流原则（与核心模块一致）：
-- 空白检测是第一拆分依据；OCR 首页标题检测是第二验证信号，不一致时提示确认；
-- 旋转只设置目标 /Rotate，导出绝不重绘页面；
-- OCR 全程本地离线运行，识别结果只作建议，可人工修改。
+- 视觉空白检测（blankdetect）生成分隔候选，本身只回答"这页看起来是不是空白"；
+- 业务属性由上下文判定（splitctx）依据印刷页码、首页结构（标题/主送机关）、
+  续页标记与前后内容页标题关系区分：separator / internal_blank / uncertain；
+- 只有 separator 允许作为分隔空白排除；internal_blank 与 uncertain 一律默认保留
+  （不静默丢页）；证据不足或互相矛盾时降级为待确认，交人工/复核；
+- 无空白页的文件由"智能补拆"（autoname.smart_split_review）产生自动建议或
+  待确认边界（页码重置 + 标题特征双信号一致才自动补拆，可撤销）；
+- 页面方向采用统一三来源模型（PageState.effective_rotation）：人工覆盖 ??
+  自动检测建议 ?? 0，预览 / OCR / 命名 / 导出全部只读它；自动检测只写
+  detected_rotation，绝不覆盖人工结果，原 PDF 的 /Rotate 不二次旋转；
+- 人工修改优先：人工改过的分隔标记、已确认的标题/单位字段，自动结果永不覆盖；
+- 旋转只设置目标 /Rotate，导出绝不重绘页面；OCR 全程本地离线运行，
+  识别结果只作建议，可人工修改。
 """
 
 from __future__ import annotations
@@ -177,7 +187,16 @@ class App:
             f"文件 {len(docs)} · 共 {total_pages} 页 · 空白候选 {blanks} · 疑似 {maybes}"
             f" · 分组 {n_groups} · 待确认 {n_conf}{cur}"
         )
-        self._update_step_state(len(docs), blanks + maybes > 0, n_groups, n_conf)
+        self._update_step_state(len(docs), self._blank_analysis_done(), n_groups, n_conf)
+
+    def _blank_analysis_done(self) -> bool:
+        """是否已对全部文档执行过空白检测。
+
+        关键区分（v1.9.1 P0-B）：“检测完成但无空白候选”与“尚未检测”是两种状态，
+        旧代码用 `blanks + maybes > 0` 判定，导致无空白页的文件永远无法进入分组。
+        改判"是否存在已检测过的文档"（至少一页 blank 结果非 None）。
+        """
+        return any(p.blank is not None for d in self.ws.documents for p in d.pages)
 
     def _update_step_state(
         self,
@@ -187,13 +206,15 @@ class App:
         n_conf: int | None = None,
     ):
         """按工作流阶段启用/置灰工具栏按钮，并在状态栏给出“下一步”提示。
-        参数缺省时从工作区现算（后台任务收尾等场景直接调用）。"""
+        参数缺省时从工作区现算（后台任务收尾等场景直接调用）。
+
+        has_blank_analysis 语义 = “是否已执行过空白检测”（而非“是否检测到空白页”）：
+        无空白候选的文件同样允许进入分组/补拆，符合连续件的工作流。
+        """
         if n_docs is None:
             docs = self.ws.documents
-            blanks = sum(1 for d in docs for p in d.pages if p.blank and p.blank.verdict == "blank")
-            maybes = sum(1 for d in docs for p in d.pages if p.blank and p.blank.verdict == "maybe")
             n_docs = len(docs)
-            has_blank_analysis = blanks + maybes > 0
+            has_blank_analysis = self._blank_analysis_done()
             n_groups = sum(len(d.groups) for d in docs)
             n_conf = sum(1 for d in docs for g in d.groups if g.need_confirm)
         readiness = {
@@ -213,12 +234,21 @@ class App:
         elif not has_blank_analysis:
             hint = "下一步：检测空白页"
         elif not n_groups:
-            hint = "下一步：自动分组"
+            if self._has_blank_candidates():
+                hint = "下一步：自动分组"
+            else:
+                hint = "未检测到空白页（连续件）：下一步“复核拆分/补拆”建立分组"
         elif n_conf:
             hint = "下一步：确认橙色“待确认”字段，然后导出"
         else:
             hint = "下一步：识别方向 / 复核拆分（可选），然后导出全部"
         self.hint_var.set(hint)
+
+    def _has_blank_candidates(self) -> bool:
+        return any(
+            p.blank and p.blank.verdict in ("blank", "maybe")
+            for d in self.ws.documents for p in d.pages
+        )
 
     def _refresh_all(self):
         self._rebuild_file_list()
@@ -478,12 +508,21 @@ class App:
                 dm = sum(1 for p in d.pages if p.blank and p.blank.verdict == "maybe")
                 self.log(f"{d.name}：空白候选 {db} 页、疑似 {dm} 页（共 {d.page_count} 页）")
             self.log(f"空白检测完成（全部文件合计）：空白候选 {n_blank} 页、疑似 {n_maybe} 页。")
-            messagebox.showinfo(
-                "检测完成",
-                f"空白候选 {n_blank} 页（蓝色“空白”徽章），疑似空白 {n_maybe} 页（橙色“疑似”徽章）。\n\n"
-                "下一步：点击“自动分组”把空白候选页作为拆分点；\n"
-                "疑似页面请在缩略图上右键人工确认（标记/取消分隔页）。",
-            )
+            if n_blank + n_maybe == 0:
+                messagebox.showinfo(
+                    "检测完成",
+                    "本文件未检测到空白页。\n\n"
+                    "如为连续件，可点击“自动分组”建立初始分组，"
+                    "再用“复核拆分/补拆”按页码重置与标题特征提出拆分建议。",
+                )
+            else:
+                messagebox.showinfo(
+                    "检测完成",
+                    f"空白候选 {n_blank} 页（蓝色“空白”徽章），疑似空白 {n_maybe} 页（橙色“疑似”徽章）。\n\n"
+                    "下一步：点击“自动分组”，系统将结合前后页上下文判定这些空白页是"
+                    "“分隔页”还是“内部空白”（内部空白默认保留，不丢页）；\n"
+                    "疑似页面请在缩略图上右键人工确认（标记/取消分隔页）。",
+                )
 
         self._start_task("detect", work, on_done, title="检测空白页")
 
@@ -566,11 +605,19 @@ class App:
             if n_int or n_unc:
                 tail = (f"\n\n已保护 {n_int} 页内部空白、{n_unc} 页待确认空白（默认保留在文档内，"
                         "未作为分隔页删除）。")
-            messagebox.showinfo(
-                "自动分组完成",
-                "已结合前后页上下文识别分隔点：内部空白与待确认页均保留在文档内。" + tail +
-                "\n可在缩略图上右键调整分隔页；建议点击“复核拆分”做双重验证。",
-            )
+            if self._has_blank_candidates():
+                messagebox.showinfo(
+                    "自动分组完成",
+                    "已结合前后页上下文识别分隔点：内部空白与待确认页均保留在文档内。" + tail +
+                    "\n可在缩略图上右键调整分隔页；建议点击“复核拆分”做双重验证。",
+                )
+            else:
+                messagebox.showinfo(
+                    "自动分组完成",
+                    "本文件未检测到空白页，已建立初始分组（整个文件为一份）。\n\n"
+                    "连续件请点击“复核拆分/补拆”，系统将按印刷页码重置与标题特征"
+                    "提出拆分建议；确认后可一键补拆。",
+                )
 
         self._start_task("autogroup", work, on_done, title="自动分组（上下文判定）")
 
@@ -578,6 +625,69 @@ class App:
         """转述 refresh_groups 的迁移/歧义说明（v1.8：人工编辑不静默丢失）。"""
         for note in getattr(doc, "group_migrate_notes", None) or []:
             self.log(f"分组调整：{note}")
+
+    def rename_affected_groups(self, doc=None):
+        """重新识别"拆分边界调整后受影响的分组"（v1.9.1 P0-C）。
+
+        只对**待确认**的组重跑 OCR 命名，且 preserve_confirmed=True：
+        人工已确认的标题/单位字段绝不被覆盖，只填补空白或歧义待确认的字段。
+        这样"命名后改边界"不会把旧文件名静默迁移到错误的新分组，
+        用户也有明确的入口重新识别受影响分组。
+        """
+        if self._busy:
+            return
+        doc = doc or self._active_doc()
+        if not doc or not doc.groups:
+            messagebox.showinfo("重新识别", "请先打开并分组 PDF 文件。")
+            return
+        targets = {gi for gi, g in enumerate(doc.groups) if g.need_confirm}
+        if not targets:
+            messagebox.showinfo("重新识别", "当前没有待确认的分组，无需重新识别。")
+            return
+        engine = OcrEngine.get()
+        use_ocr = engine.available
+        self._push_undo()
+        snap = self.ws.snapshot()
+
+        def work(progress, log, cancel):
+            renderer = PageRenderer(doc.path) if use_ocr else None
+            try:
+                autoname.auto_name_groups(
+                    doc, renderer, engine=engine if use_ocr else None,
+                    progress_cb=lambda i, n: progress(i, n, "重新识别"),
+                    cancel_cb=cancel,
+                    only_indices=targets, preserve_confirmed=True,
+                )
+            finally:
+                if renderer is not None:
+                    renderer.close()
+            return True
+
+        def on_done(_r, canceled, error):
+            self._task_finish()
+            if error:
+                self._restore_ws_snapshot(snap)
+                self._refresh_all()
+                tail = error.splitlines()[-1] if error else "未知错误"
+                self.log(f"重新识别失败：{tail}（已回滚）")
+                messagebox.showerror("重新识别", f"失败：{tail}")
+                return
+            if canceled:
+                self._restore_ws_snapshot(snap)
+                self._refresh_all()
+                self.log("重新识别已取消，未保存任何修改。")
+                return
+            self._refresh_all()
+            still = sum(1 for gi in targets if gi < len(doc.groups) and doc.groups[gi].need_confirm)
+            self.log(f"重新识别完成：处理 {len(targets)} 组，仍有 {still} 组待确认"
+                     "（人工已确认字段未被覆盖）。")
+            messagebox.showinfo(
+                "重新识别完成",
+                f"已对 {len(targets)} 个待确认分组重新识别；人工已确认的字段保持不变。\n"
+                f"仍有 {still} 组需人工确认，请在右侧面板核对。",
+            )
+
+        self._start_task("rename_affected", work, on_done, title="重新识别受影响分组")
 
     def set_separator(self, pages: list[int], value: bool):
         doc = self._active_doc()
@@ -587,6 +697,12 @@ class App:
         for p in pages:
             if 1 <= p <= doc.page_count:
                 doc.pages[p - 1].separator = value
+                # 记录/撤销"人工确认的分隔页"（v1.9.1）：这是导出时允许排除该页的
+                # 唯一人工依据（exporter.business_integrity_issues）。取消分隔标记时移除。
+                if value:
+                    doc.manual_separator_pages.add(p)
+                else:
+                    doc.manual_separator_pages.discard(p)
         grouping.refresh_groups(doc)
         self._refresh_all()
         self._log_migrate_notes(doc)
@@ -759,14 +875,22 @@ class App:
             if canceled:
                 self.log("方向分析已取消。")
                 return
-            # 记录自动检测结果（detected_rotation），**不覆盖**人工已确认方向。
+            # v1.9.1 P0-A：自动检测只写"待确认建议"（rotation_proposal），
+            # **绝不**直接写 detected_rotation——后者会立即改变 effective_rotation，
+            # 使建议在用户确认前就影响预览 / OCR / 导出。人工已确认的方向也不覆盖。
             for r in results:
                 if r.page < 1 or r.page > doc.page_count:
                     continue
                 ps = doc.pages[r.page - 1]
-                if r.suggested_angle is not None:
-                    ps.detected_rotation = int(r.suggested_angle) % 360
-                    ps.detected_confidence = float(r.confidence)
+                if ps.is_rotation_manual:
+                    ps.rotation_proposal = None  # 人工已定，撤销待确认建议
+                    continue
+                if r.suggested_angle not in (None, 0):
+                    ps.rotation_proposal = int(r.suggested_angle) % 360
+                    ps.rotation_proposal_confidence = float(r.confidence)
+                    ps.rotation_proposal_note = r.suggestion_note or ""
+                elif r.suggested_angle == 0:
+                    ps.rotation_proposal = None  # 判定无需旋转 → 无建议
             self._direction_show_results(doc, candidates, sugg, results=results, scope=scope)
 
         if not self._start_task("direction", work, on_done, title="识别方向（本地 OCR 方向对比）"):
@@ -777,25 +901,31 @@ class App:
             r.page for r in results
             if r.suggested_angle not in (None, 0)
         ]
-        # OCR 判定内容侧放的页面：询问是否一键摆正（可撤销，仍可手动调整）
+        # OCR 判定内容侧放的页面：**明确询问**是否一键摆正。
+        # v1.9.1 P0-A：建议已只写 rotation_proposal（不影响 effective_rotation），
+        # 只有用户在此点"是"才写入人工方向；点"否"则方向保持不变（零副作用），
+        # 仍可在随后的方向对话框逐页选择。
         if ocr_pages:
             by_page = {r.page: r for r in results}
             desc = "、".join(
                 f"第 {p} 页→{by_page[p].suggested_angle}°" for p in ocr_pages
             )
             if messagebox.askyesno(
-                "自动摆正",
+                "采用方向建议？",
                 f"检测到 {len(ocr_pages)} 页内容侧放（横版表格竖着扫描等）：\n"
                 f"{desc}\n\n"
-                "是否按建议自动旋转摆正？\n"
-                "（仅写入页面旋转属性，不重绘内容；Ctrl+Z 可撤销）",
+                "【是】按建议摆正这些页面（可 Ctrl+Z 撤销）；\n"
+                "【否】不采用建议，方向保持不变，可在随后对话框中逐页选择。\n\n"
+                "（仅写入页面旋转属性，不重绘内容）",
             ):
                 self.apply_rotation(
                     {p: int(by_page[p].suggested_angle) % 360 for p in ocr_pages},
                     doc=doc,
                 )
-                self.log(f"自动摆正 {len(ocr_pages)} 页：{desc}")
+                self.log(f"已采用方向建议并摆正 {len(ocr_pages)} 页：{desc}")
                 ocr_pages = []
+            else:
+                self.log(f"未采用方向建议（{len(ocr_pages)} 页方向保持不变）。")
         pages = sorted(set(sugg) | set(ocr_pages))
         if not pages:
             if results and all(r.suggested_angle is None for r in results):
@@ -812,13 +942,20 @@ class App:
         DirectionDialog(self.root, self, doc, pages, results, sugg, scope=scope)
 
     def apply_rotation(self, mapping: dict[int, int], doc=None):
+        """应用人工确认的方向（写入 user_override_rotation）。
+
+        v1.9.1 P0-A：应用即视为人工决定，清除该页的待确认建议；人工方向
+        后续不会被自动检测覆盖（见 PageState.is_rotation_manual）。
+        """
         doc = doc or self._active_doc()
         if not doc:
             return
         self._push_undo()
         for p, angle in mapping.items():
             if 1 <= p <= doc.page_count:
-                doc.pages[p - 1].rotation = int(angle) % 360
+                ps = doc.pages[p - 1]
+                ps.rotation = int(angle) % 360
+                ps.rotation_proposal = None  # 建议已被采纳，清除暂存
         self._refresh_all()
         self.log("已应用旋转：" + "、".join(f"第{p}页→{a}°" for p, a in sorted(mapping.items())))
 
@@ -946,6 +1083,108 @@ class App:
 
     # -- 导出 -------------------------------------------------------------------
 
+    # -- 导出前检查与导出 --------------------------------------------------------
+
+    def export_name_conflicts(self) -> dict[str, int]:
+        """统计本工作区所有分组按当前模板生成的**导出文件名**重复次数。
+
+        仅用于导出前提示（导出时 exporter.unique_path 仍会自动加 (2) 兜底）；
+        重名意味着用户很可能对多个组填了相同标题/单位，应人工核对。
+        """
+        template = self.template_var.get() or naming.DEFAULT_TEMPLATE
+        counts: dict[str, int] = {}
+        for doc in self.ws.documents:
+            for gi, g in enumerate(doc.groups):
+                name = naming.build_filename(
+                    g.title, g.unit, template=template, index=gi + 1,
+                    orig=doc.name, start=g.start, end=g.end,
+                ) + ".pdf"
+                counts[name] = counts.get(name, 0) + 1
+        return {k: v for k, v in counts.items() if v > 1}
+
+    def export_summary(self, docs, opts) -> tuple[list[str], list[str], dict]:
+        """导出前检查摘要（v1.9.1 阶段五）。
+
+        返回 (field_issues, integrity_issues, stats)：
+        - field_issues：字段不完整/待确认/重名等**可放宽**的问题（非严格模式可继续）；
+        - integrity_issues：页面覆盖率/异常排除/源文件保真等**不可放宽**的问题
+          （fail-closed，即便非严格模式也阻断）；
+        - stats：供摘要对话框展示的统计。
+        """
+        template = opts.template or naming.DEFAULT_TEMPLATE
+        needs_title = "{title}" in template
+        needs_unit = "{unit}" in template
+        field_issues: list[str] = []
+        integrity_issues: list[str] = []
+
+        n_groups = sum(len(d.groups) for d in docs)
+        n_confirmed = sum(
+            1 for d in docs for g in d.groups if not g.need_confirm
+        )
+        n_pending = n_groups - n_confirmed
+        excluded_pages: list[str] = []
+
+        for doc in docs:
+            for gi, g in enumerate(doc.groups):
+                if needs_title and not g.title.strip():
+                    field_issues.append(f"{doc.name} 文档{gi+1}（第{g.start}-{g.end}页）：标题为空")
+                if needs_unit and not g.unit.strip():
+                    field_issues.append(f"{doc.name} 文档{gi+1}（第{g.start}-{g.end}页）：单位为空白")
+                if opts.strict and g.need_confirm:
+                    field_issues.append(
+                        f"{doc.name} 文档{gi+1}（第{g.start}-{g.end}页）：存在待确认字段"
+                    )
+                if g.start < 1 or g.end > doc.page_count or g.start > g.end:
+                    integrity_issues.append(
+                        f"{doc.name} 文档{gi+1}：页码范围无效（{g.start}-{g.end}）"
+                    )
+            # 异常排除（未确认依据的丢页）→ integrity（fail-closed）
+            for msg in exporter.business_integrity_issues(doc):
+                integrity_issues.append(msg)
+            for p in sorted(doc.separators):
+                st = doc.pages[p - 1]
+                ctx = getattr(st, "blank_context", "") or "未判定"
+                excluded_pages.append(f"{doc.name} 第 {p} 页（依据：{ctx}）")
+
+        # 重名冲突 → field 级（可人工修名后重试，但也不宜静默）
+        dup = self.export_name_conflicts()
+        for name, cnt in sorted(dup.items()):
+            field_issues.append(f"输出文件名重复 ×{cnt}：{name}")
+
+        stats = {
+            "n_groups": n_groups,
+            "n_confirmed": n_confirmed,
+            "n_pending": n_pending,
+            "excluded": excluded_pages,
+            "n_field": len(field_issues),
+            "n_integrity": len(integrity_issues),
+            "dup": dup,
+        }
+        return field_issues, integrity_issues, stats
+
+    def _format_export_summary(self, stats: dict) -> str:
+        """生成导出前检查摘要文本（简洁、一眼看清）。"""
+        lines = [
+            "导出前检查摘要：",
+            f"· 预计导出 {stats['n_groups']} 份 PDF",
+            f"· 名称已确认 {stats['n_confirmed']} 份"
+            + (f"，待确认 {stats['n_pending']} 份" if stats["n_pending"] else "（全部已确认）"),
+        ]
+        n_split = stats.get("n_split")
+        if stats.get("excluded"):
+            ex = stats["excluded"]
+            lines.append(f"· 排除原始页 {len(ex)} 页：" + "、".join(ex[:8])
+                         + ("……" if len(ex) > 8 else ""))
+        else:
+            lines.append("· 无被排除的原始页")
+        if stats.get("dup"):
+            lines.append("· 重名冲突：" + "、".join(
+                f"{n}×{c}" for n, c in list(stats["dup"].items())[:5]))
+        else:
+            lines.append("· 无重名冲突")
+        lines.append("· 漏页/重复页：导出后将做全局覆盖率校验（fail-closed）")
+        return "\n".join(lines)
+
     def export_all(self):
         if self._busy:
             return
@@ -965,20 +1204,40 @@ class App:
             return
         template = self.template_var.get() or naming.DEFAULT_TEMPLATE
         opts = exporter.ExportOptions(template=template, out_dir=out_dir, strict=True)
-        issues = exporter.preflight(docs, opts)
-        if issues:
-            # 严格模式（v1.8 默认）：空标题/空单位/待确认字段为阻断项，
-            # 仅在用户显式选择"非严格模式"后放行（面向测试文件）。
+        field_issues, integrity_issues, stats = self.export_summary(docs, opts)
+
+        # 页面完整性 / 异常排除 / 源文件保真问题 → fail-closed，**不提供**非严格模式绕过
+        if integrity_issues:
+            messagebox.showerror(
+                "导出被阻止（页面完整性）",
+                "检测到页面完整性/排除依据问题，正式导出一律阻断，"
+                "非严格模式也不能绕过：\n\n"
+                + "\n".join(integrity_issues[:15])
+                + ("\n……" if len(integrity_issues) > 15 else "")
+                + "\n\n请在缩略图上核对分隔页/拆分点，或重新执行“自动分组”，"
+                "确保没有未确认依据的丢页后重试。",
+            )
+            self.log(f"导出被阻止：{len(integrity_issues)} 项页面完整性问题（fail-closed）。")
+            return
+
+        # 字段不完整/待确认/重名 → 可经用户显式确认后以非严格模式继续
+        if field_issues:
+            summary = self._format_export_summary(stats)
             if not messagebox.askyesno(
                 "严格导出检查未通过",
-                "以下分组存在阻断项（空标题、空单位或存在待确认字段）：\n\n"
-                + "\n".join(issues[:15])
-                + ("\n……" if len(issues) > 15 else "")
+                summary
+                + "\n\n以下分组存在阻断项（空标题、空单位、待确认字段或重名）：\n"
+                + "\n".join(field_issues[:15])
+                + ("\n……" if len(field_issues) > 15 else "")
                 + "\n\n【正式导出】请先补全并确认标题/单位后重试。\n"
                 "是否改用【非严格模式】继续导出？（仅建议用于测试文件）",
             ):
                 return
             opts.strict = False
+        else:
+            # 全部通过：展示简洁检查摘要后继续
+            if not messagebox.askyesno("导出前检查", self._format_export_summary(stats) + "\n\n是否开始导出？"):
+                return
         self._busy = True
         self._update_step_state()
 
@@ -1137,7 +1396,7 @@ class BoundaryDialog(tk.Toplevel):
             ttk.Label(self, text="没有可复核的拆分边界。", padding=12).pack()
             ttk.Button(self, text="关闭", command=self.destroy).pack(pady=6)
             return
-        ttk.Label(self, text="空白页拆分是第一依据；OCR 首页标题检测作为第二验证：",
+        ttk.Label(self, text="拆分依据：页码重置 + 首页标题特征双重验证，双信号一致才自动补拆：",
                   padding=8).pack(anchor="w")
         frame = ttk.Frame(self, padding=6)
         frame.pack(fill="both", expand=True)

@@ -1,8 +1,12 @@
 """OCR 自动命名编排：标题/单位提取、横向页方向分析、拆分边界双重验证。
 
-- 空白页检测是拆分的第一依据；OCR 首页标题只作为第二验证信号，
-  两者不一致时必须用户确认。
+- 空白页检测生成分隔候选；其业务属性（分隔/内部空白/待确认）由 splitctx
+  结合上下文判定（见 grouping/splitctx），只有分隔页才排除，其余默认保留。
+- 无空白页分隔的连续件由 smart_split_review 补拆：印刷页码重置 + 标题特征
+  双信号一致才自动补拆（可撤销），单信号仅提示人工确认，绝不凭单一信号改动分组。
 - OCR 结果全部来自实际识别文字，识别失败不编造，字段标记"待确认"。
+- 方向分析（analyze_directions）仅给出建议并写入 detected_rotation，
+  绝不自动旋转；是否采用由用户在方向对话框中确认。
 - OCR 只读取渲染图像，绝不写回 PDF。
 """
 
@@ -149,16 +153,28 @@ def auto_name_groups(
     engine=None,
     progress_cb=None,
     cancel_cb=None,
+    only_indices: set[int] | None = None,
+    preserve_confirmed: bool = False,
 ) -> list[NameResult]:
     """为每份分组自动提取标题与发文单位并填入组。
 
     engine 为 None 时仅走文本层路径（无 OCR 环境）。
+
+    only_indices：只处理这些组下标（None = 全部）。用于"拆分边界调整后
+    重新识别受影响分组"，避免对未受影响的组重复 OCR。
+    preserve_confirmed：True 时**不覆盖**已人工确认（*_confirmed=True 且已有值）
+    的字段——重新识别只填补空白/待确认字段，绝不抹掉用户已确认的结果。
     """
     results: list[NameResult] = []
     total = len(doc.groups)
     for gi, g in enumerate(doc.groups):
         if cancel_cb and cancel_cb():
             break
+        if only_indices is not None and gi not in only_indices:
+            continue
+        # 人工已确认的字段在 preserve_confirmed 下受保护（重识别只填空白字段）
+        keep_title = preserve_confirmed and g.title_confirmed and g.title.strip()
+        keep_unit = preserve_confirmed and g.unit_confirmed and g.unit.strip()
         res = NameResult(group_index=gi)
         first0, last0 = g.start - 1, g.end - 1
 
@@ -205,13 +221,17 @@ def auto_name_groups(
         # 2) 填入组字段
         best_t = res.best_title
         best_u = res.best_unit
-        if best_t and best_t.confidence >= CONFIRM_THRESHOLD:
+        if keep_title:
+            pass  # 人工已确认的标题保持不变，仅刷新候选
+        elif best_t and best_t.confidence >= CONFIRM_THRESHOLD:
             g.title = best_t.text
             g.title_conf = best_t.confidence
         else:
             g.title = best_t.text if best_t else ""
             g.title_conf = best_t.confidence if best_t else None
-        if best_u and best_u.confidence >= CONFIRM_THRESHOLD:
+        if keep_unit:
+            pass  # 人工已确认的单位保持不变，仅刷新候选
+        elif best_u and best_u.confidence >= CONFIRM_THRESHOLD:
             g.unit = best_u.text
             g.unit_conf = best_u.confidence
         else:
@@ -225,13 +245,15 @@ def auto_name_groups(
         # （_unit_auto_confirm），正文噪声不再凭置信度过线直接落盘。
         # 人工已确认状态不会被此处清除：本函数只在 OCR 命名时写入，
         # 已有人工编辑的组由 UI 层守卫（本流程启动前提示）。
-        g.title_confirmed = bool(
-            res.title_candidates
-            and best_t
-            and best_t.text.strip()
-            and best_t.confidence >= CONFIRM_THRESHOLD
-        )
-        g.unit_confirmed = _unit_auto_confirm(res)
+        if not keep_title:
+            g.title_confirmed = bool(
+                res.title_candidates
+                and best_t
+                and best_t.text.strip()
+                and best_t.confidence >= CONFIRM_THRESHOLD
+            )
+        if not keep_unit:
+            g.unit_confirmed = _unit_auto_confirm(res)
         results.append(res)
         if progress_cb:
             progress_cb(gi + 1, total)
