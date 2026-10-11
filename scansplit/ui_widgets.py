@@ -208,6 +208,18 @@ class ThumbnailStrip(ttk.Frame):
         self.canvas.yview_scroll(-int(e.delta / 120) * 2, "units")
         self.redraw()
 
+    def ensure_visible(self, page_no: int):
+        """把指定页滚动到缩略图视口内（分组面板定位时用）。"""
+        if not self._doc or not (1 <= page_no <= self._n):
+            return
+        total_h = max(self._n * THUMB_CELL_H, 1)
+        target = (page_no - 1) * THUMB_CELL_H
+        view_h = max(self.canvas.winfo_height(), 200)
+        top = self.canvas.yview()[0] * total_h
+        if target < top or target + THUMB_CELL_H > top + view_h:
+            self.canvas.yview_moveto(max(0.0, min(1.0, target / total_h)))
+        self.redraw()
+
 
 # -- 预览面板 ---------------------------------------------------------------
 
@@ -435,10 +447,25 @@ class GroupPanel(ttk.LabelFrame):
                   font=("Segoe UI", 10, "bold")).pack(side="left")
         self.confirm_lbl = ttk.Label(head, text="", padding=(5, 0))
         self.confirm_lbl.pack(side="left", padx=6)
-        ttk.Button(head, text="预览", width=5, command=lambda: self.app.on_page_select(group.start, preview=True)).pack(side="right")
+        ttk.Button(head, text="预览首页", width=8, command=lambda: self._preview(group.start)).pack(side="right")
         ttk.Button(head, text="整组识别方向", width=12,
                    command=lambda: self.app.direction_analyze_group(gi, self.doc)).pack(side="right", padx=2)
         ttk.Button(head, text="整组+90°", width=8, command=lambda: self.app.rotate_pages_in_group(gi, 90)).pack(side="right", padx=2)
+
+        # 边界前后页查看：判断是否误拆（上一边界前页 / 本组首页 / 本组末页 / 下一边界后页）
+        bd = ttk.Frame(self)
+        bd.pack(fill="x", pady=(2, 0))
+        ttk.Label(bd, text="边界前后页：", foreground="#5d6d7e").pack(side="left")
+        prev_p = group.start - 1
+        next_p = group.end + 1
+        ttk.Button(bd, text=f"‹前页({prev_p})" if prev_p >= 1 else "‹前页(—)", width=11,
+                   command=lambda p=prev_p: self._preview(p)).pack(side="left", padx=1)
+        ttk.Button(bd, text=f"首页({group.start})", width=10,
+                   command=lambda: self._preview(group.start)).pack(side="left", padx=1)
+        ttk.Button(bd, text=f"末页({group.end})", width=10,
+                   command=lambda: self._preview(group.end)).pack(side="left", padx=1)
+        ttk.Button(bd, text=f"后页({next_p})›" if next_p <= self.doc.page_count else "后页(—)›", width=11,
+                   command=lambda p=next_p: self._preview(p)).pack(side="left", padx=1)
 
         self.title_var = tk.StringVar(value=group.title)
         self.unit_var = tk.StringVar(value=group.unit)
@@ -453,7 +480,7 @@ class GroupPanel(ttk.LabelFrame):
             self.title_cb.set(tc[0])
         self.title_cb.pack(side="left", padx=(4, 0))
         self.title_cb.bind("<<ComboboxSelected>>", lambda e: self.title_var.set(self.title_cb.get()))
-        self.title_conf_lbl = ttk.Label(self, text=self._conf_text(group.title_candidates), foreground="#5d6d7e")
+        self.title_conf_lbl = ttk.Label(self, text="", foreground="#5d6d7e")
         self.title_conf_lbl.pack(anchor="e")
 
         r2 = ttk.Frame(self)
@@ -467,7 +494,7 @@ class GroupPanel(ttk.LabelFrame):
             self.unit_cb.set(uc[0])
         self.unit_cb.pack(side="left", padx=(4, 0))
         self.unit_cb.bind("<<ComboboxSelected>>", lambda e: self.unit_var.set(self.unit_cb.get()))
-        self.unit_conf_lbl = ttk.Label(self, text=self._conf_text(group.unit_candidates), foreground="#5d6d7e")
+        self.unit_conf_lbl = ttk.Label(self, text="", foreground="#5d6d7e")
         self.unit_conf_lbl.pack(anchor="e")
 
         r3 = ttk.Frame(self)
@@ -481,19 +508,39 @@ class GroupPanel(ttk.LabelFrame):
         self._loading = False
         self._update_filename()
         self._update_confirm_badge()
+        self._refresh_field_hints()
 
-    def _conf_text(self, cands: list) -> str:
+    def _conf_text(self, cands: list, field: str = "title", confirmed: bool = True) -> str:
+        """字段证据行（v1.9.1 阶段四）：明确区分"已人工确认 / 自动建议 / 待确认"，
+        并展示 OCR 候选来源（文头/落款/正文/标题/文本层）。"""
+        if confirmed:
+            if cands:
+                c = cands[0]
+                return f"已人工确认 · 来源 {c.get('source', '')}"
+            return "已人工确认（无候选）"
         if not cands:
-            return "无候选 · 待确认"
+            return "无候选 · 待确认（需手动填写）"
         c = cands[0]
         try:
             conf = float(c.get("confidence", 0.0))
         except (TypeError, ValueError):
             conf = 0.0
-        s = f"置信 {conf:.0%} · {c.get('source', '')}"
-        if conf < 0.55:
-            s += " · 待确认"
+        src = c.get("source", "")
+        reason = c.get("reason", "")
+        s = f"自动建议 · 置信 {conf:.0%} · 来源 {src}"
+        # 正文弱证据不得冒充已确认（明确警示）
+        if src == "正文":
+            s += " · 弱证据，需人工核对"
+        if reason:
+            s += f" · {reason}"
         return s
+
+    def _refresh_field_hints(self):
+        """刷新标题/单位证据行（区分自动建议与已人工确认）。"""
+        self.title_conf_lbl.configure(text=self._conf_text(
+            self.group.title_candidates, "title", self.group.title_confirmed))
+        self.unit_conf_lbl.configure(text=self._conf_text(
+            self.group.unit_candidates, "unit", self.group.unit_confirmed))
 
     def _on_change(self, field_name: str, *a):
         """字段级确认（v1.8）：编辑哪个字段只确认哪个字段，
@@ -507,6 +554,7 @@ class GroupPanel(ttk.LabelFrame):
             self.group.unit = self.unit_var.get().strip()
             self.group.unit_confirmed = True
         self._update_confirm_badge()
+        self._refresh_field_hints()
         self.app.update_status()
         self._update_filename()
 
@@ -531,15 +579,57 @@ class GroupPanel(ttk.LabelFrame):
             index=self.gi + 1, orig=self.doc.name,
             start=self.group.start, end=self.group.end,
         )
-        self.fname_lbl.configure(text=name + ".pdf")
+        # 重名冲突预检（同批导出内的文件名重复）
+        dup = self.app.export_name_conflicts().get(name + ".pdf")
+        if dup and dup > 1:
+            self.fname_lbl.configure(text=name + ".pdf  ⚠ 重名 ×" + str(dup), foreground="#a93226")
+        else:
+            self.fname_lbl.configure(text=name + ".pdf", foreground="#1a6b3c")
+
+    def _preview(self, page_no: int):
+        """定位到指定页（用于查看分组首页 / 边界前后页）。"""
+        if 1 <= page_no <= self.doc.page_count:
+            self.app.on_page_select(page_no, preview=True)
+            self.app.thumbs.ensure_visible(page_no)
+
+    def focus_pending(self):
+        """定位本组首页，并让面板滚动到可视区（"下一处待确认"用）。"""
+        self._preview(self.group.start)
+        try:
+            self.update_idletasks()
+            y = self.winfo_y()
+            total = max(self.master.winfo_height(), 1)
+            self.update_idletasks()
+            inner_h = max(self.master.winfo_height(), 1)
+            area = getattr(self.app, "groups", None)
+            if area is not None:
+                bbox = area.canvas.bbox("all")
+                if bbox and bbox[3] > 0:
+                    area.canvas.yview_moveto(max(0.0, (y - 20) / bbox[3]))
+        except Exception:
+            pass
 
 
 class GroupPanelArea(ttk.Frame):
-    """右侧分组面板滚动区。"""
+    """右侧分组面板滚动区（含顶部"待处理问题"汇总条）。"""
 
     def __init__(self, master, app):
         super().__init__(master)
         self.app = app
+        # 顶部汇总条：集中展示待处理问题（不靠日志），并提供待确认项快速跳转
+        self.summary = ttk.Frame(self, padding=(6, 4))
+        self.summary.pack(fill="x")
+        self.summary_lbl = ttk.Label(self.summary, text="", anchor="w", justify="left")
+        self.summary_lbl.pack(side="left", fill="x", expand=True)
+        self.next_btn = ttk.Button(self.summary, text="下一处待确认", width=12,
+                                   command=self._goto_next_pending)
+        self.next_btn.pack(side="right")
+        self.rename_btn = ttk.Button(self.summary, text="重新识别受影响组", width=15,
+                                     command=lambda: self.app.rename_affected_groups())
+        self.rename_btn.pack(side="right", padx=(0, 4))
+        self._pending_panels: list = []
+        self._pending_cursor = -1
+
         self.canvas = tk.Canvas(self, highlightthickness=0)
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=vsb.set)
@@ -556,7 +646,10 @@ class GroupPanelArea(ttk.Frame):
         for p in self.panels:
             p.destroy()
         self.panels = []
+        self._pending_panels = []
+        self._pending_cursor = -1
         if doc is None:
+            self.summary_lbl.configure(text="")
             return
         history = self.app.unit_history.items
         for gi, g in enumerate(doc.groups):
@@ -566,7 +659,46 @@ class GroupPanelArea(ttk.Frame):
         if not doc.groups:
             ttk.Label(self.inner, text="尚未分组。请先运行“检测空白页”与“自动分组”。",
                       foreground="#5d6d7e").pack(pady=12)
+        self._update_summary(doc)
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _update_summary(self, doc):
+        """汇总本文件的待处理问题（待确认字段 / 待确认边界 / 分隔页）。"""
+        n_conf = [gi for gi, g in enumerate(doc.groups) if g.need_confirm]
+        n_sep = len(doc.separators)
+        n_split = len(doc.split_starts)
+        n_prop = sum(1 for p in doc.pages if getattr(p, "has_rotation_proposal", False))
+        parts = [f"共 {len(doc.groups)} 组"]
+        if n_conf:
+            parts.append(f"⚠ {len(n_conf)} 组待确认命名")
+        if n_prop:
+            parts.append(f"⚠ {n_prop} 页有方向建议待处理")
+        if n_sep:
+            parts.append(f"分隔页 {n_sep}（导出排除）")
+        if n_split:
+            parts.append(f"拆分点 {n_split}")
+        if n_conf:
+            self.summary_lbl.configure(
+                text=" · ".join(parts), foreground="#a04000")
+        else:
+            self.summary_lbl.configure(text=" · ".join(parts), foreground="#1e8449")
+        self._pending_panels = [self.panels[gi] for gi in n_conf if gi < len(self.panels)]
+
+    def _goto_next_pending(self):
+        """在所有分组面板中循环跳转到下一个"待确认"分组，并定位其首页。"""
+        self._refresh_pending()
+        if not self._pending_panels:
+            self.app.log("没有待确认的分组。")
+            return
+        self._pending_cursor = (self._pending_cursor + 1) % len(self._pending_panels)
+        panel = self._pending_panels[self._pending_cursor]
+        panel.focus_pending()
+        self.app.log(f"定位待确认分组：文档 {panel.gi + 1}（第 {panel.group.start}-{panel.group.end} 页）")
+
+    def _refresh_pending(self):
+        self._pending_panels = [p for p in self.panels if p.group.need_confirm]
+        if self._pending_cursor >= len(self._pending_panels):
+            self._pending_cursor = -1
 
 
 # -- 日志与进度 ---------------------------------------------------------------
