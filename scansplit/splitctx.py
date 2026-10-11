@@ -23,6 +23,10 @@
     → 加强 separator；
   * 存在"续表/续页/（续）"标记（has_continuation）→ 强 internal 证据。
 
+上下文 OCR 方向感知：内容页先 0° 识别，侧放页（检测框竖行为主）自动在
+90/270 中选质量更高者回正后再提取上述证据——侧放表格首页的标题/页码
+只有回正后才能读到（真实样本实测）。
+
 判定（保守优先；证据不足或矛盾一律 uncertain，默认保留）：
   1. 后页页码 == 1 → separator；后页页码 > 1 → internal_blank；
   2. 否则若存在"续表/续页/（续）"标记 → internal_blank；
@@ -90,17 +94,38 @@ def _nearest_content(doc, page_1based: int, step: int) -> int | None:
 
 
 def _page_ocr(renderer, engine, page_1based: int, cache: dict) -> tuple:
-    """对指定页做一次 0° 渲染 + OCR，返回 (lines, w, h)。
+    """对指定页做一次方向感知 OCR，返回 (lines, w, h)。
 
+    先 0° 常规引擎识别（含 cls，只用于读取"页码/首页结构"，不用于方向判断）；
+    若内容侧放（检测框竖行为主），用禁用 cls 的引擎在 90/270 中选质量更高者——
+    侧放页的标题/页码/续表标记只有回正后才能正确提取（实测：分隔空白后紧跟
+    侧放表格首页时，0° 下 has_title 恒为 False，导致真分隔页被判 uncertain）。
     带页内缓存，避免同一上下文页被前后多个空白候选重复识别。
-    使用常规引擎（含 cls）：只用于读取"页码/首页结构"，不用于方向判断。
     """
+    from . import ocrfields  # 延迟导入，避免循环依赖
+
     if page_1based in cache:
         return cache[page_1based]
     try:
         img = renderer.render(page_1based - 1, width_px=1000, bucket="ctx")
         lines = engine.recognize(img)
         w, h = img.size
+        kind, _frac = ocrfields.line_orientation(lines)
+        if kind == "vertical":
+            from .ocr import OcrEngineNoCls
+
+            raw = OcrEngineNoCls.get()
+            if raw.available:
+                best_lines, best_wh, best_q = None, (w, h), -1.0
+                for angle in (90, 270):
+                    img2 = renderer.render(
+                        page_1based - 1, width_px=1000, user_rotation=angle, bucket="ctx-rot")
+                    ls = raw.recognize(img2)
+                    q = ocrfields.direction_quality({angle: ls})[angle]["quality"]
+                    if q > best_q:
+                        best_lines, best_wh, best_q = ls, img2.size, q
+                if best_lines is not None:
+                    lines, w, h = best_lines, best_wh[0], best_wh[1]
     except Exception:
         lines, w, h = [], 1.0, 1.0
     cache[page_1based] = (lines, w, h)
