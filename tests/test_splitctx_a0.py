@@ -218,6 +218,37 @@ def test_first_page_structure_recipient_is_separator():
     assert evs[0].verdict == SEPARATOR
 
 
+def test_table_fake_pagenum_with_new_title_is_separator():
+    """表格数字假页码 + 无续接后缀 + 与前一内容页标题不同源 → 分隔空白。
+
+    真实场景（81 页压力件 p11/p12）：分隔页后是侧放表格首页，其页码被
+    误取为表格数字（如 18），标题为表名（全页最大字号）。此时应识别为
+    新文档首页，从而删除前隔页，而非把整个文档粘连。
+    """
+    doc = _doc_with(["c", "b", "c"])
+    evs = _judge(doc, {
+        1: PageSpec(title="上一份文档标题", title_px=60, body_px=30),
+        3: PageSpec(title="教学仪器设备季度统计表", title_px=64, body_px=30,
+                    page_number=18),
+    })
+    assert evs[0].verdict == SEPARATOR
+
+
+def test_table_same_title_continuation_page_is_internal_blank():
+    """后页虽带"假页码"且为强首面结构，但与前一内容页标题同源 → 内部续页，保留。
+
+    真实场景（81 页压力件 p57→p58→p59）：同一张表格文档内部出现空白页，
+    前后内容页重印同一表名；此时绝不可判为分隔页，否则会把表格文档拆散。
+    """
+    doc = _doc_with(["c", "b", "c"])
+    evs = _judge(doc, {
+        1: PageSpec(title="实验教学中心巡查记录表页次：4", title_px=60, body_px=30),
+        3: PageSpec(title="实验教学中心巡查记录表", title_px=64, body_px=30,
+                    page_number=18),
+    })
+    assert evs[0].verdict == INTERNAL_BLANK
+
+
 def test_section_heading_without_title_is_uncertain():
     """顶部只有序号小节标题、无文档首面结构 → uncertain（保守保留）。"""
     doc = _doc_with(["c", "b", "c"])

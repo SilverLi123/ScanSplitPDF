@@ -23,21 +23,29 @@
     → 加强 separator；
   * 存在"续表/续页/（续）"标记（has_continuation）→ 强 internal 证据。
 
+证据 C（前后内容页标题同源）：后一内容页与最近的前一内容页标题去噪后
+相同/互为前后缀/一方含另一方 → 后页是同一份文档的续页（表格文档续页
+常重印表名），否决 separator。
+
 上下文 OCR 方向感知：内容页先 0° 识别，侧放页（检测框竖行为主）自动在
 90/270 中选质量更高者回正后再提取上述证据——侧放表格首页的标题/页码
 只有回正后才能读到（真实样本实测）。
 
 判定（保守优先；证据不足或矛盾一律 uncertain，默认保留）：
-  1. 后页页码 == 1 → separator；后页页码 > 1 → internal_blank；
-  2. 否则若存在"续表/续页/（续）"标记 → internal_blank；
-  3. 否则若后页具备文档首面结构（标题最大 / 有主送机关）→ separator；
-  4. 否则 → uncertain（保留，交人工/复核）。
+  1. 后页页码 == 1 → separator；
+  2. 后页页码 > 1 且为强文档首面结构（标题最大 / 有主送机关）、无续接
+     后缀、且与前一内容页标题不同源 → 该"页码"疑为表格数字（真实样本
+     侧放表格首页实测），判 separator；后页页码 > 1 的其他情形 → internal_blank；
+  3. 否则若存在"续表/续页/（续）"标记 → internal_blank；
+  4. 否则若后页具备文档首面结构（标题最大 / 有主送机关）→ separator；
+  5. 否则 → uncertain（保留，交人工/复核）。
 
 约束：本模块只读取渲染图做 OCR，**绝不修改 PDF**。
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 # 业务属性枚举
@@ -66,6 +74,8 @@ class ContextEvidence:
     prev_title_likeness: float = 0.0
     # 后一内容页的首页结构特征（见 ocrfields.first_page_structure）
     next_structure: dict | None = None
+    # 前一内容页的首页结构特征（用于"前后页标题同源"判定）
+    prev_structure: dict | None = None
     reason: str = ""
 
     def to_dict(self) -> dict:
@@ -78,8 +88,36 @@ class ContextEvidence:
             "next_title_likeness": round(self.next_title_likeness, 3),
             "prev_title_likeness": round(self.prev_title_likeness, 3),
             "next_structure": dict(self.next_structure or {}),
+            "prev_structure": dict(self.prev_structure or {}),
             "reason": self.reason,
         }
+
+
+# 标题归一化：去掉页码/页次等噪声后缀与标点空白，便于"同源"比较。
+_TITLE_NOISE_RE = re.compile(r"页次[：:]\s*\d+|第\s*\d+\s*页|共\s*\d+\s*页|[（(]\s*(?:统计|数据)?\s*附\s*[表页件]\s*[）)]")
+
+
+def _norm_title(t: str) -> str:
+    t = _TITLE_NOISE_RE.sub("", t or "")
+    return re.sub(r"[\s，。、；：,.;:()（）\-—_]+", "", t)
+
+
+def _titles_same_source(a: str, b: str) -> bool:
+    """判断两页标题是否"同源"（同一份文档的续页）。
+
+    同源包括：完全相等、一方为另一方的（去噪后）前缀/后缀、或去掉续接后缀后相等。
+    用于区分"表格文档内部续页（前后页同标题）"与"新文档首页（标题不同）"。
+    """
+    na, nb = _norm_title(a), _norm_title(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
+    # 短标题（≥5 字）是长标题的子串 → 视为同源（如"实验教学中心巡查记录表" ⊂ "…记录表（续表）"）
+    if len(shorter) >= 5 and (shorter in longer):
+        return True
+    return False
 
 
 def _nearest_content(doc, page_1based: int, step: int) -> int | None:
@@ -183,23 +221,43 @@ def judge_blank_context(
                 if plns:
                     ev.prev_page_number = pagenum.extract_page_number(plns, ph)
                     ev.prev_title_likeness = ocrfields.title_likeness(plns, pw, ph)
+                    ev.prev_structure = ocrfields.first_page_structure(plns, pw, ph)
 
             # --- 多位证据判定 ---
             st = ev.next_structure or {}
+            pst = ev.prev_structure or {}
             nxt_is_first = ev.next_page_number == 1
             nxt_mid = ev.next_page_number is not None and ev.next_page_number > 1
             has_cont = bool(st.get("has_continuation"))
             has_title = bool(st.get("has_title"))
             strong_title = has_title and (st.get("title_is_max") or st.get("has_recipient"))
+            # "前后页标题同源"：后页与最近的前一内容页标题相同/互为前后缀
+            # → 后页是同一份文档的续页（表格文档内部续页常重印表名）。
+            same_src = (prv is not None) and _titles_same_source(
+                st.get("title_text", ""), pst.get("title_text", ""))
 
             if nxt_is_first:
                 # 证据 A：后一内容页页码明确重置为 1 → 新文档首页
                 ev.verdict = SEPARATOR
                 ev.reason = "后一内容页印刷页码=1（新文档首页）→ 分隔空白"
+            elif nxt_mid and strong_title and not has_cont and not same_src:
+                # 证据 A 被证据 B 否决：后页虽带延续页码，但该"页码"很可能来自表格数字
+                # （如表格单元格里的 18/96/144），而页面本身是**无续接后缀**的强文档首面
+                # （标题全页最大 / 标题后紧跟主送机关），且无"续表/续页/（统计附表）"标记，
+                # 且与前一内容页标题**不同源**（不是同一文档重印表名的续页）
+                # → 这不是文档中途的续页，而是新文档首页 → 前隔页应删。
+                why = "标题为全页最大字号" if st.get("title_is_max") else "标题后紧跟主送机关"
+                ev.verdict = SEPARATOR
+                ev.reason = (
+                    f"后页页码={ev.next_page_number} 疑为表格数字，而页面为无续接后缀、"
+                    f"且与前一内容页标题不同源的文档首面结构（{why}）："
+                    f"{st.get('title_text','')[:24]} → 分隔空白"
+                )
             elif nxt_mid:
                 # 证据 A：后一内容页为延续页码（>1）→ 文档已在进行中
+                extra = "（后页与前一内容页标题同源，判为表格文档续页）" if same_src else ""
                 ev.verdict = INTERNAL_BLANK
-                ev.reason = f"后一内容页延续页码={ev.next_page_number} → 内部空白，保留"
+                ev.reason = f"后一内容页延续页码={ev.next_page_number} → 内部空白，保留{extra}"
             elif has_cont:
                 # 证据 B 矛盾：明确"续表/续页/（续）"标记 → 内部继续
                 ev.verdict = INTERNAL_BLANK
