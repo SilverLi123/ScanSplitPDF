@@ -201,10 +201,14 @@ def _export_one(
                 report.canceled = True
                 raise InterruptedError("用户取消")
             page = reader.pages[src_page - 1]
-            # 导出只依据统一方向状态 effective_rotation（人工覆盖 ?? 自动检测 ?? 0），
+            # 导出方向 = 源文件原有 /Rotate + 统一方向状态的额外旋转
+            # （effective_rotation = 人工覆盖 ?? 自动检测 ?? 0）。
+            # 二者必须叠加，才能与渲染器一致（render.py: total = stored + user）——
+            # 否则源文件已带 /Rotate 的页面在导出时会丢失该旋转（漏旋转）。
             # 以**绝对目标角度**写入 /Rotate（apply_target_rotation 内部绝对值覆盖），
             # 因此不存在二次旋转；且不重编码图片（pypdf 复制页面对象）。
-            target = doc.pages[src_page - 1].effective_rotation
+            ps = doc.pages[src_page - 1]
+            target = (int(ps.original_rotation) + int(ps.effective_rotation)) % 360
             apply_target_rotation(page, target)
             writer.add_page(page)
         with open(tmp_path, "wb") as f:

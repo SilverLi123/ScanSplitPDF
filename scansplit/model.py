@@ -53,6 +53,14 @@ class PageState:
     detected_rotation: int | None = None   # 自动方向检测建议；None=未检测
     detected_confidence: float = 0.0        # 自动检测置信度 [0,1]
     user_override_rotation: int | None = None  # 人工设定；None=未人工干预
+    # 方向"待确认建议"（v1.9.1 P0-A）：自动检测给出的**未采用**建议。
+    # 与 detected_rotation 的区别：detected_rotation 非 None 即参与
+    # effective_rotation（已生效）；rotation_proposal 只是候选，必须由用户
+    # 在方向对话框确认后才落到 detected_rotation / user_override_rotation。
+    # 预览 / OCR / 命名 / 导出**绝不读取**本字段。
+    rotation_proposal: int | None = None
+    rotation_proposal_note: str = ""        # 建议说明（几何不一致 / OCR 四方向对比结果）
+    rotation_proposal_confidence: float = 0.0
     blank: Optional[BlankResult] = None
     separator: bool = False  # 当前是否作为分隔页（该页本身是空白分隔页，不进入任何组）
     split_before: bool = False  # 该页是新文档起点（拆分边界，页本身保留在组内）
@@ -94,6 +102,11 @@ class PageState:
         """方向是否已由人工确认（此时自动检测不得覆盖）。"""
         return self.user_override_rotation is not None
 
+    @property
+    def has_rotation_proposal(self) -> bool:
+        """是否存在尚未处理的自动方向建议（供 UI 高亮/统计）。"""
+        return self.rotation_proposal is not None
+
     def snapshot(self) -> dict:
         return {
             "src_index": self.src_index,
@@ -101,6 +114,9 @@ class PageState:
             "detected_rotation": self.detected_rotation,
             "detected_confidence": self.detected_confidence,
             "user_override_rotation": self.user_override_rotation,
+            "rotation_proposal": self.rotation_proposal,
+            "rotation_proposal_note": self.rotation_proposal_note,
+            "rotation_proposal_confidence": self.rotation_proposal_confidence,
             "blank": (self.blank.verdict, self.blank.confidence, dict(self.blank.signals))
             if self.blank
             else None,
@@ -121,6 +137,9 @@ class PageState:
         else:
             rot = d.get("rotation", 0) or 0
             ps.user_override_rotation = int(rot) % 360 if rot else None
+        ps.rotation_proposal = d.get("rotation_proposal")
+        ps.rotation_proposal_note = d.get("rotation_proposal_note", "")
+        ps.rotation_proposal_confidence = float(d.get("rotation_proposal_confidence", 0.0) or 0.0)
         ps.separator = d["separator"]
         ps.split_before = bool(d.get("split_before", False))
         ps.blank_context = d.get("blank_context", "")
@@ -245,12 +264,15 @@ class ScanDocument:
             "pages": [p.snapshot() for p in self.pages],
             "groups": [g.snapshot() for g in self.groups],
             "status": self.status,
+            "manual_separator_pages": sorted(self.manual_separator_pages),
         }
 
     def restore(self, d: dict) -> None:
         self.pages = [PageState.restore(x) for x in d["pages"]]
         self.groups = [Group.restore(x) for x in d["groups"]]
         self.status = d["status"]
+        # 人工分隔页集合随快照回滚（旧快照无此键 → 置空，保持向后兼容）
+        self.manual_separator_pages = set(d.get("manual_separator_pages", []) or [])
 
 
 @dataclass
