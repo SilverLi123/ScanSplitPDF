@@ -80,6 +80,28 @@ def ui_env(monkeypatch):
     monkeypatch.setattr(ui.messagebox, "askyesno", lambda *a, **k: True)
     monkeypatch.setattr(ui.messagebox, "askokcancel", lambda *a, **k: True)
     monkeypatch.setattr("scansplit.settings.save_settings", lambda s: None)
+
+    # 导出前检查对话框（v1.9.1 改进3）：真实对话框会 wait_window 阻塞无 mainloop
+    # 的测试。默认替换为"自动确认全部清单"的桩，行为等价于旧 askyesno=True；
+    # 需要驱动真实对话框的用例可自行 monkeypatch 覆盖。
+    class _AutoExportDialog:
+        def __init__(self, master, docs, stats, field_issues, integrity_issues,
+                     name_of=None, integrity_blocked=False):
+            self.docs = docs
+            self.stats = stats
+            self.field_issues = field_issues
+            self.integrity_issues = integrity_issues
+            self.integrity_blocked = integrity_blocked
+            self.result = {"items": [], "strict": True, "confirmed": False}
+
+        def show(self):
+            if self.integrity_blocked:
+                return {"items": [], "strict": True, "confirmed": False}
+            items = [(di, gi) for di, d in enumerate(self.docs)
+                     for gi in range(len(d.groups))]
+            return {"items": items, "strict": False, "confirmed": True}
+
+    monkeypatch.setattr(ui, "ExportSummaryDialog", _AutoExportDialog)
     return ui
 
 

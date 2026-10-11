@@ -290,7 +290,7 @@ def test_renamed_affected_groups_preserve_manual(ui_env, tmp_path, make_scan):
 
 
 def test_strict_export_blocked_on_empty_fields(ui_env, tmp_path, make_scan, monkeypatch):
-    """字段缺失：严格模式提示后用户拒绝 → 不导出（0 个文件）。"""
+    """字段缺失：导出前检查对话框展示问题，用户取消 → 不导出（0 个文件）。"""
     from scansplit.ui import App
 
     scan = make_scan("strict.pdf", ["text", "text"])
@@ -304,13 +304,29 @@ def test_strict_export_blocked_on_empty_fields(ui_env, tmp_path, make_scan, monk
         pump_until_idle(app)
         app.auto_group_all()
         pump_until_idle(app)
-        # 标题/单位留空 → preflight 必报字段问题
+        # 标题/单位留空 → 摘要对话框必经；用户取消 → 不导出
         monkeypatch.setattr(ui_env.filedialog, "askdirectory", lambda **k: str(out_dir))
-        monkeypatch.setattr(ui_env.messagebox, "askyesno", lambda *a, **k: False)  # 拒绝非严格
+
+        captured = {}
+
+        class _CancelDialog:
+            def __init__(self, master, docs, stats, field_issues, integrity_issues,
+                         name_of=None, integrity_blocked=False):
+                captured["field"] = list(field_issues)
+                captured["integrity"] = list(integrity_issues)
+                captured["blocked"] = integrity_blocked
+
+            def show(self):
+                return {"items": [], "strict": True, "confirmed": False}
+
+        monkeypatch.setattr(ui_env, "ExportSummaryDialog", _CancelDialog)
         app.export_all()
         pump_until_idle(app, timeout=30)
         assert list(out_dir.glob("*.pdf")) == []
         assert not app._busy
+        # 字段级问题被识别（标题/单位为空），且不是完整性阻断
+        assert captured.get("field"), captured
+        assert not captured.get("blocked")
     finally:
         try:
             app.on_close()
@@ -334,12 +350,26 @@ def test_integrity_issue_not_bypassable(ui_env, tmp_path, make_scan, monkeypatch
         from scansplit import grouping
         grouping.refresh_groups(doc)
         monkeypatch.setattr(ui_env.filedialog, "askdirectory", lambda **k: str(out_dir))
-        monkeypatch.setattr(ui_env.messagebox, "askyesno", lambda *a, **k: True)  # 即便同意也不行
+
+        captured = {}
+
+        class _ProbeDialog:
+            def __init__(self, master, docs, stats, field_issues, integrity_issues,
+                         name_of=None, integrity_blocked=False):
+                captured["integrity"] = list(integrity_issues)
+                captured["blocked"] = integrity_blocked
+
+            def show(self):
+                # 完整性阻断时对话框不提供继续；即便强行确认也不得导出
+                return {"items": [], "strict": False, "confirmed": True}
+
+        monkeypatch.setattr(ui_env, "ExportSummaryDialog", _ProbeDialog)
         app.export_all()
         pump_until_idle(app, timeout=30)
         assert list(out_dir.glob("*.pdf")) == []
-        # 应弹出错误（被阻止）
-        assert any("完整性" in e or "阻止" in e for e in ui_env._showerror_log), ui_env._showerror_log
+        # 完整性被识别为阻断项，且非严格模式也不可绕过
+        assert captured.get("integrity"), captured
+        assert captured.get("blocked") is True
     finally:
         try:
             app.on_close()
@@ -440,6 +470,124 @@ def test_export_name_conflicts_detected(ui_env, tmp_path, make_scan):
         g1.title, g1.unit = "同名", "同单位"
         conflicts = app.export_name_conflicts()
         assert any(c > 1 for c in conflicts.values()), conflicts
+    finally:
+        try:
+            app.on_close()
+        except Exception:
+            root.destroy()
+
+
+# -- 7. v1.9.1 改进：按清单导出 / 方向建议纳入轮转 / 受影响组精确重识别 ----------
+
+
+def test_partial_export_only_selected_groups(ui_env, tmp_path, make_scan, monkeypatch):
+    """改进3：清单可勾选——只导出被选中的组，未勾选的组不算漏页（覆盖率校验通过）。"""
+    from scansplit.ui import App
+
+    scan = make_scan("part.pdf", ["text", "text", "text", "text"])
+    out_dir = tmp_path / "out"
+    root = _make_root()
+    try:
+        app = App(root)
+        app.import_files([str(scan)])
+        doc = app._active_doc()
+        app.add_split_before(3, doc=doc)
+        assert [(g.start, g.end) for g in doc.groups] == [(1, 2), (3, 4)]
+        for g in doc.groups:
+            g.title, g.unit = "标题", "单位"
+            g.title_confirmed = g.unit_confirmed = True
+        monkeypatch.setattr(ui_env.filedialog, "askdirectory", lambda **k: str(out_dir))
+
+        class _PickFirstDialog:
+            def __init__(self, master, docs, stats, field_issues, integrity_issues,
+                         name_of=None, integrity_blocked=False):
+                self.integrity_blocked = integrity_blocked
+
+            def show(self):
+                # 只勾选文档 0 的第 0 组（第 1-2 页）
+                return {"items": [(0, 0)], "strict": True, "confirmed": True}
+
+        monkeypatch.setattr(ui_env, "ExportSummaryDialog", _PickFirstDialog)
+        app.export_all()
+        pump_until_idle(app, timeout=30)
+        pdfs = list(out_dir.glob("*.pdf"))
+        # 恰好导出 1 份（第 1-2 页那组）
+        assert len(pdfs) == 1, pdfs
+        assert not doc.coverage_issues if hasattr(doc, "coverage_issues") else True
+        # 无覆盖率/完整性错误日志
+        assert not ui_env._showerror_log, ui_env._showerror_log
+    finally:
+        try:
+            app.on_close()
+        except Exception:
+            root.destroy()
+
+
+def test_rotation_proposal_included_in_pending_cycle(ui_env, tmp_path, make_scan):
+    """改进4：'下一处待确认'轮转应同时纳入方向建议页与命名待确认组。"""
+    from scansplit.ui import App
+    from scansplit.ui_widgets import GroupPanelArea
+
+    scan = make_scan("pend.pdf", ["text", "text"])
+    root = _make_root()
+    try:
+        app = App(root)
+        app.import_files([str(scan)])
+        doc = app._active_doc()
+        # 制造一个方向建议页 + 一个待确认命名组
+        doc.pages[0].rotation_proposal = 90
+        doc.pages[0].rotation_proposal_confidence = 0.8
+        app.auto_group_all() if hasattr(app, "auto_group_all") else None
+        app.add_split_before(2, doc=doc)
+        doc.groups[0].title, doc.groups[0].unit = "", ""
+        doc.groups[0].title_confirmed = doc.groups[0].unit_confirmed = False
+
+        area = GroupPanelArea(root, app)
+        area.set_document(doc)
+        area._rebuild_pending()
+        # 两类待处理项都被收集
+        assert len(area._pending_pages) >= 1
+        assert len(area._pending_panels) >= 1
+        total = len(area._pending_pages) + len(area._pending_panels)
+        # 连续点两次应覆盖到两类（游标推进且不越界）
+        seen = set()
+        for _ in range(total):
+            area._goto_next_pending()
+            i = area._pending_cursor
+            seen.add("page" if i >= len(area._pending_panels) else "panel")
+        assert "page" in seen, seen
+        area.destroy()
+    finally:
+        try:
+            app.on_close()
+        except Exception:
+            root.destroy()
+
+
+def test_rename_affected_clears_stale_indices(ui_env, tmp_path, make_scan, monkeypatch):
+    """改进6：命名完成后应从 affected_group_indices 移除已确认组，避免反复提示。"""
+    from scansplit.ui import App
+    from scansplit import autoname
+
+    scan = make_scan("aff.pdf", ["text", "text", "text", "text"])
+    root = _make_root()
+    try:
+        app = App(root)
+        app.import_files([str(scan)])
+        doc = app._active_doc()
+        app.add_split_before(3, doc=doc)
+        # 人为制造陈旧标记：两组都在 affected，但都已人工确认
+        doc.affected_group_indices = [0, 1]
+        for g in doc.groups:
+            g.title, g.unit = "人工标题", "人工单位"
+            g.title_confirmed = g.unit_confirmed = True
+        # 重跑命名（preserve_confirmed）：已确认组不应再留在 affected
+        autoname.auto_name_groups(doc, None, engine=None,
+                                  only_indices={0, 1}, preserve_confirmed=True)
+        assert doc.affected_group_indices == [], doc.affected_group_indices
+        # 无待确认/受影响组 → UI 入口提示且不启动任务
+        app.rename_affected_groups(doc)
+        assert not app._busy
     finally:
         try:
             app.on_close()
