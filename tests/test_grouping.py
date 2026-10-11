@@ -97,6 +97,7 @@ def test_group_names_migrate_on_unique_mapping(make_scan):
     groups[0].title = "报告"
     groups[0].unit = "教务处"
     groups[0].title_confirmed = True  # 人工编辑
+    groups[0].title_manual = True
     # 拆分点从第 3 页移到第 1 页：旧组 (1,2) 与新组 (2,3) 唯一对应
     doc.pages[2].separator = False
     doc.pages[0].separator = True

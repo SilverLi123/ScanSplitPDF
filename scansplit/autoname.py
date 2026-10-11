@@ -71,6 +71,12 @@ class NameResult:
         return self.unit_candidates[0] if self.unit_candidates else None
 
 
+def reporting_unit_auto_confirm(res: NameResult) -> bool:
+    candidates = [c for c in res.unit_candidates if c.source == "填报单位"]
+    return bool(candidates and candidates[0].confidence >= .85
+                and len({c.text.strip() for c in candidates}) == 1)
+
+
 @dataclass
 class DirectionResult:
     page: int
@@ -117,7 +123,7 @@ def _ocr_page_rotation_aware(renderer, idx0: int, engine, width_px: int, page_st
     应用新的方向质量评分（含横向占比因子），并把 4 方向纳入候选。
     """
     eff = int(getattr(page_state, "effective_rotation", 0) or 0) % 360
-    if eff:
+    if page_state is not None or eff:
         img = renderer.render(idx0, width_px=width_px, user_rotation=eff,
                               bucket="ocr-eff")
         lines = ocr_cache.recognize_cached(engine, "cls", renderer, idx0, width_px, eff)
@@ -155,6 +161,7 @@ def auto_name_groups(
     cancel_cb=None,
     only_indices: set[int] | None = None,
     preserve_confirmed: bool = False,
+    unit_mode: str = "legacy",
 ) -> list[NameResult]:
     """为每份分组自动提取标题与发文单位并填入组。
 
@@ -173,15 +180,22 @@ def auto_name_groups(
         if only_indices is not None and gi not in only_indices:
             continue
         # 人工已确认的字段在 preserve_confirmed 下受保护（重识别只填空白字段）
-        keep_title = preserve_confirmed and g.title_confirmed and g.title.strip()
-        keep_unit = preserve_confirmed and g.unit_confirmed and g.unit.strip()
+        keep_title = g.title_manual or (preserve_confirmed and g.title_confirmed and g.title.strip())
+        keep_unit = g.unit_manual or (preserve_confirmed and g.unit_confirmed and g.unit.strip())
         res = NameResult(group_index=gi)
         first0, last0 = g.start - 1, g.end - 1
+        if unit_mode == "reporting":
+            nonblank = [p.src_index-1 for p in doc.pages[g.start-1:g.end]
+                        if not p.blank or p.blank.verdict != "blank"]
+            if nonblank:
+                first0, last0 = nonblank[0], nonblank[-1]
 
         # 1) 文本层（可选增强）
-        if _has_text_layer(doc.reader, first0):
+        if unit_mode == "reporting" and any(p.has_rotation_proposal for p in doc.pages[g.start-1:g.end]):
+            res.error = "方向待确认，暂不命名"
+        elif _has_text_layer(doc.reader, first0) and (unit_mode == "legacy" or engine is None):
             res.title_candidates = _page_text_lines(doc.reader, first0)
-            last_titles = naming.extract_unit_candidates(doc.reader, last0)
+            last_titles = naming.extract_unit_candidates(doc.reader, last0) if unit_mode == "legacy" else []
             for t in last_titles:
                 res.unit_candidates.append(
                     ocrfields.FieldCandidate(t, 0.85, "文本层", reason="末页文本层提取")
@@ -193,6 +207,20 @@ def auto_name_groups(
                 lines, w, h, img1 = _ocr_page_rotation_aware(
                     renderer, first0, engine, 1200, doc.pages[first0])
                 res.title_candidates = ocrfields.extract_title(lines, w, h)
+                if unit_mode == "reporting":
+                    structure = ocrfields.first_page_structure(lines, w, h)
+                    expected = structure.get("title_text", "")
+                    strong = [c for c in res.title_candidates
+                              if ocrfields._title_pattern_score(c.text) >= 1
+                              and expected and (expected in c.text or c.text in expected)]
+                    if strong:
+                        res.title_candidates = strong
+                    for c in res.title_candidates:
+                        matching = [l for l in lines if l.text.strip() and l.text.strip() in c.text]
+                        if matching:
+                            c.bbox = (min(l.x0 for l in matching), min(l.y0 for l in matching),
+                                      max(l.x1 for l in matching), max(l.y1 for l in matching))
+                            c.image_size = (w, h)
                 first_units = ocrfields.extract_unit_first_page(lines, w, h)
                 if last0 != first0:
                     last_lines, lw, lh, img_last = _ocr_page_rotation_aware(
@@ -207,14 +235,36 @@ def auto_name_groups(
                 try:
                     from . import ocrseal
 
-                    seal_units = ocrseal.extract_seal_units(img1, engine)
-                    if last0 != first0:
+                    seal_units = ocrseal.extract_seal_units(img1, engine) if unit_mode == "legacy" else []
+                    if last0 != first0 and unit_mode == "legacy":
                         seal_units += ocrseal.extract_seal_units(img_last, engine)
                 except Exception:
                     seal_units = []  # 印章识别失败不影响主流程
                 res.unit_candidates = ocrfields.merge_unit_candidates(
                     first_units, last_units, seal_units
                 )
+                if unit_mode == "reporting":
+                    # Only explicit reporting labels qualify. Generic issuer/seal candidates
+                    # remain available to legacy extraction APIs, never to this field.
+                    res.unit_candidates = []
+                    page_data = [(first0, lines, w, h)]
+                    for idx0 in nonblank[1:]:
+                        if cancel_cb and cancel_cb():
+                            break
+                        if doc.pages[idx0].has_rotation_proposal:
+                            continue
+                        if idx0 == last0:
+                            page_data.append((idx0, last_lines, lw, lh))
+                        else:
+                            ls, pw, ph, _ = _ocr_page_rotation_aware(renderer, idx0, engine, 1200, doc.pages[idx0])
+                            page_data.append((idx0, ls, pw, ph))
+                    for idx0, ls, pw, ph in page_data:
+                        for c in ocrfields.extract_reporting_unit(ls, pw, ph):
+                            c.page = idx0 + 1
+                            res.unit_candidates.append(c)
+                    res.unit_candidates.sort(key=lambda c: c.confidence, reverse=True)
+                for c in res.title_candidates:
+                    c.page = first0 + 1
             except Exception as e:
                 res.error = str(e)
 
@@ -253,7 +303,15 @@ def auto_name_groups(
                 and best_t.confidence >= CONFIRM_THRESHOLD
             )
         if not keep_unit:
-            g.unit_confirmed = _unit_auto_confirm(res)
+            g.unit_confirmed = (reporting_unit_auto_confirm(res) if unit_mode == "reporting"
+                                else _unit_auto_confirm(res))
+        if unit_mode == "reporting":
+            if not keep_title:
+                g.title_confirmed = bool(g.boundary_confirmed and best_t and best_t.confidence >= .85
+                    and ocrfields._title_pattern_score(best_t.text) >= 1
+                    and len({c.text for c in res.title_candidates}) == 1 and not res.error)
+            if not keep_unit and not g.boundary_confirmed:
+                g.unit_confirmed = False
         results.append(res)
         if progress_cb:
             progress_cb(gi + 1, total)
@@ -277,6 +335,7 @@ def analyze_directions(
     pages_1based: list[int],
     progress_cb=None,
     cancel_cb=None,
+    fast: bool = False,
 ) -> list[DirectionResult]:
     """对指定页面做 0/90/180/270 四方向 OCR 质量对比，辅助判断正确方向。
 
@@ -310,6 +369,8 @@ def analyze_directions(
             # 始终评估完整四方向（0° 复用已渲染的图，其余按角度渲染）
             lines0: list = []
             for angle in (0, 90, 180, 270):
+                if cancel_cb and cancel_cb():
+                    break
                 renderer.render(
                     p - 1, width_px=1000, user_rotation=angle, bucket="ocr4")
                 lines = ocr_cache.recognize_cached(
@@ -318,9 +379,12 @@ def analyze_directions(
                     lines0 = lines
                 res.qualities[angle] = ocrfields.direction_quality(
                     {angle: lines})[angle]
+                q0 = res.qualities[angle]
+                if fast and angle == 0 and q0["quality"] >= .65 and q0["avg_score"] >= .9 and q0.get("horizontal_frac", 0) >= .95:
+                    break  # clear upright text; ambiguous pages still get all directions
 
             cands = (0, 90, 180, 270)
-            best, _ = ocrfields.best_direction({a: res.qualities[a] for a in cands})
+            best, _ = ocrfields.best_direction(res.qualities)
             res.suggested_angle = best
             res.confidence = ocrfields.direction_confidence(res.qualities)
             kind, frac = ocrfields.line_orientation(lines0)

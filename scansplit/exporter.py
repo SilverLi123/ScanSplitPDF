@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import os
 import uuid
+import json
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,8 +25,7 @@ class ExportOptions:
     on_log: object = None  # callable(str)
     on_progress: object = None  # callable(done, total, phase)
     cancel_check: object = None  # callable() -> bool
-    # 严格导出模式（v1.8 默认开启）：空标题/空单位/存在待确认字段时
-    # preflight 返回阻断项。非严格模式仅用于测试文件，须由用户显式选择。
+    # 保留旧调用签名；正式导出始终执行字段与完整性检查，不能放宽。
     strict: bool = True
     # v1.9.1 改进3：按清单导出时指定要导出的 (doc_index, group_index) 集合。
     # None = 全部导出（默认）。指定后覆盖率校验只针对被选中的组，
@@ -51,6 +52,8 @@ class ExportReport:
     src_sha_after: dict = field(default_factory=dict)
     coverage_issues: dict = field(default_factory=dict)  # doc_name -> [问题]
     canceled: bool = False
+    manifest_path: Path | None = None
+    manifest_error: str = ""
 
     @property
     def succeeded(self) -> list[ExportResult]:
@@ -92,10 +95,10 @@ def preflight(docs: list[ScanDocument], opts: ExportOptions) -> list[str]:
                 issues.append(f"{doc.name} 文档{gi + 1}（第{g.start}-{g.end}页）：标题为空")
             if needs_unit and not g.unit.strip():
                 issues.append(f"{doc.name} 文档{gi + 1}（第{g.start}-{g.end}页）：单位为空白")
-            if opts.strict and g.need_confirm:
+            if g.need_confirm:
                 issues.append(
                     f"{doc.name} 文档{gi + 1}（第{g.start}-{g.end}页）："
-                    "存在待确认字段（标题/单位），严格模式下阻止导出"
+                    "存在待确认字段（边界/标题/填报单位），阻止导出"
                 )
             if g.start < 1 or g.end > doc.page_count or g.start > g.end:
                 issues.append(f"{doc.name} 文档{gi + 1}：页码范围无效（{g.start}-{g.end}）")
@@ -117,14 +120,26 @@ def business_integrity_issues(doc: ScanDocument) -> list[str]:
         列为问题，阻断导出。
     返回问题字符串列表（空 = 通过）。
     """
-    in_group = {p for g in doc.groups for p in g.pages}
-    manual = getattr(doc, "manual_separator_pages", None) or set()
+    counts: dict[int, int] = {}
     issues: list[str] = []
+    for g in doc.groups:
+        if not (1 <= g.start <= g.end <= doc.page_count):
+            issues.append(f"{doc.name}：页码范围无效 {g.start}-{g.end}")
+            continue
+        for p in g.pages:
+            counts[p] = counts.get(p, 0) + 1
+    duplicates = [p for p, n in counts.items() if n > 1]
+    if duplicates:
+        issues.append(f"{doc.name}：分组重复包含原页 {duplicates}")
+    in_group = set(counts)
+    manual = getattr(doc, "manual_separator_pages", None) or set()
     for st in doc.pages:
         if st.src_index in in_group:
+            if st.separator:
+                issues.append(f"{doc.name} 第 {st.src_index} 页同时属于分组与排除页")
             continue  # 已导出
         # 未在分组内 → 被排除。必须有明确、经确认的排除依据。
-        confirmed = (
+        confirmed = st.separator and (
             st.src_index in manual
             or getattr(st, "blank_context", "") == "separator"
         )
@@ -134,6 +149,31 @@ def business_integrity_issues(doc: ScanDocument) -> list[str]:
                 f"{doc.name} 第 {st.src_index} 页未被导出，且没有经确认的排除依据"
                 f"（业务属性：{ctx}）——禁止静默丢页"
             )
+    return issues
+
+
+def integrity_preflight(docs: list[ScanDocument], opts: ExportOptions) -> list[str]:
+    """Hard contract enforced for UI, direct API and partial exports alike."""
+    issues = []
+    for di, doc in enumerate(docs):
+        issues.extend(business_integrity_issues(doc))
+        try:
+            if verify.file_sha256(doc.path) != doc.source_sha256:
+                issues.append(f"{doc.name}：源文件自导入后发生变化，请重新导入")
+        except OSError as exc:
+            issues.append(f"{doc.name}：无法读取源文件：{exc}")
+        for gi, g in enumerate(doc.groups):
+            if opts.only is not None and (di, gi) not in opts.only:
+                continue
+            if not g.boundary_confirmed:
+                issues.append(f"{doc.name} 第 {g.start}-{g.end} 页：拆分边界待确认")
+            if any(p.has_rotation_proposal for p in doc.pages[g.start-1:g.end]):
+                issues.append(f"{doc.name} 第 {g.start}-{g.end} 页：方向建议待处理")
+    if opts.only is not None and any(
+        not (0 <= di < len(docs) and 0 <= gi < len(docs[di].groups))
+        for di, gi in opts.only
+    ):
+        issues.append("导出选择包含无效分组")
     return issues
 
 
@@ -233,10 +273,16 @@ def _export_one(
             )
         # 保真校验（内容流与嵌入图像）
         page_map = list(range(group.start, group.end + 1))
-        issues = verify.verify_mapping(doc.path, tmp_path, page_map)
+        rotations = [(doc.pages[p-1].original_rotation + doc.pages[p-1].effective_rotation) % 360
+                     for p in page_map]
+        issues = verify.verify_mapping(doc.path, tmp_path, page_map, rotations=rotations)
         if issues:
             raise RuntimeError("保真校验未通过：" + "；".join(issues[:5]))
-        os.replace(tmp_path, final_path)
+        if verify.file_sha256(doc.path) != doc.source_sha256:
+            raise RuntimeError("源文件在导出过程中发生变化")
+        # On Windows rename refuses an existing destination, including a file
+        # created after unique_path. Never overwrite another process's output.
+        os.rename(tmp_path, final_path)
         result.ok = True
         _log(report, opts, f"[成功] {filename}.pdf（{group.page_count} 页，源第 {group.start}-{group.end} 页，保真校验通过）")
     except InterruptedError:
@@ -260,6 +306,21 @@ def export_documents(
     """批量导出所有文档的全部分组。源文件仅读取，绝不写入。"""
     report = ExportReport()
     out_dir = Path(opts.out_dir)
+    hard_issues = integrity_preflight(docs, opts)
+    if hard_issues:
+        report.coverage_issues["预检"] = hard_issues
+        for msg in hard_issues:
+            _log(report, opts, f"[阻止导出] {msg}")
+        return report
+    invalid = [(doc, g) for di, doc in enumerate(docs) for gi, g in enumerate(doc.groups)
+               if (opts.only is None or (di, gi) in opts.only) and (g.need_confirm
+               or ("{title}" in opts.template and not g.title.strip())
+               or ("{unit}" in opts.template and not g.unit.strip()))]
+    if invalid:
+        for doc, g in invalid:
+            report.results.append(ExportResult(g, doc.name, error="标题或填报单位待确认"))
+            _log(report, opts, f"[阻止导出] {doc.name} 第 {g.start}-{g.end} 页：名称待确认")
+        return report
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for di, doc in enumerate(docs):
@@ -324,4 +385,48 @@ def export_documents(
     n_ok = len(report.succeeded)
     n_fail = len(report.failed)
     _log(report, opts, f"导出完成：成功 {n_ok} 份，失败 {n_fail} 份。")
+    _write_manifest(docs, opts, report, out_dir)
     return report
+
+
+def _write_manifest(docs, opts, report, out_dir):
+    """Persist the disposition of EVERY source page, including omissions and cancellation."""
+    sources = []
+    outputs = []
+    for di, doc in enumerate(docs):
+        pages = []
+        for ps in doc.pages:
+            group_idx = next((gi for gi, g in enumerate(doc.groups) if g.start <= ps.src_index <= g.end), None)
+            result = next((r for r in report.results if group_idx is not None
+                           and r.group is doc.groups[group_idx]), None)
+            if result and result.ok:
+                status = "exported"
+            elif group_idx is None:
+                status = "excluded_manual" if ps.src_index in doc.manual_separator_pages else "excluded_context"
+            elif opts.only is not None and (di, group_idx) not in opts.only:
+                status = "unselected"
+            else:
+                status = "canceled" if report.canceled else "failed"
+            pages.append(dict(source_page=ps.src_index, status=status,
+                output=str(result.path) if result and result.ok else None,
+                output_page=ps.src_index-result.group.start+1 if result and result.ok else None,
+                rotation=(ps.original_rotation+ps.effective_rotation)%360,
+                note=ps.blank_context_reason if hasattr(ps, "blank_context_reason") else "",
+                manual_separator=ps.src_index in doc.manual_separator_pages))
+        sources.append(dict(path=str(doc.path), imported_sha256=doc.source_sha256,
+            after_sha256=report.src_sha_after.get(str(doc.path)), page_count=doc.page_count, pages=pages))
+    try:
+        for r in report.succeeded:
+            outputs.append(dict(path=str(r.path), sha256=verify.file_sha256(r.path), pages=r.pages,
+                                title=r.group.title, reporting_unit=r.group.unit))
+        path = out_dir / f"ScanSplit-导出记录-{uuid.uuid4().hex[:12]}.json"
+        payload = dict(schema=1, created_at=datetime.now(timezone.utc).isoformat(),
+                       canceled=report.canceled, sources=sources, outputs=outputs,
+                       issues=report.coverage_issues, logs=report.logs)
+        with path.open("x", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        report.manifest_path = path
+        _log(report, opts, f"页面去向记录：{path.name}")
+    except OSError as exc:
+        report.manifest_error = str(exc)
+        _log(report, opts, f"[注意] 页面去向记录写入失败：{exc}")

@@ -47,12 +47,14 @@ def _contents_bytes(page, errors: list[str] | None = None) -> bytes:
 
 
 def _raw_stream_bytes(obj, errors: list[str] | None = None) -> bytes | None:
-    """流的原始编码字节（未经过滤器解码）。不可得时返回 None（跳过该项校验）。"""
+    """流的原始编码字节；不可得时记录校验失败。"""
     try:
         target = obj.get_object() if hasattr(obj, "get_object") else obj
         raw = getattr(target, "_data", None)
         if isinstance(raw, (bytes, bytearray)):
             return bytes(raw)
+        if errors is not None:
+            errors.append("无法读取原始编码流，不能确认未重编码")
     except Exception as e:
         if errors is not None:
             errors.append(f"原始流读取异常：{e}")
@@ -87,7 +89,11 @@ def _collect_images(res, errors: list[str] | None = None, depth: int = 0, seen: 
     读取异常记录到 errors（fail-closed），不再静默跳过。
     """
     out: list[bytes] = []
-    if res is None or depth > 3:
+    if res is None:
+        return out
+    if depth > 32:
+        if errors is not None:
+            errors.append("Form 嵌套超过校验深度，无法确认保真")
         return out
     if seen is None:
         seen = set()
@@ -127,8 +133,12 @@ def _collect_images(res, errors: list[str] | None = None, depth: int = 0, seen: 
 def _image_raw_shas(res, errors: list[str] | None = None, depth: int = 0, seen: set | None = None) -> list[str] | None:
     """嵌入图像原始编码字节哈希列表；任何图像原始流不可得时返回 None。"""
     out: list[str] = []
-    if res is None or depth > 3:
+    if res is None:
         return out
+    if depth > 32:
+        if errors is not None:
+            errors.append("Form 嵌套超过校验深度，无法确认原始编码流")
+        return None
     if seen is None:
         seen = set()
     try:
@@ -187,6 +197,13 @@ def page_fingerprint(page) -> dict:
     images = _collect_images(res, errors)
     image_raw_shas = _image_raw_shas(res, errors)
     contents_raw_sha = _contents_raw_sha(page, errors)
+    try:
+        cropbox = [float(v) for v in page.cropbox]
+        rotation = int(page.rotation or 0) % 360
+        user_unit = float(page.get("/UserUnit", 1))
+    except Exception as e:
+        cropbox, rotation, user_unit = None, None, None
+        errors.append(f"页面几何读取异常：{e}")
     return {
         "mediabox": mediabox,
         "contents_sha": _sha(_contents_bytes(page, errors)),
@@ -195,10 +212,14 @@ def page_fingerprint(page) -> dict:
         "image_raw_shas": image_raw_shas,
         "image_count": len(images),
         "errors": errors,
+        "cropbox": cropbox,
+        "rotation": rotation,
+        "user_unit": user_unit,
     }
 
 
-def verify_mapping(src_path: str | Path, out_path: str | Path, page_map: list[int]) -> list[str]:
+def verify_mapping(src_path: str | Path, out_path: str | Path, page_map: list[int],
+                   rotations: list[int] | None = None) -> list[str]:
     """校验输出文件每页与源页面的映射保真。page_map: 输出每页对应的源页码（1 起始）。
 
     返回问题列表；空列表表示全部一致。
@@ -268,4 +289,9 @@ def verify_mapping(src_path: str | Path, out_path: str | Path, page_map: list[in
             issues.append(
                 f"第 {out_idx + 1} 页（源第 {src_page} 页）页面尺寸不一致"
             )
+        if f_src["cropbox"] != f_out["cropbox"] or f_src["user_unit"] != f_out["user_unit"]:
+            issues.append(f"第 {out_idx + 1} 页（源第 {src_page} 页）裁切范围或页面比例不一致")
+        expected_rotation = rotations[out_idx] if rotations is not None else f_src["rotation"]
+        if rotations is not None and f_out["rotation"] != expected_rotation % 360:
+            issues.append(f"第 {out_idx + 1} 页（源第 {src_page} 页）导出方向不一致")
     return issues

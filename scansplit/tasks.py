@@ -15,7 +15,7 @@
   ("progress", done, total, phase)   进度（worker → 主线程）
   ("log", msg)                       日志（worker → 主线程）
   ("done", result)                   成功完成
-  ("canceled",)                      用户取消（work 正常返回）
+  ("canceled", result)               用户取消（保留导出部分成功的报告）
   ("error", str)                     work 抛异常
 """
 
@@ -73,7 +73,7 @@ class TaskManager:
             try:
                 result = work(progress_cb, log_cb, cancel_check)
                 if cancel.is_set():
-                    q.put(("canceled",))
+                    q.put(("canceled", result))
                 else:
                     q.put(("done", result))
             except Exception:
@@ -120,6 +120,7 @@ class TaskManager:
                         result = msg[1]
                     elif kind == "canceled":
                         canceled = True
+                        result = msg[1]
                     else:
                         error = msg[1]
                         self.last_error = error

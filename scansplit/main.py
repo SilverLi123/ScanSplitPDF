@@ -49,8 +49,44 @@ def selftest() -> int:
         print("SELFTEST FAIL 空白检测：", res.verdict)
         return 2
     import pypdfium2 as pdfium  # noqa: F401
+    # Exercise the shipped OCR/render/export stack with an actual Chinese scan.
+    from tempfile import TemporaryDirectory
+    from pathlib import Path
+    from PIL import ImageDraw, ImageFont
+    from pypdf import PdfReader
+    from . import ocrfields, exporter, verify
+    from .model import ScanDocument, Group
+    from .render import PageRenderer
 
-    print("SELFTEST OK：OCR 模型完整、推理可用、检测与渲染依赖可用")
+    with TemporaryDirectory(prefix="scansplit-selftest-") as folder:
+        folder = Path(folder)
+        scan = Image.new("RGB", (1200,1600), "white")
+        draw = ImageDraw.Draw(scan)
+        font_path = Path("C:/Windows/Fonts/msyh.ttc")
+        draw.text((240,230), "教学设备统计表", font=ImageFont.truetype(str(font_path),48), fill="black")
+        draw.text((80,360), "填报单位：教务处", font=ImageFont.truetype(str(font_path),36), fill="black")
+        source = folder/"source.pdf"
+        scan.save(source,"PDF",resolution=144)
+        doc = ScanDocument(source,PdfReader(str(source)))
+        renderer = PageRenderer(source)
+        try:
+            rendered = renderer.render(0,width_px=1200)
+            candidates = ocrfields.extract_reporting_unit(engine.recognize(rendered), *rendered.size)
+            if not candidates or candidates[0].text != "教务处":
+                print("SELFTEST FAIL 中文 OCR/填报单位提取")
+                return 2
+        finally:
+            renderer.close()
+        doc.groups=[Group(1,1,"教学设备统计表","教务处")]
+        report=exporter.export_documents([doc],exporter.ExportOptions(out_dir=folder/"export"))
+        if len(report.succeeded)!=1 or report.failed or report.coverage_issues or not report.manifest_path:
+            print("SELFTEST FAIL 无损导出/页面记录")
+            return 2
+        if verify.file_sha256(source)!=doc.source_sha256:
+            print("SELFTEST FAIL 源文件发生变化")
+            return 2
+
+    print("SELFTEST OK：模型完整、中文 OCR、填报单位提取、渲染、无损导出和页面记录可用")
     return 0
 
 

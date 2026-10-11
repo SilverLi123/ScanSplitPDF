@@ -23,7 +23,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import autoname, blankdetect, exporter, grouping, loader, naming, rotation, settings, splitctx
+from . import autoname, blankdetect, exporter, grouping, loader, naming, rotation, settings, splitctx, pipeline
 from .loader import LoadError
 from .model import ScanDocument, Workspace
 from .ocr import OcrEngine
@@ -72,7 +72,7 @@ class App:
             self.preview.zoom = 1.0
         self.preview.fit_mode = bool(self.settings.get("fit_mode", True))
         self.update_status()
-        enable_drag_drop(self.root, self.import_files)
+        enable_drag_drop(self.root, self.import_files_async)
         self.log("就绪。请打开 PDF 文件（可多选或直接拖入窗口）。")
 
     # -- 界面构建 -----------------------------------------------------------
@@ -97,13 +97,13 @@ class App:
 
         tool_section("① 拆分", [
             ("open", "打开 PDF…", self.open_dialog),
-            ("detect", "检测空白页", self.detect_blank),
-            ("group", "自动分组", self.auto_group_all),
+            ("detect", "自动拆分", self.automatic_split),
+            ("group", "检查拆分", self.review_pending),
         ])
         tool_section("② 命名 / 检查", [
             ("ocr", "OCR 自动命名（本地）", self.ocr_name),
             ("direction", "识别方向", self.direction_analyze),
-            ("review", "复核拆分/补拆", self.boundary_review_action),
+            ("review", "待处理问题", self.review_pending),
         ])
         tool_section("③ 导出", [
             ("export", "导出全部…", self.export_all),
@@ -197,7 +197,7 @@ class App:
         旧代码用 `blanks + maybes > 0` 判定，导致无空白页的文件永远无法进入分组。
         改判"是否存在已检测过的文档"（至少一页 blank 结果非 None）。
         """
-        return any(p.blank is not None for d in self.ws.documents for p in d.pages)
+        return bool(self.ws.documents) and all(p.blank is not None for d in self.ws.documents for p in d.pages)
 
     def _update_step_state(
         self,
@@ -229,20 +229,29 @@ class App:
         for key, ready in readiness.items():
             btn = self.tool_btns.get(key)
             if btn is not None:
-                btn.state(["!disabled"] if ready else ["disabled"])
+                btn.state(["!disabled"] if ready and not self._busy else ["disabled"])
+        def set_edit_state(widget):
+            if isinstance(widget, ttk.Combobox):
+                widget.configure(state="disabled" if self._busy else "readonly")
+            elif isinstance(widget, ttk.Entry):
+                widget.configure(state="disabled" if self._busy else "normal")
+            for child in widget.winfo_children():
+                set_edit_state(child)
+        if hasattr(self, "groups"):
+            set_edit_state(self.groups)
         if not n_docs:
             hint = "下一步：打开 PDF（可拖入窗口）"
         elif not has_blank_analysis:
-            hint = "下一步：检测空白页"
+            hint = "下一步：自动拆分（检测空白、检查方向和文档边界）"
         elif not n_groups:
             if self._has_blank_candidates():
                 hint = "下一步：自动分组"
             else:
                 hint = "未检测到空白页（连续件）：下一步“复核拆分/补拆”建立分组"
         elif n_conf:
-            hint = "下一步：确认橙色“待确认”字段，然后导出"
+            hint = "下一步：检查待确认的拆分边界，再确认标题与填报单位"
         else:
-            hint = "下一步：识别方向 / 复核拆分（可选），然后导出全部"
+            hint = "下一步：检查导出清单，然后导出"
         self.hint_var.set(hint)
 
     def _has_blank_candidates(self) -> bool:
@@ -254,6 +263,9 @@ class App:
     def _refresh_all(self):
         self._rebuild_file_list()
         doc = self._active_doc()
+        for path, renderer in self.renderers.items():
+            if not doc or path != str(doc.path):
+                renderer.clear_cache()
         if doc:
             self.current_page = min(max(self.current_page, 1), doc.page_count)
             if not self.sel_pages:
@@ -357,7 +369,59 @@ class App:
             filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")],
         )
         if paths:
-            self.import_files(list(paths))
+            self.import_files_async(list(paths))
+
+    def import_files_async(self, paths):
+        if self._busy:
+            return
+        existing = {d.path.resolve() for d in self.ws.documents}
+        def work(progress, log, cancel):
+            loaded, errors = [], []
+            for i, value in enumerate(paths, 1):
+                if cancel():
+                    break
+                path = Path(value).resolve()
+                progress(i-1, len(paths), f"导入 {path.name}")
+                if path.suffix.lower() != ".pdf" or path in existing:
+                    continue
+                try:
+                    reader, warnings = loader.open_document(path)
+                    doc = ScanDocument(path, reader, warnings)
+                    grouping.refresh_groups(doc)
+                    for g in doc.groups:
+                        g.boundary_confirmed = False
+                    loaded.append(doc)
+                    existing.add(path)
+                except (LoadError, OSError) as exc:
+                    errors.append(str(exc))
+            return loaded, errors
+        def done(result, canceled, error):
+            self._task_finish()
+            if canceled:
+                self.log("导入已取消，工作区保持原状。")
+                return
+            if error:
+                messagebox.showerror("导入", error.splitlines()[-1])
+                return
+            loaded, errors = result
+            for doc in loaded:
+                try:
+                    renderer = PageRenderer(doc.path)  # owned by main thread
+                except RenderError as exc:
+                    errors.append(str(exc))
+                    continue
+                self.ws.documents.append(doc)
+                self.renderers[str(doc.path)] = renderer
+                self.log(f"导入 {doc.name}（{doc.page_count} 页）")
+                for warning in doc.warnings:
+                    self.log(f"警告：{warning}")
+            if errors:
+                messagebox.showwarning("导入", "\n".join(errors[:8]))
+            if loaded:
+                self.doc_index = max(0, len(self.ws.documents)-1)
+                self.current_page, self.sel_pages = 1, {1}
+            self._refresh_all()
+        self._start_task("import", work, done, title="导入 PDF")
 
     def import_files(self, paths: list[str]):
         if self._busy:
@@ -378,6 +442,8 @@ class App:
                 continue
             doc = ScanDocument(path, reader, warnings)
             grouping.refresh_groups(doc)
+            for g in doc.groups:
+                g.boundary_confirmed = False
             self.ws.documents.append(doc)
             self.renderers[str(path)] = renderer
             self.log(f"导入 {path.name}（{doc.page_count} 页）")
@@ -567,6 +633,7 @@ class App:
                                       splitctx.INTERNAL_BLANK: [],
                                       splitctx.UNCERTAIN: []}
                     grouping.auto_group(d, context_aware=True)
+                    pipeline.update_boundary_state(d)
                     out.append((d, ctx_counts))
                 finally:
                     if renderer is not None:
@@ -622,6 +689,113 @@ class App:
 
         self._start_task("autogroup", work, on_done, title="自动分组（上下文判定）")
 
+    def automatic_split(self):
+        if self._busy or not self.ws.documents:
+            return
+        docs = list(self.ws.documents)
+        self._push_undo()
+        snap = self.ws.snapshot()
+
+        def work(progress, log, cancel):
+            engine = OcrEngine.get()  # initialise models on worker, not Tk thread
+            for doc in docs:
+                if cancel():
+                    break
+                pipeline.analyze_document(doc, self.detect_params, engine, progress, cancel)
+                log(f"{doc.name}：{len(doc.groups)} 份，{len(doc.pending_boundaries)} 处边界待确认")
+
+        def on_done(result, canceled, error):
+            self._task_finish()
+            if canceled or error:
+                self._restore_ws_snapshot(snap)
+                self._refresh_all()
+                self.log("自动拆分已回滚：" + (error.splitlines()[-1] if error else "用户取消"))
+                return
+            self._refresh_all()
+            n = sum(len(d.pending_boundaries) for d in docs)
+            rotations = sum(p.has_rotation_proposal for d in docs for p in d.pages)
+            messagebox.showinfo("自动拆分完成", f"已生成 {sum(len(d.groups) for d in docs)} 份草稿。\n"
+                f"待确认边界 {n} 处，待处理方向 {rotations} 页。\n"
+                "先检查拆分与方向，再点击自动命名；内部与不确定空白均保留。")
+        self._start_task("automatic", work, on_done, title="自动拆分")
+
+    def review_pending(self):
+        doc = self._active_doc()
+        if doc and not self._busy:
+            ReviewDialog(self.root, self, doc)
+
+    def resolve_boundary(self, page_no, split, doc=None):
+        doc = doc or self._active_doc()
+        if not doc or self._busy:
+            return
+        self._push_undo()
+        doc.manual_boundaries[page_no] = bool(split)
+        doc.pending_boundaries.pop(page_no, None)
+        if page_no > 1:
+            doc.pages[page_no - 1].split_before = bool(split)
+        # A manual merge also cancels exclusion in the preceding blank run.
+        if not split:
+            p = page_no - 1
+            while p >= 1 and doc.pages[p-1].blank and doc.pages[p-1].blank.verdict == "blank":
+                doc.pages[p-1].separator = False
+                doc.manual_separator_pages.add(p)
+                p -= 1
+        grouping.refresh_groups(doc)
+        pipeline.update_boundary_state(doc)
+        self._refresh_all()
+
+    def exclude_confirmed_blank(self, page_no, doc):
+        if self._busy:
+            return
+        p = page_no if doc.pages[page_no-1].blank and doc.pages[page_no-1].blank.verdict == "blank" else page_no-1
+        run = []
+        while p >= 1 and doc.pages[p-1].blank and doc.pages[p-1].blank.verdict == "blank":
+            run.append(p)
+            p -= 1
+        if not run:
+            messagebox.showinfo("确认分隔空白", "这处边界前没有检测到空白页；请选择保留页面并拆开。")
+            return
+        if not messagebox.askyesno("排除分隔空白", f"确认第 {min(run)}-{max(run)} 页是分隔空白，导出时排除这些页？\n源文件保留，可撤销。"):
+            return
+        self._push_undo()
+        for p in run:
+            doc.pages[p-1].separator = True
+            doc.manual_separator_pages.add(p)
+            doc.pending_boundaries.pop(p, None)
+        next_page = max(run)+1
+        if next_page <= doc.page_count:
+            doc.manual_boundaries[next_page] = True
+            doc.pages[next_page-1].split_before = True
+            doc.pending_boundaries.pop(next_page, None)
+        doc.pending_boundaries.pop(page_no, None)
+        grouping.refresh_groups(doc)
+        pipeline.update_boundary_state(doc)
+        self._refresh_all()
+
+    def confirm_group_boundary(self, doc, gi):
+        if self._busy:
+            return
+        g = doc.groups[gi]
+        if any(g.start <= p <= g.end + 1 for p in doc.pending_boundaries):
+            self.review_pending()
+            return
+        if any(p.has_rotation_proposal for p in doc.pages[g.start-1:g.end]):
+            self.show_direction_proposals(doc)
+            return
+        self._push_undo()
+        g.boundary_confirmed = True
+        for p in g.pages:
+            doc.manual_boundaries[p] = p == g.start and p > 1
+            doc.manual_separator_pages.add(p)  # group confirmation also confirms retained blanks
+        self._refresh_all()
+
+    def show_direction_proposals(self, doc):
+        pages = [p.src_index for p in doc.pages if p.has_rotation_proposal]
+        results = [autoname.DirectionResult(p, {}, doc.pages[p-1].rotation_proposal,
+                   doc.pages[p-1].rotation_proposal_note,
+                   doc.pages[p-1].rotation_proposal_confidence) for p in pages]
+        DirectionDialog(self.root, self, doc, pages, results, {}, "待确认")
+
     def _log_migrate_notes(self, doc):
         """转述 refresh_groups 的迁移/歧义说明（v1.8：人工编辑不静默丢失）。"""
         for note in getattr(doc, "group_migrate_notes", None) or []:
@@ -662,6 +836,7 @@ class App:
                     progress_cb=lambda i, n: progress(i, n, "重新识别"),
                     cancel_cb=cancel,
                     only_indices=targets, preserve_confirmed=True,
+                    unit_mode="reporting",
                 )
             finally:
                 if renderer is not None:
@@ -696,19 +871,25 @@ class App:
 
     def set_separator(self, pages: list[int], value: bool):
         doc = self._active_doc()
-        if not doc:
+        if not doc or self._busy:
+            return
+        if value and not messagebox.askyesno("排除页面", f"所选原页 {pages} 将从导出文件中排除。\n"
+            "如果这里只是新文件的首页，请取消并选择“从此页开始新文件（保留页）”。\n确认这些页无需导出？"):
             return
         self._push_undo()
         for p in pages:
             if 1 <= p <= doc.page_count:
                 doc.pages[p - 1].separator = value
                 # 记录/撤销"人工确认的分隔页"（v1.9.1）：这是导出时允许排除该页的
-                # 唯一人工依据（exporter.business_integrity_issues）。取消分隔标记时移除。
+                # 保留与排除都是人工决定，重跑分析不得覆盖。
+                doc.manual_separator_pages.add(p)  # both keep and exclude are manual decisions
                 if value:
-                    doc.manual_separator_pages.add(p)
-                else:
-                    doc.manual_separator_pages.discard(p)
+                    doc.pending_boundaries.pop(p, None)
+                    if p < doc.page_count:
+                        doc.manual_boundaries[p+1] = True
+                        doc.pending_boundaries.pop(p+1, None)
         grouping.refresh_groups(doc)
+        pipeline.update_boundary_state(doc)
         self._refresh_all()
         self._log_migrate_notes(doc)
         self.log(f"第 {','.join(map(str, sorted(pages)))} 页：{'标记为分隔页' if value else '取消分隔标记'}")
@@ -720,7 +901,10 @@ class App:
             return
         self._push_undo()
         doc.pages[page_no - 1].split_before = True
+        doc.manual_boundaries[page_no] = True
+        doc.pending_boundaries.pop(page_no, None)
         grouping.refresh_groups(doc)
+        pipeline.update_boundary_state(doc)
         self._refresh_all()
         self._log_migrate_notes(doc)
         self.log(f"已在第 {page_no} 页前新增拆分点")
@@ -744,6 +928,10 @@ class App:
             return
         if not any(d.groups for d in docs):
             messagebox.showinfo("OCR 自动命名", "尚未分组。请先运行“自动分组”。")
+            return
+        if any(not g.boundary_confirmed for d in docs for g in d.groups):
+            messagebox.showinfo("先检查拆分", "还有文档边界待确认。请先检查待处理问题，并确认分组属于哪一份文件，再进行自动命名。")
+            self.review_pending()
             return
         engine = OcrEngine.get()
         text_layer_only = False
@@ -776,6 +964,7 @@ class App:
                     autoname.auto_name_groups(
                         d, renderer, engine=engine if use_ocr else None,
                         progress_cb=cb, cancel_cb=cancel,
+                        unit_mode="reporting",
                     )
                 finally:
                     if renderer is not None:
@@ -803,7 +992,7 @@ class App:
             for doc in docs:
                 if self._doc_still_open(doc):
                     for g in doc.groups:
-                        if g.unit.strip():
+                        if g.unit.strip() and g.unit_confirmed and g.boundary_confirmed:
                             self.unit_history.add(g.unit)
             self._refresh_all()
             n_conf = sum(1 for d in docs if self._doc_still_open(d)
@@ -894,8 +1083,10 @@ class App:
                     ps.rotation_proposal = int(r.suggested_angle) % 360
                     ps.rotation_proposal_confidence = float(r.confidence)
                     ps.rotation_proposal_note = r.suggestion_note or ""
-                elif r.suggested_angle == 0:
-                    ps.rotation_proposal = None  # 判定无需旋转 → 无建议
+                else:
+                    ps.rotation_proposal = None if r.suggested_angle == 0 and r.confidence >= .75 else 0
+                    ps.rotation_proposal_confidence = r.confidence
+                    ps.rotation_proposal_note = r.suggestion_note
             self._direction_show_results(doc, candidates, sugg, results=results, scope=scope)
 
         if not self._start_task("direction", work, on_done, title="识别方向（本地 OCR 方向对比）"):
@@ -931,7 +1122,8 @@ class App:
                 ocr_pages = []
             else:
                 self.log(f"未采用方向建议（{len(ocr_pages)} 页方向保持不变）。")
-        pages = sorted(set(sugg) | set(ocr_pages))
+        pages = sorted(set(sugg) | set(ocr_pages) |
+                       {p for p in candidates if doc.pages[p-1].has_rotation_proposal})
         if not pages:
             if results and all(r.suggested_angle is None for r in results):
                 messagebox.showwarning(
@@ -953,7 +1145,7 @@ class App:
         后续不会被自动检测覆盖（见 PageState.is_rotation_manual）。
         """
         doc = doc or self._active_doc()
-        if not doc:
+        if not doc or self._busy:
             return
         self._push_undo()
         for p, angle in mapping.items():
@@ -961,6 +1153,15 @@ class App:
                 ps = doc.pages[p - 1]
                 ps.rotation = int(angle) % 360
                 ps.rotation_proposal = None  # 建议已被采纳，清除暂存
+                if doc.analysis_complete:
+                    doc.pending_boundaries[p] = "方向已变化，请重新自动拆分以更新页面证据"
+                    for g in doc.groups:
+                        if g.start <= p <= g.end:
+                            g.boundary_confirmed = False
+                            if not g.title_manual:
+                                g.title_confirmed = False
+                            if not g.unit_manual:
+                                g.unit_confirmed = False
         self._refresh_all()
         self.log("已应用旋转：" + "、".join(f"第{p}页→{a}°" for p, a in sorted(mapping.items())))
 
@@ -1006,7 +1207,8 @@ class App:
             # 双重验证一致（页码重置+标题特征）的页面自动补拆——可撤销。
             # 拆分边界记录在页面自身（split_before），内容页不会被排除出导出。
             auto_pages = [s.next_page for s in statuses
-                          if s.status == "auto_split" and s.next_page]
+                          if s.status == "auto_split" and s.next_page
+                          and s.next_page not in doc.manual_boundaries]
             if auto_pages:
                 self._push_undo()
                 for p in auto_pages:
@@ -1022,6 +1224,17 @@ class App:
         self._start_task("boundary", work, on_done, title="复核拆分 / 智能补拆（本地 OCR）")
 
     # -- 页面操作 --------------------------------------------------------------
+
+    def locate_page(self, page_no, doc=None):
+        doc = doc or self._active_doc()
+        if not doc or not self._doc_still_open(doc) or not 1 <= page_no <= doc.page_count:
+            return
+        if self._active_doc() is not doc:
+            self.doc_index = next(i for i, d in enumerate(self.ws.documents) if d is doc)
+            self._refresh_all()
+        self.sel_pages = {page_no}
+        self.on_page_select(page_no, preview=True)
+        self.thumbs.ensure_visible(page_no)
 
     def on_page_select(self, page_no: int, preview: bool = True):
         self.current_page = page_no
@@ -1046,26 +1259,23 @@ class App:
 
     def rotate_selection(self, delta: int, absolute: bool = False):
         doc = self._active_doc()
-        if not doc:
+        if not doc or self._busy:
             return
         pages = sorted(self.sel_pages) if self.sel_pages else [self.current_page]
-        self._push_undo()
+        mapping = {}
         for p in pages:
             if 1 <= p <= doc.page_count:
                 cur = doc.pages[p - 1].rotation
-                doc.pages[p - 1].rotation = (delta % 360) if absolute else (cur + delta) % 360
-        self._refresh_all()
+                mapping[p] = (delta % 360) if absolute else (cur + delta) % 360
+        self.apply_rotation(mapping, doc)
         self.log(f"第 {','.join(map(str, pages))} 页旋转 → {doc.pages[pages[0] - 1].rotation}°")
 
     def rotate_pages_in_group(self, gi: int, delta: int):
         doc = self._active_doc()
-        if not doc or gi >= len(doc.groups):
+        if not doc or self._busy or gi >= len(doc.groups):
             return
         group = doc.groups[gi]
-        self._push_undo()
-        for p in group.pages:
-            doc.pages[p - 1].rotation = (doc.pages[p - 1].rotation + delta) % 360
-        self._refresh_all()
+        self.apply_rotation({p: (doc.pages[p - 1].rotation + delta) % 360 for p in group.pages}, doc)
         self.log(f"文档 {gi + 1}（第 {group.start}-{group.end} 页）整组旋转 +{delta}°")
 
     def _nav_key(self, delta: int):
@@ -1165,6 +1375,8 @@ class App:
             "n_integrity": len(integrity_issues),
             "dup": dup,
         }
+        integrity_issues = list(dict.fromkeys(integrity_issues + exporter.integrity_preflight(docs, opts)))
+        stats["n_integrity"] = len(integrity_issues)
         return field_issues, integrity_issues, stats
 
     def _format_export_summary(self, stats: dict) -> str:
@@ -1264,7 +1476,7 @@ class App:
             for doc in docs:
                 if self._doc_still_open(doc):
                     for g in doc.groups:
-                        if g.unit.strip():
+                        if g.unit.strip() and g.unit_confirmed and g.boundary_confirmed:
                             self.unit_history.add(g.unit)
             self.settings["output_dir"] = out_dir
             self.settings["template"] = template
@@ -1281,6 +1493,10 @@ class App:
                 f"源文件完整性：{'全部一致（SHA-256 校验通过）' if integrity_ok else '异常！请查看日志'}\n"
                 f"页面覆盖率：{'每个有效原页恰好导出一次' if coverage_ok else '异常！存在漏页/重复页，请查看日志'}"
             )
+            if report.manifest_path:
+                msg += f"\n页面去向记录：{report.manifest_path.name}"
+            if report.manifest_error:
+                msg += f"\n页面去向记录写入失败：{report.manifest_error}"
             if canceled or report.canceled:
                 done_names = "、".join(r.filename + ".pdf" for r in report.succeeded) or "（无）"
                 msg += (
@@ -1320,7 +1536,9 @@ class App:
             self.tasks.cancel()
             finished = self.tasks.cancel_and_join(3.0)
             if not finished:
-                self.log("后台任务未能在 3 秒内退出，强制关闭窗口。")
+                self.log("正在等待当前处理安全停止，完成后关闭窗口。")
+                self.root.after(100, self.on_close)
+                return
         try:
             self._save_settings()
         except Exception:
@@ -1340,11 +1558,19 @@ class DirectionDialog(tk.Toplevel):
         self.doc = doc
         title_scope = f" — {scope}" if scope else f" — {doc.name}"
         self.title(f"识别方向{title_scope}")
-        self.resizable(False, False)
-        ttk.Label(self, text="疑似需要旋转的页面（几何不一致或 OCR 判定内容侧放，常见于横版表格）——请选择旋转角度：",
+        self.resizable(True, True)
+        ttk.Label(self, text="以下页面的方向需要确认。预览后选择相对源 PDF 的额外旋转角度；0°也属于人工决定。",
                   padding=8).pack(anchor="w")
-        frame = ttk.Frame(self, padding=6)
-        frame.pack(fill="both", expand=True)
+        wrap = ttk.Frame(self)
+        wrap.pack(fill="both", expand=True)
+        canvas = tk.Canvas(wrap, width=1000, height=min(480, 60+len(pages)*34), highlightthickness=0)
+        scroll = ttk.Scrollbar(wrap, command=canvas.yview)
+        canvas.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        frame = ttk.Frame(canvas, padding=6)
+        canvas.create_window((0,0), window=frame, anchor="nw")
+        frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         by_page = {r.page: r for r in results}
         ttk.Label(frame, text="页面").grid(row=0, column=0, padx=4, pady=2, sticky="w")
         ttk.Label(frame, text="几何").grid(row=0, column=1, padx=4, pady=2, sticky="w")
@@ -1363,6 +1589,8 @@ class DirectionDialog(tk.Toplevel):
                 ttk.Button(frame, text=f"{ang}°", width=4,
                            command=lambda pp=p, a=ang: self._apply(pp, a)).grid(
                     row=row, column=3 + j, padx=1, pady=3)
+            ttk.Button(frame, text="预览", width=5, command=lambda pp=p: app.locate_page(pp, doc)).grid(
+                row=row, column=7, padx=3)
         btns = ttk.Frame(self)
         btns.pack(pady=6)
         sugg_map = {
@@ -1373,7 +1601,12 @@ class DirectionDialog(tk.Toplevel):
         if sugg_map:
             ttk.Button(btns, text="全部按建议摆正", width=16,
                        command=lambda: self._apply_all(sugg_map)).pack(side="left", padx=4)
+        ttk.Button(btns, text="所列页面保持当前方向", command=lambda: self._keep_current(pages)).pack(side="left", padx=4)
         ttk.Button(btns, text="关闭", command=self.destroy).pack(side="left", padx=4)
+
+    def _keep_current(self, pages):
+        if messagebox.askyesno("确认方向", "请确认已检查所列页面，保留它们当前的方向。此决定会受到保护，重新识别不会覆盖。", parent=self):
+            self._apply_all({p:self.doc.pages[p-1].effective_rotation for p in pages})
 
     def _apply(self, page: int, angle: int):
         self.app.apply_rotation({page: angle}, doc=self.doc)
@@ -1387,6 +1620,67 @@ class DirectionDialog(tk.Toplevel):
 
 
 # -- 拆分边界复核对话框 -----------------------------------------------------------
+
+
+class ReviewDialog(tk.Toplevel):
+    """Scrollable boundary review; split and merge both preserve content pages."""
+    def __init__(self, master, app, doc):
+        super().__init__(master)
+        self.app, self.doc = app, doc
+        self.title(f"检查拆分 — {doc.name}")
+        self.geometry("880x440")
+        ttk.Label(self, text="选择问题，查看前后页，再决定拆开或继续同一份。空白页默认保留。", padding=8).pack(anchor="w")
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(frame, columns=("page", "reason"), show="headings", selectmode="browse")
+        self.tree.heading("page", text="原页码")
+        self.tree.heading("reason", text="需要确认的原因")
+        self.tree.column("page", width=70, stretch=False)
+        self.tree.column("reason", width=680)
+        scrollbar = ttk.Scrollbar(frame, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.tree.pack(fill="both", expand=True)
+        row = ttk.Frame(self, padding=8)
+        row.pack(fill="x")
+        for label, fn in [("查看前页", lambda: self.preview(-1)), ("查看该页", lambda: self.preview(0)),
+                          ("保留页面并拆开", lambda: self.resolve(True)), ("继续同一份", lambda: self.resolve(False)),
+                          ("确认并排除分隔空白", self.exclude_blank),
+                          ("处理方向建议", lambda: app.show_direction_proposals(doc))]:
+            ttk.Button(row, text=label, command=fn).pack(side="left", padx=3)
+        ttk.Button(row, text="关闭", command=self.destroy).pack(side="right")
+        self.refresh()
+
+    def refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        for p, reason in sorted(self.doc.pending_boundaries.items()):
+            self.tree.insert("", "end", iid=str(p), values=(p, reason))
+        children = self.tree.get_children()
+        if children:
+            self.tree.selection_set(children[0])
+        else:
+            self.tree.insert("", "end", iid="done", values=("✓", "没有待确认边界，可检查分组并命名。"))
+
+    def page(self):
+        selection = self.tree.selection()
+        return int(selection[0]) if selection and selection[0].isdigit() else None
+
+    def preview(self, delta):
+        p = self.page()
+        if p and 1 <= p + delta <= self.doc.page_count:
+            self.app.locate_page(p + delta, self.doc)
+
+    def resolve(self, split):
+        p = self.page()
+        if p:
+            self.app.resolve_boundary(p, split, self.doc)
+            self.refresh()
+
+    def exclude_blank(self):
+        p = self.page()
+        if p:
+            self.app.exclude_confirmed_blank(p, self.doc)
+            self.refresh()
 
 
 class BoundaryDialog(tk.Toplevel):

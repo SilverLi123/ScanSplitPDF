@@ -16,4 +16,5 @@ htmlcov/
 Thumbs.db
 Desktop.ini
 stress_v19/
+work/acceptance/
 pytest_*.txt

@@ -194,6 +194,8 @@ def test_auto_name_sideways_first_page(tmp_path):
     refresh_groups(doc)
     renderer = PageRenderer(p)
     try:
+        # 方向须先由用户确认。命名阶段不得偷偷猜测或改变统一方向。
+        doc.pages[0].rotation = 270
         results = auto_name_groups(doc, renderer, engine=OcrEngine.get())
         assert len(results) == 1
         g = doc.groups[0]

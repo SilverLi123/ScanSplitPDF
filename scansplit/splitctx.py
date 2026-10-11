@@ -131,7 +131,7 @@ def _nearest_content(doc, page_1based: int, step: int) -> int | None:
     return None
 
 
-def _page_ocr(renderer, engine, page_1based: int, cache: dict) -> tuple:
+def _page_ocr(renderer, engine, page_1based: int, cache: dict, page_state=None) -> tuple:
     """对指定页做一次方向感知 OCR，返回 (lines, w, h)。
 
     先 0° 常规引擎识别（含 cls，只用于读取"页码/首页结构"，不用于方向判断）；
@@ -145,11 +145,15 @@ def _page_ocr(renderer, engine, page_1based: int, cache: dict) -> tuple:
     if page_1based in cache:
         return cache[page_1based]
     try:
-        img = renderer.render(page_1based - 1, width_px=1000, bucket="ctx")
+        rotation = getattr(page_state, "effective_rotation", 0)
+        render_args = dict(width_px=1000, bucket="ctx")
+        if rotation:
+            render_args["user_rotation"] = rotation
+        img = renderer.render(page_1based - 1, **render_args)
         lines = engine.recognize(img)
         w, h = img.size
         kind, _frac = ocrfields.line_orientation(lines)
-        if kind == "vertical":
+        if kind == "vertical" and page_state is None:
             from .ocr import OcrEngineNoCls
 
             raw = OcrEngineNoCls.get()
@@ -177,6 +181,7 @@ def judge_blank_context(
     blank_pages: list[int] | None = None,
     progress_cb=None,
     cancel_cb=None,
+    page_cache=None,
 ) -> list[ContextEvidence]:
     """对每个视觉空白候选页判定业务属性（separator / internal_blank / uncertain）。
 
@@ -188,7 +193,7 @@ def judge_blank_context(
         blank_pages = [st.src_index for st in doc.pages
                        if st.blank is not None and st.blank.verdict == "blank"]
 
-    cache: dict = {}
+    cache: dict = page_cache if page_cache is not None else {}
     out: list[ContextEvidence] = []
     total = len(blank_pages)
     for i, p in enumerate(blank_pages):
@@ -210,14 +215,14 @@ def judge_blank_context(
                     progress_cb(i + 1, total)
                 continue
 
-            lns, w, h = _page_ocr(renderer, engine, nxt, cache)
+            lns, w, h = _page_ocr(renderer, engine, nxt, cache, doc.pages[nxt - 1])
             if lns:
                 ev.next_page_number = pagenum.extract_page_number(lns, h)
                 ev.next_title_likeness = ocrfields.title_likeness(lns, w, h)
                 ev.next_structure = ocrfields.first_page_structure(lns, w, h)
 
             if prv is not None:
-                plns, pw, ph = _page_ocr(renderer, engine, prv, cache)
+                plns, pw, ph = _page_ocr(renderer, engine, prv, cache, doc.pages[prv - 1])
                 if plns:
                     ev.prev_page_number = pagenum.extract_page_number(plns, ph)
                     ev.prev_title_likeness = ocrfields.title_likeness(plns, pw, ph)
@@ -236,7 +241,10 @@ def judge_blank_context(
             same_src = (prv is not None) and _titles_same_source(
                 st.get("title_text", ""), pst.get("title_text", ""))
 
-            if nxt_is_first:
+            if nxt_is_first and (has_cont or same_src):
+                ev.verdict = UNCERTAIN
+                ev.reason = "页码为1但存在续页/同名标题证据，空白保留，请确认边界"
+            elif nxt_is_first:
                 # 证据 A：后一内容页页码明确重置为 1 → 新文档首页
                 ev.verdict = SEPARATOR
                 ev.reason = "后一内容页印刷页码=1（新文档首页）→ 分隔空白"

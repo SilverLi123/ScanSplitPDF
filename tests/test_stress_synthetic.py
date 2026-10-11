@@ -171,6 +171,9 @@ def test_internal_blank_page_retained_in_export_mapping(make_scan, tmp_path):
     grouping.refresh_groups(doc)
     assert [(g.start, g.end) for g in doc.groups] == [(1, 5)]
     doc.groups[0].title, doc.groups[0].unit = "完整文档", "单位C"
+    # 用户改完边界后再次确认该组名称，旧非严格参数不能替代确认。
+    doc.groups[0].title_confirmed = doc.groups[0].unit_confirmed = True
+    doc.groups[0].boundary_confirmed = True
     out2 = tmp_path / "full"
     out2.mkdir()
     opts2 = exporter.ExportOptions(template="{title}_{unit}", out_dir=out2, strict=False)

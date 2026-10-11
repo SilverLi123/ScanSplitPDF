@@ -67,15 +67,53 @@ class FieldCandidate:
     confidence: float
     source: str  # 文头 | 落款 | 正文 | 标题
     reason: str = ""
+    page: int | None = None
+    bbox: list | None = None
+    image_size: list | None = None
 
     def to_dict(self) -> dict:
         return {"text": self.text, "confidence": round(self.confidence, 3),
-                "source": self.source, "reason": self.reason}
+                "source": self.source, "reason": self.reason, "page": self.page,
+                "bbox": self.bbox, "image_size": self.image_size}
 
     @staticmethod
     def from_dict(d: dict) -> "FieldCandidate":
         return FieldCandidate(d.get("text", ""), d.get("confidence", 0.0),
-                              d.get("source", ""), d.get("reason", ""))
+                              d.get("source", ""), d.get("reason", ""), d.get("page"),
+                              d.get("bbox"), d.get("image_size"))
+
+
+def extract_reporting_unit(lines: list[OcrLine], img_w: float, img_h: float) -> list[FieldCandidate]:
+    """Extract 填报单位, including label/value in neighbouring OCR boxes.
+
+    Other organisation roles are deliberately not synonyms. No header/signature fallback.
+    """
+    label = re.compile(r"^填\s*报\s*单\s*位\s*[：:]?\s*(.*)$")
+    out = []
+    for ln in lines:
+        match = label.match(ln.text.strip())
+        if not match:
+            continue
+        value = match.group(1).strip()
+        evidence = ln
+        if not value:
+            neighbours = [other for other in lines if other is not ln and (
+                (other.x0 >= ln.x1 - 5 and other.x0 - ln.x1 <= img_w * .25
+                 and abs(other.cy - ln.cy) <= max(ln.height, other.height) * .6)
+                or (0 <= other.y0 - ln.y1 <= ln.height * 1.2
+                    and abs(other.x0 - ln.x0) <= img_w * .08))
+                and UNIT_PATTERN.fullmatch(other.text.strip())]
+            if len(neighbours) != 1:
+                continue
+            evidence = neighbours[0]
+            value = evidence.text.strip()
+        if not UNIT_PATTERN.fullmatch(value) or value in PLACE_STOPWORDS:
+            continue
+        out.append(FieldCandidate(value, round(min(ln.score, evidence.score) * .95, 3),
+            "填报单位", "明确的填报单位标签", bbox=[min(ln.x0, evidence.x0),
+            min(ln.y0,evidence.y0), max(ln.x1,evidence.x1), max(ln.y1,evidence.y1)],
+            image_size=[img_w,img_h]))
+    return sorted(out, key=lambda c: c.confidence, reverse=True)
 
 
 def _strip_leading_particles(s: str) -> str:

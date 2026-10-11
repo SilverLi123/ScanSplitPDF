@@ -163,6 +163,9 @@ class Group:
     # 默认 True：无 OCR 结果时不产生"待确认"噪音；自动命名后按置信度回落。
     title_confirmed: bool = True
     unit_confirmed: bool = True
+    title_manual: bool = False
+    unit_manual: bool = False
+    boundary_confirmed: bool = True
 
     @property
     def page_count(self) -> int:
@@ -175,7 +178,7 @@ class Group:
     @property
     def need_confirm(self) -> bool:
         """任一字段未确认即整组待确认（字段级状态的派生值）。"""
-        return not (self.title_confirmed and self.unit_confirmed)
+        return not (self.title_confirmed and self.unit_confirmed and self.boundary_confirmed)
 
     @need_confirm.setter
     def need_confirm(self, value: bool) -> None:
@@ -195,6 +198,9 @@ class Group:
             "unit_candidates": _norm(self.unit_candidates),
             "title_confirmed": self.title_confirmed,
             "unit_confirmed": self.unit_confirmed,
+            "title_manual": self.title_manual,
+            "unit_manual": self.unit_manual,
+            "boundary_confirmed": self.boundary_confirmed,
             "need_confirm": self.need_confirm,  # 兼容旧版读取
         }
 
@@ -210,6 +216,9 @@ class Group:
             tc = uc = not d.get("need_confirm", False)
         g.title_confirmed = bool(tc)
         g.unit_confirmed = bool(uc)
+        g.title_manual = bool(d.get("title_manual", False))
+        g.unit_manual = bool(d.get("unit_manual", False))
+        g.boundary_confirmed = bool(d.get("boundary_confirmed", True))
         # 候选以 dict 形态存储（与 auto_name_groups 写入、UI 面板读取一致）
         g.title_candidates = [dict(x) for x in d.get("title_candidates", [])]
         g.unit_candidates = [dict(x) for x in d.get("unit_candidates", [])]
@@ -221,6 +230,8 @@ class ScanDocument:
 
     def __init__(self, path: str | Path, reader: PdfReader, warnings: list[str] | None = None):
         self.path = Path(path)
+        from .verify import file_sha256
+        self.source_sha256 = file_sha256(self.path)
         self.reader = reader
         self.warnings = list(warnings or [])
         self.pages: list[PageState] = [
@@ -241,6 +252,9 @@ class ScanDocument:
         self.affected_group_indices: list[int] = []
         # 人工改过分隔标记的页码集合（v1.9 A0）：自动分组/上下文判定不得覆盖。
         self.manual_separator_pages: set[int] = set()
+        self.manual_boundaries: dict[int, bool] = {}
+        self.pending_boundaries: dict[int, str] = {}
+        self.analysis_complete = False
         self.status = "loaded"  # loaded | analyzed | grouped | exported | error
         self.error: Optional[str] = None
 
@@ -269,6 +283,9 @@ class ScanDocument:
             "status": self.status,
             "manual_separator_pages": sorted(self.manual_separator_pages),
             "affected_group_indices": sorted(self.affected_group_indices),
+            "manual_boundaries": dict(self.manual_boundaries),
+            "pending_boundaries": dict(self.pending_boundaries),
+            "analysis_complete": self.analysis_complete,
         }
 
     def restore(self, d: dict) -> None:
@@ -278,6 +295,9 @@ class ScanDocument:
         # 人工分隔页集合随快照回滚（旧快照无此键 → 置空，保持向后兼容）
         self.manual_separator_pages = set(d.get("manual_separator_pages", []) or [])
         self.affected_group_indices = list(d.get("affected_group_indices", []) or [])
+        self.manual_boundaries = {int(k): bool(v) for k, v in d.get("manual_boundaries", {}).items()}
+        self.pending_boundaries = {int(k): str(v) for k, v in d.get("pending_boundaries", {}).items()}
+        self.analysis_complete = bool(d.get("analysis_complete", False))
 
 
 @dataclass

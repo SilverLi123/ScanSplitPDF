@@ -157,6 +157,8 @@ def test_full_workflow(tmp_path, make_scan, ui_env, monkeypatch):
         assert doc.pages[1].rotation == 0
 
         # OCR 命名（扫描件无文本层：有 OCR 则识别，无 OCR 则留空待确认）
+        for gi in range(len(doc.groups)):
+            app.confirm_group_boundary(doc, gi)
         app.ocr_name()
         pump_until_idle(app)
 
@@ -166,6 +168,11 @@ def test_full_workflow(tmp_path, make_scan, ui_env, monkeypatch):
         assert doc.pages[1].rotation == 0
 
         # 导出（目录已 monkeypatch；空字段时 preflight 提示 → 测试中放行）
+        for gi, g in enumerate(doc.groups):
+            # 模拟用户最终复核：扫描样本没有明确填报单位标签。
+            g.title, g.unit = f"人工确认报告{gi + 1}", "测试单位"
+            g.title_manual = g.unit_manual = True
+            g.title_confirmed = g.unit_confirmed = g.boundary_confirmed = True
         app.export_all()
         pump_until_idle(app, timeout=60)
         pdfs = sorted(out_dir.glob("*.pdf"))
@@ -338,6 +345,7 @@ def test_field_level_confirm_in_panel(ui_env, tmp_path, make_scan):
         app.import_files([str(scan)])
         doc = app._active_doc()
         g = doc.groups[0]
+        g.boundary_confirmed = True  # 本测试只验证命名字段，不替代拆分确认。
         g.title, g.unit = "旧标题", "旧单位"
         g.title_confirmed = False  # 模拟 OCR 低置信
         g.unit_confirmed = False

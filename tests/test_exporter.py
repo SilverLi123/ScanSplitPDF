@@ -27,6 +27,7 @@ def test_split_export_basic(tmp_path, make_scan):
     doc = _load_doc(pdf)
     doc.pages[2].separator = True
     doc.pages[4].separator = True
+    doc.manual_separator_pages.update({3, 5})
     refresh_groups(doc)
     doc.groups[0].title, doc.groups[0].unit = "文档A", "教务处"
     doc.groups[1].title, doc.groups[1].unit = "文档B", "科研处"
@@ -51,6 +52,7 @@ def test_source_file_sha256_unchanged(tmp_path, make_scan):
     before = verify.file_sha256(pdf)
     doc = _load_doc(pdf)
     doc.pages[1].separator = True
+    doc.manual_separator_pages.add(2)
     refresh_groups(doc)
     doc.groups[0].title, doc.groups[0].unit = "A", "B"
     doc.groups[1].title, doc.groups[1].unit = "C", "D"
@@ -64,6 +66,7 @@ def test_output_page_fidelity(tmp_path, make_scan):
     pdf = make_scan("f.pdf", ["text", "table", "blank", "stamp"])
     doc = _load_doc(pdf)
     doc.pages[2].separator = True
+    doc.manual_separator_pages.add(3)
     refresh_groups(doc)
     doc.groups[0].title, doc.groups[0].unit = "A", "B"
     doc.groups[1].title, doc.groups[1].unit = "C", "D"
@@ -86,6 +89,7 @@ def test_duplicate_names_get_suffix(tmp_path, make_scan):
     for pdf in (pdf1, pdf2):
         doc = _load_doc(pdf)
         doc.pages[1].separator = True
+        doc.manual_separator_pages.add(2)
         refresh_groups(doc)
         for g in doc.groups:
             g.title, g.unit = "同名报告", "教务处"
@@ -102,6 +106,7 @@ def test_cancel_export_keeps_partial_results(tmp_path, make_scan):
     doc = _load_doc(pdf)
     for i in (1, 3, 5):
         doc.pages[i].separator = True
+        doc.manual_separator_pages.add(i + 1)
     refresh_groups(doc)
     for g in doc.groups:
         g.title, g.unit = "报告", "单位"
@@ -124,6 +129,7 @@ def test_export_failure_keeps_source_and_valid_results(tmp_path, make_scan, monk
     doc = _load_doc(pdf)
     for i in (1, 3):
         doc.pages[i].separator = True
+        doc.manual_separator_pages.add(i + 1)
     refresh_groups(doc)
     for g in doc.groups:
         g.title, g.unit = "报告", "单位"
@@ -193,7 +199,7 @@ def test_encrypted_pdf_refused(tmp_path, make_scan):
 
 
 def test_strict_preflight_blocks_unconfirmed_fields(tmp_path, make_scan):
-    """严格模式：待确认字段为阻断项；非严格模式放行（仅建议测试文件）。"""
+    """待确认字段不可被旧 strict=False 参数绕过。"""
     pdf = make_scan("st.pdf", ["text", "blank", "text"])
     doc = _load_doc(pdf)
     doc.pages[1].separator = True
@@ -204,7 +210,7 @@ def test_strict_preflight_blocks_unconfirmed_fields(tmp_path, make_scan):
     strict_issues = preflight([doc], ExportOptions(out_dir=tmp_path / "out", strict=True))
     assert any("待确认" in i for i in strict_issues)
     soft_issues = preflight([doc], ExportOptions(out_dir=tmp_path / "out", strict=False))
-    assert not any("待确认" in i for i in soft_issues)
+    assert any("待确认" in i for i in soft_issues)
     # 空标题在两种模式下都拦截
     doc.groups[0].title = ""
     issues = preflight([doc], ExportOptions(out_dir=tmp_path / "out", strict=False))
@@ -295,6 +301,7 @@ def test_large_pdf_120_pages(tmp_path, make_scan):
         p.blank = r
         if r.verdict == "blank":
             p.separator = True
+            doc.manual_separator_pages.add(p.src_index)
     refresh_groups(doc)
     assert len(doc.groups) >= 38
     for gi, g in enumerate(doc.groups):

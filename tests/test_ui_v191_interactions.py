@@ -50,7 +50,7 @@ def test_no_blank_full_flow(ui_env, tmp_path, make_scan, monkeypatch):
         # 检测后：分组按钮**启用**（关键修复：不再把"无空白"当"未检测"）
         app.update_status()
         assert app.tool_btns["group"].instate(["!disabled"])
-        assert "复核拆分" in app.hint_var.get() or "补拆" in app.hint_var.get()
+        assert "拆分" in app.hint_var.get()
 
         # 自动分组建立初始分组（整个文件一份）
         app.auto_group_all()
@@ -272,6 +272,8 @@ def test_renamed_affected_groups_preserve_manual(ui_env, tmp_path, make_scan):
         g = doc.groups[0]
         g.title, g.unit = "人工标题", "人工单位"
         g.title_confirmed = g.unit_confirmed = True
+        g.title_manual = g.unit_manual = True
+        g.boundary_confirmed = True
         # 直接调用底层：preserve_confirmed=True 时不得覆盖已确认字段
         autoname.auto_name_groups(doc, None, engine=None, preserve_confirmed=True)
         assert g.title == "人工标题" and g.unit == "人工单位"
@@ -305,6 +307,7 @@ def test_strict_export_blocked_on_empty_fields(ui_env, tmp_path, make_scan, monk
         app.auto_group_all()
         pump_until_idle(app)
         # 标题/单位留空 → 摘要对话框必经；用户取消 → 不导出
+        doc.groups[0].boundary_confirmed = True  # 分组已由用户复核，专测名称缺失。
         monkeypatch.setattr(ui_env.filedialog, "askdirectory", lambda **k: str(out_dir))
 
         captured = {}
@@ -396,9 +399,10 @@ def test_manual_separator_recorded_and_snapshotted(ui_env, tmp_path, make_scan):
         assert doc.pages[1].separator is False
         app.redo()
         assert 2 in doc.manual_separator_pages
-        # 取消分隔标记 → 依据移除
+        # 人工决定保留也必须留存，不能被下一次自动分析覆盖。
         app.set_separator([2], False)
-        assert 2 not in doc.manual_separator_pages
+        assert 2 in doc.manual_separator_pages
+        assert doc.pages[1].separator is False
     finally:
         try:
             app.on_close()
@@ -496,6 +500,7 @@ def test_partial_export_only_selected_groups(ui_env, tmp_path, make_scan, monkey
         for g in doc.groups:
             g.title, g.unit = "标题", "单位"
             g.title_confirmed = g.unit_confirmed = True
+            g.boundary_confirmed = True  # 用户已完成本测试的分组复核。
         monkeypatch.setattr(ui_env.filedialog, "askdirectory", lambda **k: str(out_dir))
 
         class _PickFirstDialog:
@@ -581,6 +586,7 @@ def test_rename_affected_clears_stale_indices(ui_env, tmp_path, make_scan, monke
         for g in doc.groups:
             g.title, g.unit = "人工标题", "人工单位"
             g.title_confirmed = g.unit_confirmed = True
+            g.boundary_confirmed = True
         # 重跑命名（preserve_confirmed）：已确认组不应再留在 affected
         autoname.auto_name_groups(doc, None, engine=None,
                                   only_indices={0, 1}, preserve_confirmed=True)

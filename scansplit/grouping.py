@@ -117,6 +117,11 @@ def refresh_groups(doc: ScanDocument) -> list[Group]:
         if len(srcs) == 1 and len(targets_of[id(srcs[0])]) == 1:
             src = srcs[0]
             _migrate_group_fields(src, g)
+            g.boundary_confirmed = False
+            if not g.title_manual:
+                g.title_confirmed = False
+            if not g.unit_manual:
+                g.unit_confirmed = False
             if src.title.strip() or src.unit.strip():
                 notes.append(
                     f"第 {start}-{end} 页：已沿用原第 {src.start}-{src.end} 页分组的标题/单位"
@@ -154,11 +159,22 @@ def _migrate_group_fields(src: Group, dst: Group) -> None:
     dst.unit_candidates = list(src.unit_candidates)
     dst.title_confirmed = src.title_confirmed
     dst.unit_confirmed = src.unit_confirmed
+    dst.title_manual = src.title_manual
+    dst.unit_manual = src.unit_manual
+    dst.boundary_confirmed = src.boundary_confirmed
 
 
 def _cands_of(groups: list[Group], which: str) -> list:
     out, seen = [], set()
     for g in groups:
+        value = getattr(g, which).strip()
+        if value:
+            source = "人工填写" if getattr(g, f"{which}_manual") else "原分组"
+            key = (value, source)
+            if key not in seen:
+                seen.add(key)
+                out.append(dict(text=value, source=source, confidence=1.0,
+                                reason=f"原第 {g.start}-{g.end} 页分组的字段，边界改变后请复核"))
         for c in getattr(g, f"{which}_candidates"):
             key = (c.get("text"), c.get("source"))
             if c.get("text") and key not in seen:
