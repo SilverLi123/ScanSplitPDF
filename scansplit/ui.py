@@ -30,6 +30,7 @@ from .ocr import OcrEngine
 from .render import PageRenderer, RenderError
 from .tasks import TaskManager
 from .ui_widgets import (
+    ExportSummaryDialog,
     GroupPanelArea,
     LogPanel,
     PreviewPane,
@@ -640,9 +641,13 @@ class App:
         if not doc or not doc.groups:
             messagebox.showinfo("重新识别", "请先打开并分组 PDF 文件。")
             return
-        targets = {gi for gi, g in enumerate(doc.groups) if g.need_confirm}
+        # 精确范围（v1.9.1 改进6）：refresh_groups 回传的受影响组
+        # ∪ 当前仍待确认的组（避免遗漏人工标待确认但未被判"受影响"的组）。
+        affected = set(getattr(doc, "affected_group_indices", []) or [])
+        targets = affected | {gi for gi, g in enumerate(doc.groups) if g.need_confirm}
+        targets = {gi for gi in targets if 0 <= gi < len(doc.groups)}
         if not targets:
-            messagebox.showinfo("重新识别", "当前没有待确认的分组，无需重新识别。")
+            messagebox.showinfo("重新识别", "当前没有受影响或待确认的分组，无需重新识别。")
             return
         engine = OcrEngine.get()
         use_ocr = engine.available
@@ -1206,38 +1211,36 @@ class App:
         opts = exporter.ExportOptions(template=template, out_dir=out_dir, strict=True)
         field_issues, integrity_issues, stats = self.export_summary(docs, opts)
 
-        # 页面完整性 / 异常排除 / 源文件保真问题 → fail-closed，**不提供**非严格模式绕过
-        if integrity_issues:
-            messagebox.showerror(
-                "导出被阻止（页面完整性）",
-                "检测到页面完整性/排除依据问题，正式导出一律阻断，"
-                "非严格模式也不能绕过：\n\n"
-                + "\n".join(integrity_issues[:15])
-                + ("\n……" if len(integrity_issues) > 15 else "")
-                + "\n\n请在缩略图上核对分隔页/拆分点，或重新执行“自动分组”，"
-                "确保没有未确认依据的丢页后重试。",
-            )
+        # v1.9.1 改进3：统一改用「可勾选清单」对话框，替代一行 askyesno。
+        # - 完整性（fail-closed）：只读展示，无「非严格模式」，不可绕过；
+        # - 字段级（可放宽）：勾选要导出的组，可选「非严格模式导出」。
+        integrity_blocked = bool(integrity_issues)
+
+        def name_of(doc, gi, g):
+            return naming.build_filename(
+                g.title, g.unit, template=template, index=gi + 1,
+                orig=doc.name, start=g.start, end=g.end,
+            ) + ".pdf"
+
+        dlg = ExportSummaryDialog(
+            self.root, docs, stats, field_issues, integrity_issues,
+            name_of=name_of, integrity_blocked=integrity_blocked,
+        )
+        result = dlg.show()
+
+        if integrity_blocked:
             self.log(f"导出被阻止：{len(integrity_issues)} 项页面完整性问题（fail-closed）。")
             return
-
-        # 字段不完整/待确认/重名 → 可经用户显式确认后以非严格模式继续
-        if field_issues:
-            summary = self._format_export_summary(stats)
-            if not messagebox.askyesno(
-                "严格导出检查未通过",
-                summary
-                + "\n\n以下分组存在阻断项（空标题、空单位、待确认字段或重名）：\n"
-                + "\n".join(field_issues[:15])
-                + ("\n……" if len(field_issues) > 15 else "")
-                + "\n\n【正式导出】请先补全并确认标题/单位后重试。\n"
-                "是否改用【非严格模式】继续导出？（仅建议用于测试文件）",
-            ):
-                return
-            opts.strict = False
-        else:
-            # 全部通过：展示简洁检查摘要后继续
-            if not messagebox.askyesno("导出前检查", self._format_export_summary(stats) + "\n\n是否开始导出？"):
-                return
+        if not result.get("confirmed"):
+            self.log("已取消导出。")
+            return
+        only = set(result["items"])
+        if not only:
+            self.log("未勾选任何分组，导出取消。")
+            return
+        opts.strict = bool(result["strict"])
+        opts.only = only
+        total_g = len(only)
         self._busy = True
         self._update_step_state()
 
@@ -1246,6 +1249,7 @@ class App:
             worker_opts = exporter.ExportOptions(
                 template=template, out_dir=out_dir, strict=opts.strict,
                 on_log=log, on_progress=progress, cancel_check=cancel,
+                only=only,
             )
             return exporter.export_documents(docs, worker_opts)
 

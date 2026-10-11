@@ -26,6 +26,10 @@ class ExportOptions:
     # 严格导出模式（v1.8 默认开启）：空标题/空单位/存在待确认字段时
     # preflight 返回阻断项。非严格模式仅用于测试文件，须由用户显式选择。
     strict: bool = True
+    # v1.9.1 改进3：按清单导出时指定要导出的 (doc_index, group_index) 集合。
+    # None = 全部导出（默认）。指定后覆盖率校验只针对被选中的组，
+    # 未勾选的组视为"用户主动跳过"，不计入漏页。
+    only: object = None  # set[tuple[int, int]] | None
 
 
 @dataclass
@@ -133,13 +137,20 @@ def business_integrity_issues(doc: ScanDocument) -> list[str]:
     return issues
 
 
-def coverage_issues(doc: ScanDocument, results: list[ExportResult]) -> list[str]:
+def coverage_issues(doc: ScanDocument, results: list[ExportResult],
+                    only_groups: set | None = None) -> list[str]:
     """全局页面覆盖率校验（v1.8）：每个有效原页（组内页）必须恰好导出一次。
 
     漏导、重复导出、导出了组外页均视为问题。空白页只要未标记为分隔页，
     就属于某个分组、必须出现在输出中（防止"内部空白页被误删"）。
+
+    only_groups（v1.9.1 改进3）：按清单导出时，只针对这些组索引校验覆盖率；
+    未勾选的组属用户主动跳过，不计入漏页。
     """
-    expected = sorted(p for g in doc.groups for p in g.pages)
+    if only_groups is None:
+        expected = sorted(p for g in doc.groups for p in g.pages)
+    else:
+        expected = sorted(p for gi, g in enumerate(doc.groups) if gi in only_groups for p in g.pages)
     exported: list[int] = []
     for r in results:
         if r.ok:
@@ -251,13 +262,24 @@ def export_documents(
     out_dir = Path(opts.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for doc in docs:
+    for di, doc in enumerate(docs):
         report.src_sha_before[str(doc.path)] = verify.file_sha256(doc.path)
-        _log(report, opts, f"开始导出 {doc.name}（{len(doc.groups)} 份）")
+        # 按清单导出：仅导出被勾选的分组
+        only = getattr(opts, "only", None)
+        sel_gis = None
+        if only is not None:
+            sel_gis = {gi for (d_i, gi) in only if d_i == di}
+            if not sel_gis:
+                continue
+            _log(report, opts, f"开始导出 {doc.name}（已勾选 {len(sel_gis)} 份）")
+        else:
+            _log(report, opts, f"开始导出 {doc.name}（{len(doc.groups)} 份）")
         doc_result_start = len(report.results)
         for gi, group in enumerate(doc.groups):
             if report.canceled:
                 break
+            if sel_gis is not None and gi not in sel_gis:
+                continue  # 用户主动跳过该组
             result = _export_one(doc, group, out_dir, opts, report, gi + 1)
             report.results.append(result)
             if opts.on_progress:
@@ -275,20 +297,29 @@ def export_documents(
         if report.canceled:
             _log(report, opts, f"{doc.name} 导出被取消，跳过页面覆盖率校验。")
         else:
-            doc_issues = coverage_issues(doc, report.results[doc_result_start:])
+            doc_issues = coverage_issues(
+                doc, report.results[doc_result_start:], only_groups=sel_gis
+            )
             biz_issues = business_integrity_issues(doc)
             if doc_issues:
                 report.coverage_issues[doc.name] = doc_issues
                 for msg in doc_issues:
                     _log(report, opts, f"[严重] 页面覆盖率校验：{msg}")
             elif not biz_issues:
+                n_pages = sum(
+                    g.page_count for gi, g in enumerate(doc.groups)
+                    if sel_gis is None or gi in sel_gis
+                )
                 _log(
                     report, opts,
-                    f"页面覆盖率校验通过：{doc.name} 全部 {sum(g.page_count for g in doc.groups)} 个有效页恰好导出一次",
+                    f"页面覆盖率校验通过：{doc.name} 全部 {n_pages} 个有效页恰好导出一次",
                 )
-            for msg in biz_issues:
-                report.coverage_issues.setdefault(doc.name, []).append(msg)
-                _log(report, opts, f"[严重] 业务完整性校验：{msg}")
+            # 业务完整性只在未按清单筛选、或筛选覆盖全部组时适用；
+            # 用户主动跳过某些组时，未导出页属预期，不报"静默丢页"。
+            if sel_gis is None or len(sel_gis) == len(doc.groups):
+                for msg in biz_issues:
+                    report.coverage_issues.setdefault(doc.name, []).append(msg)
+                    _log(report, opts, f"[严重] 业务完整性校验：{msg}")
 
     n_ok = len(report.succeeded)
     n_fail = len(report.failed)
