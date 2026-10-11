@@ -236,6 +236,9 @@ class ScanDocument:
                 ps.original_rotation = 0
         self.groups: list[Group] = []
         self.group_migrate_notes: list[str] = []  # refresh_groups 的迁移/歧义说明
+        # refresh_groups 回传的"受边界调整影响"的组下标（v1.9.1 改进6），
+        # 供 UI "重新识别受影响分组"精确定位。
+        self.affected_group_indices: list[int] = []
         # 人工改过分隔标记的页码集合（v1.9 A0）：自动分组/上下文判定不得覆盖。
         self.manual_separator_pages: set[int] = set()
         self.status = "loaded"  # loaded | analyzed | grouped | exported | error
@@ -265,6 +268,7 @@ class ScanDocument:
             "groups": [g.snapshot() for g in self.groups],
             "status": self.status,
             "manual_separator_pages": sorted(self.manual_separator_pages),
+            "affected_group_indices": sorted(self.affected_group_indices),
         }
 
     def restore(self, d: dict) -> None:
@@ -273,6 +277,7 @@ class ScanDocument:
         self.status = d["status"]
         # 人工分隔页集合随快照回滚（旧快照无此键 → 置空，保持向后兼容）
         self.manual_separator_pages = set(d.get("manual_separator_pages", []) or [])
+        self.affected_group_indices = list(d.get("affected_group_indices", []) or [])
 
 
 @dataclass

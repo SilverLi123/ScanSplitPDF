@@ -104,7 +104,10 @@ def refresh_groups(doc: ScanDocument) -> list[Group]:
 
     notes: list[str] = []
     new: list[Group] = []
-    for start, end in new_ranges:
+    # 受影响组下标（v1.9.1 改进6）：边界调整后新生成/需要复核的组，
+    # 供 UI "重新识别受影响分组"精确定位（而非仅按 need_confirm 粗筛）。
+    affected: list[int] = []
+    for idx, (start, end) in enumerate(new_ranges):
         prev = old_by_range.get((start, end))
         if prev is not None:
             new.append(prev)
@@ -118,6 +121,8 @@ def refresh_groups(doc: ScanDocument) -> list[Group]:
                 notes.append(
                     f"第 {start}-{end} 页：已沿用原第 {src.start}-{src.end} 页分组的标题/单位"
                 )
+            else:
+                affected.append(idx)  # 唯一对应但原本就无标题/单位 → 需识别
         elif srcs:
             # 歧义：旧组被拆到多个新组（或新组横跨多个旧组），不能替用户做主。
             # 候选按字段分桶保留供复核，标题/单位留空、标记待确认。
@@ -125,13 +130,18 @@ def refresh_groups(doc: ScanDocument) -> list[Group]:
             g.unit_candidates = _cands_of(srcs, "unit")
             g.title_confirmed = False
             g.unit_confirmed = False
+            affected.append(idx)
             notes.append(
                 f"第 {start}-{end} 页：分组边界调整后与原分组对应关系不唯一，"
                 "已保留命名候选，请人工复核标题/单位"
             )
+        else:
+            # 全新页段（原分组中不存在任何重叠）→ 需识别
+            affected.append(idx)
         new.append(g)
     doc.groups = new
     doc.group_migrate_notes = notes
+    doc.affected_group_indices = affected
     return new
 
 

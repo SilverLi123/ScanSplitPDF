@@ -257,6 +257,17 @@ def auto_name_groups(
         results.append(res)
         if progress_cb:
             progress_cb(gi + 1, total)
+    # v1.9.1 改进6：命名后同步维护"受影响组"清单——本次处理过且已不再
+    # 需要人工确认的组，从 affected_group_indices 中移除，避免 UI 反复提示
+    # "有受影响组需重新识别"（消除陈旧标记导致的空转与误判）。
+    if getattr(doc, "affected_group_indices", None):
+        handled = only_indices if only_indices is not None else set(range(len(doc.groups)))
+        still = [
+            gi for gi in doc.affected_group_indices
+            if 0 <= gi < len(doc.groups)
+            and not (gi in handled and not doc.groups[gi].need_confirm)
+        ]
+        doc.affected_group_indices = still
     return results
 
 
