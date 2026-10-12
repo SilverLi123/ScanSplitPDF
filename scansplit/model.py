@@ -53,11 +53,13 @@ class PageState:
     original_rotation: int = 0        # PDF 源文件原有 /Rotate（只读，加载时记录）
     detected_rotation: int | None = None   # 自动方向检测建议；None=未检测
     detected_confidence: float = 0.0        # 自动检测置信度 [0,1]
+    detected_note: str = ""                # 已应用自动建议的依据，保留供集中复查
+    direction_review_required: bool = False  # 已应用但把握不足，允许集中一次确认
     user_override_rotation: int | None = None  # 人工设定；None=未人工干预
     # 方向"待确认建议"（v1.9.1 P0-A）：自动检测给出的**未采用**建议。
     # 与 detected_rotation 的区别：detected_rotation 非 None 即参与
-    # effective_rotation（已生效）；rotation_proposal 只是候选，必须由用户
-    # 在方向对话框确认后才落到 detected_rotation / user_override_rotation。
+    # effective_rotation（已生效）；rotation_proposal 仅保留没有可用方向
+    # 建议的异常页，或旧记录的尚未采用建议，仍需人工处理。
     # 预览 / OCR / 命名 / 导出**绝不读取**本字段。
     rotation_proposal: int | None = None
     rotation_proposal_note: str = ""        # 建议说明（几何不一致 / OCR 四方向对比结果）
@@ -99,11 +101,17 @@ class PageState:
         绝不会覆盖人工结果。
         """
         self.user_override_rotation = int(value) % 360
+        self.direction_review_required = False
 
     @property
     def is_rotation_manual(self) -> bool:
         """方向是否已由人工确认（此时自动检测不得覆盖）。"""
         return self.user_override_rotation is not None
+
+    @property
+    def is_rotation_automatic(self) -> bool:
+        """自动建议已应用，但不能显示为人工确认。包括自动保持 0°。"""
+        return self.detected_rotation is not None and not self.is_rotation_manual
 
     @property
     def has_rotation_proposal(self) -> bool:
@@ -116,6 +124,8 @@ class PageState:
             "original_rotation": self.original_rotation,
             "detected_rotation": self.detected_rotation,
             "detected_confidence": self.detected_confidence,
+            "detected_note": self.detected_note,
+            "direction_review_required": self.direction_review_required,
             "user_override_rotation": self.user_override_rotation,
             "rotation_proposal": self.rotation_proposal,
             "rotation_proposal_note": self.rotation_proposal_note,
@@ -138,6 +148,8 @@ class PageState:
             ps.original_rotation = int(d.get("original_rotation", 0) or 0) % 360
             ps.detected_rotation = d.get("detected_rotation")
             ps.detected_confidence = float(d.get("detected_confidence", 0.0) or 0.0)
+            ps.detected_note = d.get("detected_note", "")
+            ps.direction_review_required = bool(d.get("direction_review_required", False))
             ps.user_override_rotation = d.get("user_override_rotation")
         else:
             rot = d.get("rotation", 0) or 0

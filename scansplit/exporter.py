@@ -170,7 +170,7 @@ def integrity_preflight(docs: list[ScanDocument], opts: ExportOptions) -> list[s
                 continue
             if not g.boundary_confirmed or doc.pending_for_group(g):
                 issues.append(f"{doc.name} 第 {g.start}-{g.end} 页：拆分边界待确认")
-            if any(p.has_rotation_proposal for p in doc.pages[g.start-1:g.end]):
+            if any(p.has_rotation_proposal or p.direction_review_required for p in doc.pages[g.start-1:g.end]):
                 issues.append(f"{doc.name} 第 {g.start}-{g.end} 页：方向建议待处理")
     if opts.only is not None and any(
         not (0 <= di < len(docs) and 0 <= gi < len(docs[di].groups))

@@ -46,7 +46,7 @@ def field_info(group, field):
 def split_ready(doc, group):
     return (doc.analysis_complete and not doc.analysis_stale and group.boundary_confirmed
             and not doc.pending_for_group(group)
-            and not any(p.has_rotation_proposal for p in doc.pages[group.start-1:group.end]))
+            and not any(p.has_rotation_proposal or p.direction_review_required for p in doc.pages[group.start-1:group.end]))
 
 
 def name_ready(doc, group):
@@ -57,7 +57,8 @@ def state_key(docs):
     """Cheap invalidation for displayed checks; no hashing PDF on each keystroke."""
     return tuple((str(d.path), d.source_sha256, d.analysis_complete, d.analysis_stale,
         d.naming_attempted, tuple(sorted(d.pending_boundaries.items())),tuple(sorted(d.manual_boundaries.items())),tuple(sorted(d.manual_separator_pages)),
-        tuple((p.separator,p.omitted_blank,p.split_before,p.effective_rotation,p.rotation_proposal) for p in d.pages),
+        tuple((p.separator,p.omitted_blank,p.split_before,p.effective_rotation,p.rotation_proposal,
+               p.detected_rotation,p.detected_confidence,p.is_rotation_manual,p.direction_review_required) for p in d.pages),
         tuple((g.start,g.end,g.title,g.unit,g.title_confirmed,g.unit_confirmed,g.boundary_confirmed,
                g.title_manual,g.unit_manual) for g in d.groups)) for d in docs)
 
@@ -73,12 +74,15 @@ def issues(docs):
                 result.append(Issue(f"{di}:blank:{p.src_index}", "空白页", "疑似空白，已保留", "空白证据不足；可能含页码、印章或签名。查看原页后可右键保留或排除。", di,p.src_index,action="page"))
             if p.has_rotation_proposal:
                 result.append(Issue(f"{di}:direction:{p.src_index}", "页面方向", "方向需要确认", p.rotation_proposal_note or "请按原页确认文字是否正向；建议尚未应用。", di,p.src_index,action="direction"))
+            elif p.direction_review_required:
+                result.append(Issue(f"{di}:direction-audit:{p.src_index}", "页面方向", "已自动回正，需要复查",
+                    "方向建议已应用，但识别把握较低。集中浏览回正结果后可一次确认；此确认不影响拆分与名称。",di,p.src_index,action="direction"))
         if d.analysis_stale:
             result.append(Issue(f"{di}:stale", "拆分", "方向改变，需要更新分析", "重新分析保留人工决定；旧自动证据暂不可用于导出。", di,action="reanalyze"))
         for p,reason in sorted(d.pending_boundaries.items()):
             result.append(Issue(f"{di}:boundary:{p}", "拆分交界", "文件归属需要确认", reason,di,p,action="boundary"))
         for gi,g in enumerate(d.groups):
-            if not g.boundary_confirmed and not d.pending_for_group(g) and not d.analysis_stale and not any(p.has_rotation_proposal for p in d.pages[g.start-1:g.end]):
+            if not g.boundary_confirmed and not d.pending_for_group(g) and not d.analysis_stale and not any(p.has_rotation_proposal or p.direction_review_required for p in d.pages[g.start-1:g.end]):
                 result.append(Issue(f"{di}:group:{gi}", "文件范围", "页码范围需要确认", f"核对原第 {g.start}–{g.end} 页是否属于同一份文件。",di,g.start,gi,action="group"))
             if not d.naming_attempted:
                 continue
@@ -127,11 +131,14 @@ def page_info(doc, number):
         page_type="内容页 · 保留"
     rotation=(f"原件方向 {p.original_rotation}°；" if p.original_rotation else "")
     rotation += (f"人工调整 {p.effective_rotation}°（已生效）" if p.is_rotation_manual else
-                 f"自动检测调整 {p.effective_rotation}°（已生效）" if p.effective_rotation else "保持原件方向")
+                 f"自动建议已应用 {p.effective_rotation}° · 可集中复查" if p.is_rotation_automatic else "保持原件方向")
+    if p.direction_review_required:
+        rotation += "（识别把握较低，请重点复查）"
     if not p.is_rotation_manual and not p.has_rotation_proposal and p.rotation_proposal_note.startswith("规则检查通过"):
         rotation += "（四方向规则检查通过）"
     if p.has_rotation_proposal:
-        rotation+=f"；建议调整 {p.rotation_proposal}°（未应用）"
+        rotation += ("；未获得有效方向建议，需要人工检查" if p.rotation_proposal_note.startswith("未获得有效方向建议") else
+                     f"；建议调整 {p.rotation_proposal}°（未应用）")
     boundary = ""
     if number in doc.pending_boundaries:
         boundary="该页是否另起一份，需要确认："+doc.pending_boundaries[number]

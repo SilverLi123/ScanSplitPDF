@@ -96,7 +96,7 @@ class ThumbnailStrip(ttk.Frame):
     def _badges(self, page) -> list[tuple[str, str]]:
         doc=self._doc
         g=next((g for g in doc.groups if g.start<=page.src_index<=g.end),None) if doc else None
-        pending=page.has_rotation_proposal or (doc and (doc.analysis_stale or page.src_index in doc.pending_boundaries or (g and not g.boundary_confirmed)))
+        pending=page.has_rotation_proposal or page.direction_review_required or (doc and (doc.analysis_stale or page.src_index in doc.pending_boundaries or (g and not g.boundary_confirmed)))
         if page.omitted_blank:
             out=[("人工确认删除","confirmed")] if doc and page.src_index in doc.manual_separator_pages else [("明确空白 · 自动删除","confirmed")] if blankpolicy.valid_exclusion(page) else [("排除需核查","uncertain")]
         elif pending:
@@ -111,6 +111,8 @@ class ThumbnailStrip(ttk.Frame):
             out=[("待分析","aux")]
         if page.split_before:
             out.append(("▶ 新文件","aux"))
+        if page.is_rotation_automatic and page.effective_rotation:
+            out.append(("自动回正","aux"))
         return out
 
     def _page_strip_color(self, page) -> str | None:
@@ -360,7 +362,7 @@ class PreviewPane(ttk.Frame):
             return
         summary,direction,boundary=presentation.page_info(self._doc,self._page_no)
         page=self._doc.pages[self._page_no-1]
-        reason=page.rotation_proposal_note if page.has_rotation_proposal else ""
+        reason=page.rotation_proposal_note if page.has_rotation_proposal else page.detected_note if page.is_rotation_automatic else ""
         messagebox.showinfo("当前页面",f"{self._doc.name}\n{summary}\n方向：{direction}\n{boundary}\n{reason}")
 
     def show_guide(self):
@@ -1017,7 +1019,7 @@ class GroupPanelArea(ttk.Frame):
         n_boundary = sum(not g.boundary_confirmed for g in doc.groups)
         n_sep = len(doc.excluded_pages)
         n_split = len(doc.split_starts)
-        n_prop = sum(1 for p in doc.pages if getattr(p, "has_rotation_proposal", False))
+        n_prop = sum(p.has_rotation_proposal or p.direction_review_required for p in doc.pages)
         parts = [f"文件 {len(doc.groups)} 份"]
         if n_sep:
             parts.append(f"输出删除 {n_sep} 页")
@@ -1049,7 +1051,7 @@ class GroupPanelArea(ttk.Frame):
         self._pending_panels = [self.panels[gi] for gi, g in enumerate(doc.groups)
                                 if (g.need_confirm or not g.title.strip() or not g.unit.strip()) and gi < len(self.panels)]
         self._pending_pages = [p.src_index for p in doc.pages
-                               if getattr(p, "has_rotation_proposal", False)]
+                               if p.has_rotation_proposal or p.direction_review_required]
         n = len(self._pending_panels) + len(self._pending_pages)
         if n == 0:
             self._pending_cursor = -1
@@ -1076,6 +1078,9 @@ class GroupPanelArea(ttk.Frame):
             self.app.on_page_select(pno, preview=True)
             self.app.thumbs.ensure_visible(pno)
             page = self._doc.pages[pno - 1]
+            if page.direction_review_required:
+                self.app.show_direction_proposals(self._doc)
+                return
             deg = int(page.rotation_proposal) % 360
             self.app.log(f"定位方向建议：第 {pno} 页（建议 {deg}°，请在预览上方“识别方向”中采用或忽略）")
 

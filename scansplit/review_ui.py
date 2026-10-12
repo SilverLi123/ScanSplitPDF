@@ -174,6 +174,7 @@ class ReviewDialog(tk.Toplevel):
         self._waiting = False
         self._wait_job = None
         self._all_boundaries = False
+        self._audit_directions = False
         self.browser_pages = []
         self.browser_number = None
         self._queue_hidden = False
@@ -189,6 +190,8 @@ class ReviewDialog(tk.Toplevel):
         header.grid(row=0, column=0, sticky="ew")
         tools = ttk.Frame(header)
         tools.pack(side="right", padx=(8, 0))
+        self.direction_audit_button = ttk.Button(tools, text="复查自动回正", command=self.audit_directions)
+        self.direction_audit_button.pack(side="left", padx=3)
         self.queue_button = ttk.Button(tools, text="收起列表", command=self.toggle_queue)
         self.queue_button.pack(side="left", padx=3)
         ttk.Button(tools, text="最大化 / 还原", command=self.toggle_maximize).pack(side="left")
@@ -388,6 +391,9 @@ class ReviewDialog(tk.Toplevel):
         if self.mode == "direction":
             self.browser_pages = [self.page()] if self.page() else []
             self.scope.configure(state="disabled")
+        elif self.mode == "direction_audit":
+            self.browser_pages = [p.src_index for p in self.doc.pages if p.is_rotation_automatic]
+            self.scope.configure(state="disabled")
         else:
             self.scope.configure(state="readonly")
             group = self.current_group()
@@ -416,7 +422,8 @@ class ReviewDialog(tk.Toplevel):
         self.page_var.set(str(number))
         self.position.configure(text=f"第 {index+1} / {len(self.browser_pages)} 页 · 原第 {number} 页")
         group = self.current_group()
-        caption = (f"原第 {number} 页 · 待确认方向预览" if self.mode=="direction" else
+        caption = (f"自动回正结果 · 原第 {number} 页" if self.mode=="direction_audit" else
+                   f"原第 {number} 页 · 待确认方向预览" if self.mode=="direction" else
                    f"当前文件草稿 · 原第 {group.start}–{group.end} 页" if group and not self.scope_var.get().startswith("原 PDF") else "原 PDF 全部页面")
         self.browser_page.show(number,caption,self.draft_angle if self.mode=="direction" else None,reset_zoom=False)
         for button,disabled in ((self.first_button,index==0),(self.previous_button,index==0),
@@ -424,6 +431,18 @@ class ReviewDialog(tk.Toplevel):
             button.state(["disabled"] if disabled else ["!disabled"])
         summary,direction,_ = presentation.page_info(self.doc,number)
         self.browse_hint.configure(text=summary.replace("\n"," · ")+" · "+direction,foreground="#49566a")
+        if self.mode == "direction_audit":
+            ps = self.doc.pages[number-1]
+            iid = f"d:{number}"
+            if self.tree.selection() != (iid,):
+                self._selection_key = (self.mode, iid)
+                self.tree.selection_set(iid)
+                self.tree.see(iid)
+            self.question.configure(text=f"原第 {number} 页：自动回正后是否能正常阅读？")
+            self.left_page.show(number, "原件方向（未附加回正）", 0)
+            self.right_page.show(number, "自动建议已应用", ps.effective_rotation)
+            self.context.configure(text=direction+"\n识别依据："+(ps.detected_note or "旧记录未保存依据")+
+                                   "\n这里只复查页面方向，不确认文件交界或名称。")
         if hasattr(self,"view_split_button") and self.view_split_button.winfo_exists():
             retained = [p for p in group.pages if p not in self.doc.excluded_pages] if group else []
             allowed = bool(self.mode=="groups" and group and number in group.pages
@@ -451,7 +470,7 @@ class ReviewDialog(tk.Toplevel):
     def key_browse(self, event, delta):
         if event.widget.winfo_class() in ("Entry","TEntry","TCombobox","Spinbox","TSpinbox","Treeview"):
             return
-        if str(self.notebook.select()) == str(self.browser):
+        if self.mode == "direction_audit" or str(self.notebook.select()) == str(self.browser):
             self.browse(delta)
             return "break"
 
@@ -482,6 +501,8 @@ class ReviewDialog(tk.Toplevel):
             self.browser_page.show(None,"正在更新，完成后继续浏览")
             return
         directions = [p for p in self.doc.pages if p.has_rotation_proposal]
+        automatic = [p for p in self.doc.pages if p.is_rotation_automatic]
+        self.direction_audit_button.state(["!disabled"] if automatic else ["disabled"])
         if directions:
             self.mode = "direction"
             self.heading.configure(text=f"先把页面转正 · 剩余 {len(directions)} 页")
@@ -490,8 +511,21 @@ class ReviewDialog(tk.Toplevel):
                 self.tree.insert("", "end", iid=f"d:{p.src_index}", values=(p.src_index, "方向待确认"))
             self._button("向左转 90°", lambda: self.rotate(-90))
             self._button("向右转 90°", lambda: self.rotate(90))
-            self._button("预览建议方向", self.suggest)
+            self.suggest_button = self._button("预览建议方向", self.suggest)
             self._button("方向正确，确认下一页", self.confirm_direction, True)
+        elif automatic and (self._audit_directions or any(p.direction_review_required for p in automatic)):
+            self.mode = "direction_audit"
+            self.heading.configure(text=f"复查自动回正 · {len(automatic)} 页自动结果")
+            self.detail.configure(text="方向建议已应用。左右键翻页审核，只有错误页需要纠正；可一次确认本批方向。此操作不确认拆分和名称。")
+            for p in automatic:
+                label = "自动保持原方向" if p.effective_rotation == 0 else f"自动回正 {p.effective_rotation}°"
+                if p.direction_review_required:
+                    label += " · 重点复查"
+                self.tree.insert("", "end", iid=f"d:{p.src_index}", values=(p.src_index, label))
+            self._button("当前页向左纠正 90°", lambda:self.correct_audit(-90))
+            self._button("当前页向右纠正 90°", lambda:self.correct_audit(90))
+            self._button("本批方向正确，一次确认", self.confirm_audit, True)
+            self._button("返回拆分检查", self.end_audit)
         elif self.doc.analysis_stale:
             self.mode = "update"
             self.heading.configure(text="方向已确认，需要更新拆分")
@@ -535,7 +569,7 @@ class ReviewDialog(tk.Toplevel):
             self.view_split_button = ttk.Button(self.adjust,text="以正在查看的页另起一份",command=self.split_viewed)
             self.view_split_button.pack(side="left",padx=8)
         self.notebook.tab(self.browser,text="查看待确认方向" if self.mode=="direction" else "浏览整份文件")
-        self.notebook.tab(self.comparison,text="当前与预览方向对照" if self.mode=="direction" else
+        self.notebook.tab(self.comparison,text="原件与自动回正对照" if self.mode=="direction_audit" else "当前与预览方向对照" if self.mode=="direction" else
                           "首页与末页对照" if self.mode=="groups" else "交界两页对照")
         if self.mode == "boundary":
             self.notebook.select(self.comparison)
@@ -574,13 +608,18 @@ class ReviewDialog(tk.Toplevel):
         if not force and getattr(self,"_selection_key",None)==key:
             return
         self._selection_key = key
-        if self.mode == "direction":
+        if self.mode == "direction_audit":
+            pass  # browse_at uses the actual browsed page for both comparison panels.
+        elif self.mode == "direction":
             ps = self.doc.pages[p-1]
+            missing = ps.rotation_proposal_note.startswith("未获得有效方向建议")
+            self.suggest_button.state(["disabled"] if missing else ["!disabled"])
             self.draft_angle = ps.effective_rotation
             self.question.configure(text=f"原第 {p} 页：右侧文字是否已经正向？")
             self.left_page.show(p, "当前方向（已生效）")
             self.right_page.show(p, "待确认预览", self.draft_angle)
-            self.context.configure(text=f"系统建议：{ps.rotation_proposal_note}。建议尚未应用，请按实际页面判断。")
+            self.context.configure(text=ps.rotation_proposal_note+"。请人工判断页面能否正常阅读，当前方向保持不变。" if missing else
+                                   f"系统建议：{ps.rotation_proposal_note}。建议尚未应用，请按实际页面判断。")
         elif self.mode == "boundary":
             self.notebook.select(self.comparison)
             self.left_page.fit_mode = self.right_page.fit_mode = "page"
@@ -619,6 +658,29 @@ class ReviewDialog(tk.Toplevel):
         p = self.page()
         if p and 1 <= p+delta <= self.doc.page_count:
             self.app.locate_page(p+delta, self.doc)
+
+    def audit_directions(self):
+        if not self.app._busy:
+            self._audit_directions = True
+            self.refresh()
+
+    def end_audit(self):
+        self._audit_directions = False
+        self.refresh()
+
+    def correct_audit(self, delta):
+        p = self.browser_number
+        if self.app._busy or self.mode != "direction_audit" or p is None:
+            return
+        self.app.apply_rotation({p:(self.doc.pages[p-1].effective_rotation+delta)%360}, self.doc)
+        self.refresh()
+
+    def confirm_audit(self):
+        if self.app._busy or self.mode != "direction_audit":
+            return
+        mapping = {p.src_index:p.effective_rotation for p in self.doc.pages if p.is_rotation_automatic}
+        self.app.apply_rotation(mapping, self.doc)
+        self.end_audit()
 
     def rotate(self, delta):
         if not self.app._busy and self.mode == "direction":

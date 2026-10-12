@@ -78,7 +78,8 @@ def run_document(monkeypatch,make_scan,kinds,texts):
     source=make_scan('joint.pdf',kinds)
     doc=ScanDocument(source,PdfReader(source))
     # Isolate boundary rules from orientation score changes; real OCR separately accepted.
-    monkeypatch.setattr(pipeline.autoname,'analyze_directions',lambda *a,**kw:[])
+    monkeypatch.setattr(pipeline.autoname,'analyze_directions',lambda d,r,pages,**kw:
+        [pipeline.autoname.DirectionResult(page=p,qualities={},suggested_angle=0,confidence=1) for p in pages])
     def read(renderer,index,engine,width,ps):
         page_text=texts.get(index+1)
         lines=[line('教学设备统计表',cy=80),line('填报单位：教务处',cy=200),line('正文数据',cy=500)]
@@ -148,6 +149,8 @@ def test_suspected_blank_and_direction_pending_never_certify_restart(monkeypatch
     monkeypatch.undo()
     doc,engine=run_document(monkeypatch,make_scan,['text','blank','text'],{1:'第3页',3:'第1页'})
     doc.pages[2].rotation_proposal=90
+    monkeypatch.setattr(pipeline.autoname,'analyze_directions',lambda d,r,pages,**kw:
+        [pipeline.autoname.DirectionResult(page=p,qualities={},suggested_angle=None if p==3 else 0,confidence=1) for p in pages])
     pipeline.analyze_document(doc,engine=engine)
     assert not doc.pages[2].split_before and 3 in doc.pending_boundaries
 

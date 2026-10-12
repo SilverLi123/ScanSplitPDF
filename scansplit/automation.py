@@ -5,6 +5,32 @@ from .ocr import OcrEngine
 from .render import PageRenderer
 
 
+def apply_direction_result(page, result):
+    """Apply an existing OCR suggestion as an absolute extra /Rotate angle.
+
+    User-authorized automatic correction; no new scoring or geometric guesses.
+    A failed/missing result remains unresolved at the current angle.
+    Return whether downstream evidence must be refreshed.
+    """
+    if page.is_rotation_manual:
+        return False
+    before = page.effective_rotation
+    pending = page.has_rotation_proposal
+    angle = result.suggested_angle
+    page.rotation_proposal_confidence = result.confidence
+    page.rotation_proposal_note = result.suggestion_note
+    if angle not in (0, 90, 180, 270) or not math.isfinite(result.confidence) or not 0 <= result.confidence <= 1:
+        page.rotation_proposal = before
+        page.rotation_proposal_note = "未获得有效方向建议：" + (result.suggestion_note or "识别结果无效，请人工检查")
+        return True
+    page.detected_rotation = angle
+    page.detected_confidence = result.confidence
+    page.detected_note = result.suggestion_note
+    page.direction_review_required = result.confidence < .75 and not clearly_upright(result)
+    page.rotation_proposal = None
+    return pending or before != angle
+
+
 def clearly_upright(result):
     """Certify maintaining 0 degrees only after complete geometric comparison.
 
@@ -39,7 +65,7 @@ def name_ready(doc, engine=None, progress=None, cancel=None):
         return []
     ready = {i for i, g in enumerate(doc.groups) if g.boundary_confirmed
              and not doc.pending_for_group(g)
-             and not any(p.has_rotation_proposal for p in doc.pages[g.start-1:g.end])}
+             and not any(p.has_rotation_proposal or p.direction_review_required for p in doc.pages[g.start-1:g.end])}
     if not ready:
         return []
     engine = engine or OcrEngine.get()

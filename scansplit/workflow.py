@@ -22,6 +22,8 @@ def next_step(docs):
         count = sum(p.has_rotation_proposal for p in doc.pages)
         if count:
             return NextStep(2, "review", f"{doc.name}：{count} 页方向需要检查", "在检查窗口把页面转正并确认；结束后系统自动更新拆分。", "检查页面方向", i)
+        if any(p.direction_review_required for p in doc.pages):
+            return NextStep(2, "review", f"{doc.name}：自动回正结果需要复查", "方向建议已应用；翻页审核后可一次确认本批方向，只纠正错误页。", "复查自动回正", i)
         if getattr(doc, "analysis_stale", False):
             return NextStep(2, "reanalyze", "方向已确认，更新拆分结果", "系统会按已确认的方向重新分析，保留你的人工决定。", "更新拆分并继续检查", i)
     for i, doc in enumerate(docs):

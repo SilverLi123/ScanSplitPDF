@@ -1,4 +1,4 @@
-"""Offline analysis: detect -> orientation proposals -> boundaries. No PDF writes."""
+"""Offline analysis: detect -> automatic orientation -> boundaries. No PDF writes."""
 from __future__ import annotations
 
 import re
@@ -43,7 +43,7 @@ def update_boundary_state(doc):
         else:
             # One manual split does not certify every other page in the new ranges.
             g.boundary_confirmed = all(p in doc.manual_boundaries for p in g.pages)
-        if any(p.has_rotation_proposal for p in doc.pages[g.start - 1:g.end]):
+        if any(p.has_rotation_proposal or p.direction_review_required for p in doc.pages[g.start - 1:g.end]):
             g.boundary_confirmed = False
 
 
@@ -82,7 +82,7 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None, 
                 if ps.src_index in content and not ps.is_rotation_manual:
                     ps.rotation_proposal = 0
                     ps.rotation_proposal_confidence = 0
-                    ps.rotation_proposal_note = '本地 OCR 不可用，请检查并确认当前方向'
+                    ps.rotation_proposal_note = '未获得有效方向建议：本地 OCR 不可用，请检查并确认当前方向'
             grouping.auto_group(doc)
             for g in doc.groups:
                 g.boundary_confirmed = False
@@ -95,13 +95,21 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None, 
             progress_cb=lambda i,n: progress(i,n,'检查方向'), cancel_cb=cancel, fast=True)
         if cancel():
             return
-        for r in directions:
-            ps = doc.pages[r.page-1]
-            upright = ps.effective_rotation == 0 and automation.clearly_upright(r)
-            ps.rotation_proposal = (None if r.suggested_angle == 0 and (r.confidence >= .75 or upright)
-                                    else (r.suggested_angle or 0))
-            ps.rotation_proposal_confidence = r.confidence
-            ps.rotation_proposal_note = ("规则检查通过：四方向比对表明当前正放，无需旋转" if upright else r.suggestion_note)
+        by_page = {r.page:r for r in directions}
+        for p in content:
+            ps = doc.pages[p-1]
+            if ps.is_rotation_manual:
+                continue
+            r = by_page.get(p) or autoname.DirectionResult(
+                page=p, qualities={}, suggestion_note="未得到方向分析结果，请人工检查")
+            changed = automation.apply_direction_result(ps, r)
+            if changed:
+                for g in doc.groups:
+                    if g.start <= p <= g.end:
+                        if not g.title_manual:
+                            g.title_confirmed = False
+                        if not g.unit_manual:
+                            g.unit_confirmed = False
         cache, features = {}, {}
         for done, p in enumerate(content, 1):
             if cancel():

@@ -23,7 +23,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import autoname, blankdetect, exporter, grouping, loader, naming, rotation, settings, splitctx, pipeline, workflow, presentation
+from . import autoname, blankdetect, exporter, grouping, loader, naming, rotation, settings, splitctx, pipeline, workflow, presentation, automation
 from .review_ui import ReviewDialog
 from .loader import LoadError
 from .model import ScanDocument, Workspace
@@ -424,7 +424,7 @@ class App:
             n_conf = sum(1 for d in docs for g in d.groups if g.need_confirm)
         docs = self.ws.documents
         boundaries_ready = bool(docs) and all(d.groups and not d.pending_boundaries
-            and not d.analysis_stale and not any(p.has_rotation_proposal for p in d.pages)
+            and not d.analysis_stale and not any(p.has_rotation_proposal or p.direction_review_required for p in d.pages)
             and all(g.boundary_confirmed for g in d.groups) for d in docs)
         readiness = {
             "open": True,
@@ -453,7 +453,9 @@ class App:
         step = workflow.next_step(docs)
         self.hint_var.set("下一步：" + step.button + ("（自动拆分草稿）" if step.action=="analyze" else ""))
         self.workflow_title.set("正在处理，请稍候…" if self._busy else step.title)
-        self.workflow_detail.set("可在进度窗口取消。完成后会继续提示下一步。" if self._busy else step.detail)
+        auto = sum(p.is_rotation_automatic and p.effective_rotation != 0 for d in docs for p in d.pages)
+        self.workflow_detail.set("可在进度窗口取消。完成后会继续提示下一步。" if self._busy else
+                                 step.detail + (f" 已按建议自动回正 {auto} 页，可在检查窗口集中复查。" if auto else ""))
         self.next_button.configure(text=step.button)
         self.next_button.state(["disabled"] if self._busy else ["!disabled"])
         if self._busy:
@@ -942,7 +944,7 @@ class App:
                 elif step.action in ("review", "reanalyze"):
                     self.review_pending()
             else:
-                self.log("拆分草稿已更新。点击顶部主要操作，继续检查方向和拆分。")
+                self.log("拆分草稿已更新。方向建议已自动应用；可集中复查回正结果，继续检查拆分。")
         self._start_task("automatic", work, on_done, title="自动拆分")
 
     def review_pending(self, doc=None):
@@ -1016,7 +1018,7 @@ class App:
         if doc.pending_for_group(g):
             self.review_pending()
             return
-        if any(p.has_rotation_proposal for p in doc.pages[g.start-1:g.end]):
+        if any(p.has_rotation_proposal or p.direction_review_required for p in doc.pages[g.start-1:g.end]):
             self.show_direction_proposals(doc)
             return
         self._push_undo()
@@ -1327,74 +1329,37 @@ class App:
             if canceled:
                 self.log("方向分析已取消。")
                 return
-            # v1.9.1 P0-A：自动检测只写"待确认建议"（rotation_proposal），
-            # **绝不**直接写 detected_rotation——后者会立即改变 effective_rotation，
-            # 使建议在用户确认前就影响预览 / OCR / 导出。人工已确认的方向也不覆盖。
-            for r in results:
-                if r.page < 1 or r.page > doc.page_count:
-                    continue
-                ps = doc.pages[r.page - 1]
-                if ps.is_rotation_manual:
-                    ps.rotation_proposal = None  # 人工已定，撤销待确认建议
-                    continue
-                if r.suggested_angle not in (None, 0):
-                    ps.rotation_proposal = int(r.suggested_angle) % 360
-                    ps.rotation_proposal_confidence = float(r.confidence)
-                    ps.rotation_proposal_note = r.suggestion_note or ""
-                else:
-                    ps.rotation_proposal = None if r.suggested_angle == 0 and r.confidence >= .75 else 0
-                    ps.rotation_proposal_confidence = r.confidence
-                    ps.rotation_proposal_note = r.suggestion_note
             self._direction_show_results(doc, candidates, sugg, results=results, scope=scope)
 
         if not self._start_task("direction", work, on_done, title="识别方向（本地 OCR 方向对比）"):
             return
 
     def _direction_show_results(self, doc, candidates, sugg, results, scope: str = ""):
-        ocr_pages: list[int] = [
-            r.page for r in results
-            if r.suggested_angle not in (None, 0)
-        ]
-        # OCR 判定内容侧放的页面：**明确询问**是否一键摆正。
-        # v1.9.1 P0-A：建议已只写 rotation_proposal（不影响 effective_rotation），
-        # 只有用户在此点"是"才写入人工方向；点"否"则方向保持不变（零副作用），
-        # 仍可在随后的方向对话框逐页选择。
-        if ocr_pages:
-            by_page = {r.page: r for r in results}
-            desc = "、".join(
-                f"第 {p} 页→{by_page[p].suggested_angle}°" for p in ocr_pages
-            )
-            if messagebox.askyesno(
-                "采用方向建议？",
-                f"检测到 {len(ocr_pages)} 页内容侧放（横版表格竖着扫描等）：\n"
-                f"{desc}\n\n"
-                "【是】按建议摆正这些页面（可 Ctrl+Z 撤销）；\n"
-                "【否】不采用建议，方向保持不变，可在随后对话框中逐页选择。\n\n"
-                "（仅写入页面旋转属性，不重绘内容）",
-            ):
-                self.apply_rotation(
-                    {p: int(by_page[p].suggested_angle) % 360 for p in ocr_pages},
-                    doc=doc,
-                )
-                self.log(f"已采用方向建议并摆正 {len(ocr_pages)} 页：{desc}")
-                ocr_pages = []
-            else:
-                self.log(f"未采用方向建议（{len(ocr_pages)} 页方向保持不变）。")
-        pages = sorted(set(sugg) | set(ocr_pages) |
-                       {p for p in candidates if doc.pages[p-1].has_rotation_proposal})
-        if not pages:
-            if results and all(r.suggested_angle is None for r in results):
-                messagebox.showwarning(
-                    "识别方向",
-                    f"方向分析未得到结果：{results[0].suggestion_note or '未知原因'}\n"
-                    "请按页面内容人工判断。",
-                )
-            elif results:
-                self.log("方向分析完成：未发现需要旋转的页面。")
-            else:
-                self.log("未发现几何方向差异的页面。")
+        if results:
+            self._push_undo()
+            changed = False
+            for result in results:
+                if 1 <= result.page <= doc.page_count:
+                    changed |= automation.apply_direction_result(doc.pages[result.page-1], result)
+            if changed and doc.analysis_complete:
+                doc.analysis_stale = True
+                for g in doc.groups:
+                    g.boundary_confirmed = False
+                    if not g.title_manual:
+                        g.title_confirmed = False
+                    if not g.unit_manual:
+                        g.unit_confirmed = False
+            self._refresh_all()
+            self.review_pending(doc)
+            if not any(p.has_rotation_proposal for p in doc.pages):
+                self._review_dialog.audit_directions()
             return
-        DirectionDialog(self.root, self, doc, pages, results, sugg, scope=scope)
+        # Page dimensions alone cannot choose a direction: keep manual review.
+        pages = sorted(set(sugg) | {p for p in candidates if doc.pages[p-1].has_rotation_proposal})
+        if pages:
+            DirectionDialog(self.root, self, doc, pages, results, sugg, scope=scope)
+        else:
+            self.log("未获得可应用的 OCR 方向建议，请按页面内容核对。")
 
     def apply_rotation(self, mapping: dict[int, int], doc=None):
         """应用人工确认的方向（写入 user_override_rotation）。
@@ -1409,9 +1374,10 @@ class App:
         for p, angle in mapping.items():
             if 1 <= p <= doc.page_count:
                 ps = doc.pages[p - 1]
+                needs_update = ps.has_rotation_proposal or ps.effective_rotation != int(angle) % 360
                 ps.rotation = int(angle) % 360
                 ps.rotation_proposal = None  # 建议已被采纳，清除暂存
-                if doc.analysis_complete:
+                if needs_update and doc.analysis_complete:
                     doc.analysis_stale = True
                     doc.pending_boundaries[p] = "方向已变化，请重新自动拆分以更新页面证据"
                     for g in doc.groups:
