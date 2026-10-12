@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from . import autoname, blankdetect, grouping, ocrfields, pagenum, splitctx
+from . import autoname, blankdetect, grouping, ocrfields, pagenum, splitctx, jointsplit
 from .ocr import OcrEngine
 from .render import PageRenderer
 
@@ -61,6 +61,9 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None):
             return
         for ps, result in zip(doc.pages, results):
             ps.blank = result
+            if ps.src_index not in doc.manual_boundaries:
+                ps.split_before = False
+        doc.boundary_evidence = {}
         content = [ps.src_index for ps in doc.pages if ps.blank.verdict != 'blank']
         if not engine.available:
             doc.pending_boundaries = {p.src_index: '本地 OCR 不可用，请人工核对该页方向与文档归属'
@@ -100,6 +103,7 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None):
             cache[p] = (lines, w, h)
             features[p] = dict(structure=ocrfields.first_page_structure(lines,w,h),
                 number=pagenum.extract_page_number(lines,h),
+                pagination=pagenum.pagination_evidence(lines,w,h),
                 units={c.text for c in ocrfields.extract_reporting_unit(lines,w,h)})
             progress(done, len(content), '分析文档边界')
         evs = splitctx.judge_blank_context(doc, renderer, engine, page_cache=cache, cancel_cb=cancel)
@@ -127,6 +131,24 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None):
                 doc.pending_boundaries[p] = '相邻页方向待确认，确认后重新自动拆分'
                 continue
             decision, reason = boundary_decision(features[prev], features[p])
+            blank_pages = list(range(prev+1,p))
+            numbered = jointsplit.decide(features[prev], features[p], blank_pages)
+            if numbered is not None:
+                decision, reason = numbered
+            elif decision == 'split':
+                decision, reason = 'review', '首页与数字变化提示新文件，但印刷页码证据不足，请确认'
+            if blank_pages:
+                # Context classification is separate from exclusion. Auto split retains
+                # the entire blank run at the end of the preceding document.
+                for bp in blank_pages:
+                    ps = doc.pages[bp-1]
+                    ps.blank_context = "internal_blank" if decision == "keep" else "uncertain"
+                    if bp not in doc.manual_separator_pages:
+                        ps.separator = False
+                doc.pending_boundaries.pop(p, None)
+            doc.boundary_evidence[p] = dict(previous_page=prev, next_page=p,
+                blank_pages=blank_pages, previous_pagination=features[prev]['pagination'].to_dict(),
+                next_pagination=features[p]['pagination'].to_dict(), decision=decision, reason=reason)
             doc.pages[p-1].split_before = decision == 'split'
             if decision == 'review':
                 doc.pending_boundaries[p] = reason

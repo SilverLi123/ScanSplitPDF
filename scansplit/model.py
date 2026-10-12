@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Optional
 
@@ -261,6 +262,7 @@ class ScanDocument:
         self.manual_separator_pages: set[int] = set()
         self.manual_boundaries: dict[int, bool] = {}
         self.pending_boundaries: dict[int, str] = {}
+        self.boundary_evidence: dict[int, dict] = {}
         self.analysis_complete = False
         self.analysis_stale = False
         self.naming_attempted = False
@@ -294,6 +296,7 @@ class ScanDocument:
             "affected_group_indices": sorted(self.affected_group_indices),
             "manual_boundaries": dict(self.manual_boundaries),
             "pending_boundaries": dict(self.pending_boundaries),
+            "boundary_evidence": deepcopy(self.boundary_evidence),
             "analysis_complete": self.analysis_complete,
             "analysis_stale": self.analysis_stale,
             "naming_attempted": self.naming_attempted,
@@ -308,6 +311,7 @@ class ScanDocument:
         self.affected_group_indices = list(d.get("affected_group_indices", []) or [])
         self.manual_boundaries = {int(k): bool(v) for k, v in d.get("manual_boundaries", {}).items()}
         self.pending_boundaries = {int(k): str(v) for k, v in d.get("pending_boundaries", {}).items()}
+        self.boundary_evidence = {int(k): deepcopy(v) for k, v in d.get("boundary_evidence", {}).items()}
         self.analysis_complete = bool(d.get("analysis_complete", False))
         self.analysis_stale = bool(d.get("analysis_stale", False))
         self.naming_attempted = bool(d.get("naming_attempted", False))

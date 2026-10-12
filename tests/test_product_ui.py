@@ -219,6 +219,29 @@ def test_page_summary_keeps_original_direction_separate_from_proposal(ui_env,mak
     assert p.effective_rotation==0
 
 
+def test_review_shows_saved_pagination_evidence_without_confirming(ui_env,make_scan):
+    from scansplit.ui import App,ReviewDialog
+    root=_make_root()
+    app=App(root)
+    try:
+        app.import_files([str(make_scan("numbered.pdf",["text"]*3))])
+        d=app._active_doc()
+        d.analysis_complete=True
+        d.groups=[Group(1,2),Group(3,3)]
+        d.pages[2].split_before=True
+        reason="无空白间隔；两侧印刷页码 2 → 1；可靠页码重新从1开始，从后页拆分"
+        d.boundary_evidence={3:dict(reason=reason,decision="split")}
+        before=d.snapshot()
+        dialog=ReviewDialog(root,app,d)
+        dialog.all_boundaries()
+        assert dialog.page()==3 and reason in dialog.context.cget("text")
+        assert reason in presentation.page_info(d,3)[2]
+        assert d.snapshot()==before and not d.manual_boundaries
+        dialog.close()
+    finally:
+        app.on_close()
+
+
 def test_cancelled_export_and_empty_hash_sets_cannot_show_passed(ui_env,make_scan):
     d=open_pdf(make_scan("cancel.pdf",["text"]))
     d.groups=[Group(1,1,"标题","单位")]

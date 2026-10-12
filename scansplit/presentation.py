@@ -121,6 +121,8 @@ def page_info(doc, number):
         boundary="该页是否另起一份，需要确认："+doc.pending_boundaries[number]
     elif p.split_before:
         boundary="人工确认新文件起点" if doc.manual_boundaries.get(number) is True else "规则自动建立的新文件起点"
+        if number not in doc.manual_boundaries and number in doc.boundary_evidence:
+            boundary += "："+doc.boundary_evidence[number]["reason"]
     if number+1 in doc.pending_boundaries:
         boundary+=("\n" if boundary else "")+"下一页可能开始新文件，需要确认。"
     return f"{belongs} · 原第 {number} 页\n{page_type}",rotation,boundary

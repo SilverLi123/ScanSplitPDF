@@ -280,7 +280,7 @@ class ReviewDialog(tk.Toplevel):
             self.blank_button.state(["!disabled"] if blank else ["disabled"])
             self.split_button.state(["!disabled"] if p > 1 else ["disabled"])
             note = f"中间第 {prev+1}–{p-1} 页为空白候选，当前仍保留。" if prev < p-1 else "页面默认保留。"
-            reason=self.doc.pending_boundaries.get(p) or ("这是人工决定的交界，可对照原页再次核对。" if p in self.doc.manual_boundaries else "这是规则自动建立的交界。未保存详细分析依据，请直接对照原页核对。")
+            reason=self.doc.pending_boundaries.get(p) or ("这是人工决定的交界，可对照原页再次核对。" if p in self.doc.manual_boundaries else self.doc.boundary_evidence.get(p,{}).get("reason") or "这是规则自动建立的交界。未保存详细分析依据，请直接对照原页核对。")
             status="规则分析建议 · 需要确认" if p in self.doc.pending_boundaries else "人工决定" if p in self.doc.manual_boundaries else "规则自动结果"
             self.context.configure(text=f"{status}\n判断依据：{reason}\n{note}")
         elif self.mode == "groups":

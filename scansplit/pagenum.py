@@ -4,9 +4,10 @@
 （页脚区域优先，兼容页眉页码），页码出现"重置"（小于前一有页码页）时
 给出"新文档起点"候选信号。
 
-该信号只作拆分建议之一，必须与标题特征双重验证
-（见 autoname.smart_split_review）：双信号一致才自动补拆，
-单信号仅提示人工确认——绝不凭单一信号自动改动分组。
+旧 extract_page_number/reset_points 接口供历史补拆建议使用。
+统一自动分析使用 pagination_evidence：严格检查区域、格式、识别分数及
+候选冲突，交给 jointsplit 比较相邻内容页；可靠重启无需空白或标题变化，
+续表、附件和总页数等矛盾证据仍必须人工确认。
 
 页码行用整行模式匹配（纯数字 / 第X页 / X/Y / —X— / Page X），
 避免把落款日期"2026年10月9日"里的数字误当页码。
@@ -16,6 +17,65 @@ OCR 只读渲染图像，识别内容绝不写回 PDF。
 from __future__ import annotations
 
 import re
+import unicodedata
+from dataclasses import dataclass, asdict
+
+
+@dataclass(frozen=True)
+class PaginationEvidence:
+    number: int | None = None
+    total: int | None = None
+    reliable: bool = False
+    text: str = ""
+    reason: str = "未找到可靠印刷页码"
+
+    def to_dict(self):
+        return asdict(self)
+
+
+def pagination_evidence(lines, page_w: float, page_h: float) -> PaginationEvidence:
+    """Strict evidence for automatic pagination splits; legacy API unchanged.
+
+    Explicit labels in margins qualify. Bare numbers additionally need an extreme,
+    centred margin position. Conflicting candidates are never resolved by guessing.
+    OCR scores are evidence thresholds, not calibrated correctness probabilities.
+    """
+    found = []
+    for line in lines:
+        cy = (line.y0 + line.y1) / 2
+        if not (cy <= page_h * .15 or cy >= page_h * .85):
+            continue
+        text = unicodedata.normalize("NFKC", line.text).strip()
+        explicit = re.fullmatch(r"第\s*(\d{1,4})\s*页(?:\s*[,，]?\s*共\s*(\d{1,4})\s*页)?", text)
+        if explicit is None:
+            explicit = re.fullmatch(r"page\s*(\d{1,4})(?:\s*(?:of|/)\s*(\d{1,4}))?", text, re.I)
+        match = explicit or re.fullmatch(r"(\d{1,4})\s*/\s*(\d{1,4})", text)
+        if match:
+            number = int(match.group(1))
+            total = int(match.group(2)) if match.group(2) else None
+        else:
+            number, total = _match_page_number(text), None
+        if number is None:
+            continue
+        if number < 1 or (total is not None and not number <= total <= _MAX_PAGENO):
+            found.append(PaginationEvidence(text=text, reason="页码或总页数格式不合理"))
+            continue
+        score = float(getattr(line, "score", 0) or 0)
+        centred = (hasattr(line, "x0") and hasattr(line, "x1") and page_w > 0
+                   and abs((line.x0 + line.x1)/2 - page_w/2) <= page_w * .18)
+        extreme = cy <= page_h * .06 or cy >= page_h * .94
+        reliable = score >= .85 if explicit else score >= .90 and centred and extreme and not 1900 <= number <= 2099
+        found.append(PaginationEvidence(number, total, reliable, text,
+            "明确页码标签" if explicit and reliable else "页边居中印刷页码" if reliable else "数字位置或识别证据不足"))
+    if not found:
+        return PaginationEvidence()
+    if len({(c.number, c.total) for c in found}) != 1:
+        return PaginationEvidence(text="；".join(c.text for c in found), reason="页眉页脚存在不同页码候选")
+    # Every matching line must qualify; duplicate OCR lines do not add certainty.
+    best = found[0]
+    if not all(c.reliable for c in found):
+        return PaginationEvidence(best.number, best.total, False, best.text, "页码识别证据不足或重复候选不一致")
+    return best
 
 # 整行匹配的页码文本模式（按优先级排列）
 _PATTERNS = [
