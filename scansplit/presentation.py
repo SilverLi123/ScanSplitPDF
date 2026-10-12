@@ -114,6 +114,8 @@ def page_info(doc, number):
     rotation=(f"原件方向 {p.original_rotation}°；" if p.original_rotation else "")
     rotation += (f"人工调整 {p.effective_rotation}°（已生效）" if p.is_rotation_manual else
                  f"自动检测调整 {p.effective_rotation}°（已生效）" if p.effective_rotation else "保持原件方向")
+    if not p.is_rotation_manual and not p.has_rotation_proposal and p.rotation_proposal_note.startswith("规则检查通过"):
+        rotation += "（四方向规则检查通过）"
     if p.has_rotation_proposal:
         rotation+=f"；建议调整 {p.rotation_proposal}°（未应用）"
     boundary = ""

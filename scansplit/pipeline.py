@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from . import autoname, blankdetect, grouping, ocrfields, pagenum, splitctx, jointsplit
+from . import autoname, blankdetect, grouping, ocrfields, pagenum, splitctx, jointsplit, pagination_read, automation
 from .ocr import OcrEngine
 from .render import PageRenderer
 
@@ -87,10 +87,11 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None):
             return
         for r in directions:
             ps = doc.pages[r.page-1]
-            ps.rotation_proposal = (None if r.suggested_angle == 0 and r.confidence >= .75
+            upright = ps.effective_rotation == 0 and automation.clearly_upright(r)
+            ps.rotation_proposal = (None if r.suggested_angle == 0 and (r.confidence >= .75 or upright)
                                     else (r.suggested_angle or 0))
             ps.rotation_proposal_confidence = r.confidence
-            ps.rotation_proposal_note = r.suggestion_note
+            ps.rotation_proposal_note = ("规则检查通过：四方向比对表明当前正放，无需旋转" if upright else r.suggestion_note)
         cache, features = {}, {}
         for done, p in enumerate(content, 1):
             if cancel():
@@ -101,9 +102,11 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None):
                 continue
             lines, w, h, _ = autoname._ocr_page_rotation_aware(renderer, p-1, engine, 1200, ps)
             cache[p] = (lines, w, h)
+            evidence = pagination_read.refine(renderer,p-1,engine,ps.effective_rotation,
+                pagenum.pagination_evidence(lines,w,h),cancel)
             features[p] = dict(structure=ocrfields.first_page_structure(lines,w,h),
                 number=pagenum.extract_page_number(lines,h),
-                pagination=pagenum.pagination_evidence(lines,w,h),
+                pagination=evidence,
                 units={c.text for c in ocrfields.extract_reporting_unit(lines,w,h)})
             progress(done, len(content), '分析文档边界')
         evs = splitctx.judge_blank_context(doc, renderer, engine, page_cache=cache, cancel_cb=cancel)
@@ -137,6 +140,8 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None):
                 decision, reason = numbered
             elif decision == 'split':
                 decision, reason = 'review', '首页与数字变化提示新文件，但印刷页码证据不足，请确认'
+            decision, reason, sequence = jointsplit.check_sequence(features, content, i,
+                doc.manual_boundaries, doc.separators, decision, reason)
             if blank_pages:
                 # Context classification is separate from exclusion. Auto split retains
                 # the entire blank run at the end of the preceding document.
@@ -148,7 +153,7 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None):
                 doc.pending_boundaries.pop(p, None)
             doc.boundary_evidence[p] = dict(previous_page=prev, next_page=p,
                 blank_pages=blank_pages, previous_pagination=features[prev]['pagination'].to_dict(),
-                next_pagination=features[p]['pagination'].to_dict(), decision=decision, reason=reason)
+                next_pagination=features[p]['pagination'].to_dict(), sequence=sequence,decision=decision, reason=reason)
             doc.pages[p-1].split_before = decision == 'split'
             if decision == 'review':
                 doc.pending_boundaries[p] = reason
@@ -165,3 +170,21 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None):
         doc.status = 'grouped'
     finally:
         renderer.close()
+
+
+def organize_document(doc, params=None, engine=None, progress=None, cancel=None):
+    """One worker transaction: analysis, then naming where boundaries are reliable."""
+    engine = engine or OcrEngine.get()
+    cancel = cancel or (lambda: False)
+    snapshot = doc.snapshot()
+    try:
+        analyze_document(doc, params, engine, progress, cancel)
+        if not cancel():
+            automation.name_ready(doc, engine, progress, cancel)
+        if cancel():
+            doc.restore(snapshot)
+            return False
+        return True
+    except Exception:
+        doc.restore(snapshot)
+        raise

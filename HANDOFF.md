@@ -1,6 +1,20 @@
 # ScanSplit PDF — 项目交接文档（给接手的 Agent）
 
-## 当前维护入口：v1.13
+## 当前维护入口：v1.14
+
+当前版本1.14.0，分支 `codex/reliable-scansplit`，基线 `8b57298`（321项）。当前说明/验收：`work/v114-user-guide.md`、`work/v114-delivery-report.md`、`TEST_REPORT.md`。
+
+- `pipeline.organize_document` 是 UI 自动分析入口：分析后仅命名可靠分组；单文档事务在取消/异常时完整回滚。既有 `analyze_document` 仍为仅分析接口。
+- `automation.clearly_upright` 只认可保持当前0°且四方向证据完整：足够横排实质文字，反向弱、侧向没有竞争。少文字的旧综合分数不是唯一依据；非零旋转从不自动应用，人工方向优先。
+- `pagination_read.refine` 对不可靠页码做2400px页边区域OCR，几何映射回整页后使用原严格阈值；整页与区域冲突、页眉页脚冲突不能选一个。缓存模式/原件签名/角度/宽度分离，空结果不缓存以免掩盖临时故障。
+- `jointsplit.check_sequence` 只用邻页矛盾否决拆分，不推测未知页码。裸数字重启需前后连续序列；明确Page/第N页仍可独立判断。人工起点和确认排除的分隔页隔断序列。
+- `automation.name_ready` 跳过方向/边界/过期分析与实际pending范围；部分组命名不标全局naming_attempted。使用现有 reporting/preserve_confirmed 命名规则，人工编辑优先。
+- 清晰自动分析直接定位名称卡片；最后一个待确认交界解决后只继续一次，不在导航/跳过时运行识别。自动正放在预览标注“规则检查通过”，不冒称人工确认。
+- `tools.acceptance_automation.py` 读取v1.13保存的同一批PDF与基线记录做真实OCR比较；三个清晰场景方向/拆分/名称全自动，最后名称批准明确模拟人工。低分中文与侧放/倒置必须维持待确认；历史11页样本仅只读诊断，没有业务准确率gold。
+- OCR引擎/模型、命名/字段算法、旧检测/上下文、方向算法、导出与保真算法无变更。新策略和编排不改变原件字节。
+- 独立运行目录 `D:/ScanSplitPDF-Reliable-1.14.0` 与同名ZIP，旧包保留；真实业务准确率、几百页体验、干净第二台Windows及项目保存/恢复仍未完整验收。
+
+## 历史维护入口：v1.13
 
 当前版本 1.13.0，分支 `codex/reliable-scansplit`，基线 `1eb3a1e`（v1.12.0，275 项通过）。最新操作与证据以 `work/v113-user-guide.md`、`work/v113-delivery-report.md` 和 `TEST_REPORT.md` 为准。
 

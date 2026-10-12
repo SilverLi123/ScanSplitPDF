@@ -340,10 +340,14 @@ class ReviewDialog(tk.Toplevel):
     def resolve(self, split):
         p = self.page()
         if p and self.mode == "boundary" and not self.app._busy:
+            was_pending = bool(self.doc.pending_boundaries)
             children=list(self.tree.get_children())
             next_i=children[(children.index(str(p))+1)%len(children)] if children else None
             self.app.resolve_boundary(p, split, self.doc)
             self.refresh()
+            if was_pending and not self.doc.pending_boundaries:
+                self.reanalyze()  # One continuation after the last unresolved boundary.
+                return
             if self._all_boundaries and next_i and self.tree.exists(next_i):
                 self.tree.selection_set(next_i)
                 self.selected()

@@ -919,7 +919,7 @@ class App:
             for doc in docs:
                 if cancel():
                     break
-                pipeline.analyze_document(doc, self.detect_params, engine, progress, cancel)
+                pipeline.organize_document(doc, self.detect_params, engine, progress, cancel)
                 log(f"{doc.name}：{len(doc.groups)} 份，{len(doc.pending_boundaries)} 处边界待确认")
 
         def on_done(result, canceled, error):
@@ -936,7 +936,10 @@ class App:
             elif guided:
                 step = workflow.next_step(self.ws.documents)
                 self.activate_document(step.doc_index)
-                self.review_pending()
+                if step.action == "names":
+                    self.focus_next_name()
+                elif step.action in ("review", "reanalyze"):
+                    self.review_pending()
             else:
                 self.log("拆分草稿已更新。点击顶部主要操作，继续检查方向和拆分。")
         self._start_task("automatic", work, on_done, title="自动拆分")

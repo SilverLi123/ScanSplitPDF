@@ -219,6 +219,14 @@ def test_page_summary_keeps_original_direction_separate_from_proposal(ui_env,mak
     assert p.effective_rotation==0
 
 
+def test_upright_rule_check_is_shown_without_claiming_human_confirmation(ui_env,make_scan):
+    d=open_pdf(make_scan('upright-summary.pdf',['text']))
+    d.pages[0].rotation_proposal_note='规则检查通过：四方向比对表明当前正放，无需旋转'
+    _,direction,_=presentation.page_info(d,1)
+    assert '四方向规则检查通过' in direction and '人工' not in direction
+    assert d.pages[0].user_override_rotation is None
+
+
 def test_review_shows_saved_pagination_evidence_without_confirming(ui_env,make_scan):
     from scansplit.ui import App,ReviewDialog
     root=_make_root()
@@ -238,6 +246,55 @@ def test_review_shows_saved_pagination_evidence_without_confirming(ui_env,make_s
         assert reason in presentation.page_info(d,3)[2]
         assert d.snapshot()==before and not d.manual_boundaries
         dialog.close()
+    finally:
+        app.on_close()
+
+
+def test_last_boundary_confirmation_automatically_continues_naming(ui_env,make_scan,monkeypatch):
+    from scansplit.ui import App,ReviewDialog
+    root=_make_root()
+    app=App(root)
+    try:
+        app.import_files([str(make_scan("continue.pdf",["text"]*2))])
+        d=app._active_doc()
+        d.analysis_complete=True
+        d.pending_boundaries={2:'待确认'}
+        calls=[]
+        def organize(document,*args):
+            calls.append(document)
+            document.groups[0].title='自动填写的标题'
+            document.naming_attempted=True
+        monkeypatch.setattr(ui_env.pipeline,'organize_document',organize)
+        dialog=ReviewDialog(root,app,d)
+        assert dialog.page()==2
+        dialog.resolve(False)
+        pump_until_idle(app)
+        assert calls==[d] and d.manual_boundaries=={2:False} and not d.pending_boundaries
+        assert d.groups[0].title=='自动填写的标题' and not d.groups[0].title_manual
+        dialog.close()
+    finally:
+        app.on_close()
+
+
+def test_guided_automatic_analysis_opens_names_when_splitting_is_ready(ui_env,make_scan,monkeypatch):
+    from scansplit.ui import App
+    root=_make_root()
+    app=App(root)
+    try:
+        app.import_files([str(make_scan("automatic.pdf",["text"]))])
+        def organize(document,*args):
+            document.analysis_complete=document.naming_attempted=True
+            document.groups[0].boundary_confirmed=True
+            document.groups[0].title='自动标题'
+            document.groups[0].unit='自动单位'
+            document.groups[0].unit_confirmed=False
+        monkeypatch.setattr(ui_env.pipeline,'organize_document',organize)
+        opened=[]
+        monkeypatch.setattr(app,'focus_next_name',lambda:opened.append('names'))
+        monkeypatch.setattr(app,'review_pending',lambda:opened.append('review'))
+        app.automatic_split(guided=True)
+        pump_until_idle(app)
+        assert opened==['names']
     finally:
         app.on_close()
 

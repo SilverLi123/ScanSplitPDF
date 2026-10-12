@@ -242,24 +242,12 @@ def test_guided_primary_action_through_real_ocr_and_lossless_export(ui_env, tmp_
         pump_until_idle(app)
         d = app._active_doc()
         dialog = app._review_dialog
-        assert dialog and d.analysis_complete
-        # Explicitly simulated human checks: the generated source is upright,
-        # contains one document, and has this title/reporting-unit ground truth.
-        for _ in range(3):
-            if dialog.mode != "direction":
-                break
-            dialog.draft_angle = 0
-            dialog.confirm_direction()
-            pump_until_idle(app)
-            dialog.refresh()
-        while d.pending_boundaries:
-            dialog.resolve(False)
-        if not d.groups[0].boundary_confirmed:
-            dialog.confirm_group()
-        assert dialog.mode == "groups"
-        dialog.finish()
-        pump_until_idle(app)
-        assert d.naming_attempted
+        # This clear upright one-document source now reaches name cards directly.
+        # No simulated human direction/boundary decisions may hide an auto failure.
+        assert dialog is None and d.analysis_complete and d.naming_attempted
+        assert d.groups[0].boundary_confirmed and not d.pending_boundaries
+        assert not d.manual_boundaries and all(not p.is_rotation_manual for p in d.pages)
+        assert all(not p.has_rotation_proposal and p.effective_rotation==0 for p in d.pages)
         assert d.groups[0].title == "教学设备统计表"
         assert d.groups[0].unit == "教务处"
         app.groups.panels[0]._confirm_name()
