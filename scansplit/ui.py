@@ -23,7 +23,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import autoname, blankdetect, exporter, grouping, loader, naming, rotation, settings, splitctx, pipeline, workflow
+from . import autoname, blankdetect, exporter, grouping, loader, naming, rotation, settings, splitctx, pipeline, workflow, presentation
 from .review_ui import ReviewDialog
 from .loader import LoadError
 from .model import ScanDocument, Workspace
@@ -32,6 +32,7 @@ from .render import PageRenderer, RenderError
 from .tasks import TaskManager
 from .ui_widgets import (
     ExportSummaryDialog,
+    CheckCenter,
     GroupPanelArea,
     LogPanel,
     PreviewPane,
@@ -60,12 +61,17 @@ class App:
         self._busy = False
         self._review_dialog = None
         self._log_visible = False
+        self._precheck = None
+        self._last_export = None
+        self._preview_errors = {}
+        self._operation_notice = None
         # v1.9 后台任务：单工作线程 + Queue/root.after 回传（UI 不冻结）
         self.tasks = TaskManager(root, self.log)
         self.tasks.progress_hook = self._on_task_progress
         self._prog = None
 
         self._build_ui()
+        self.template_var.trace_add("write", self._on_template_change)
         try:
             self.preview.zoom = min(
                 max(float(self.settings.get("zoom", 1.0)), PreviewPane.MIN_ZOOM),
@@ -90,10 +96,13 @@ class App:
         steps = ttk.Frame(root, padding=(8, 4))
         steps.pack(fill="x")
         self.step_labels = []
-        for text in ("1  导入", "2  自动拆分", "3  检查拆分", "4  检查名称", "5  导出"):
+        self.step_names = ("导入", "自动分析", "检查拆分", "确认名称", "导出")
+        for i,text in enumerate(self.step_names):
             label = ttk.Label(steps, text=text, style="Step.TLabel")
-            label.pack(side="left", expand=True, fill="x")
+            label.grid(row=0,column=i,sticky="ew")
+            steps.columnconfigure(i,weight=1,uniform="steps")
             self.step_labels.append(label)
+        steps.bind("<Configure>",lambda e:[label.configure(wraplength=max(120,e.width//5-28)) for label in self.step_labels])
 
         guide = ttk.Frame(root, padding=(18, 8, 18, 12))
         guide.pack(fill="x")
@@ -153,9 +162,16 @@ class App:
 
         self.preview = PreviewPane(paned, self)
 
-        right = ttk.LabelFrame(paned, text="拆分草稿 / 文件名称", padding=2, width=400)
+        right = ttk.LabelFrame(paned, text="整理工作区", padding=2, width=400)
         self.right_panel = right
-        self.groups = GroupPanelArea(right, self)
+        self.review_tabs = ttk.Notebook(right)
+        self.review_tabs.pack(fill="both",expand=True)
+        self.check_center = CheckCenter(self.review_tabs,self)
+        self.review_tabs.add(self.check_center,text="检查中心")
+        name_tab=ttk.Frame(self.review_tabs)
+        self.review_tabs.add(name_tab,text="文件名称")
+        self.name_tab=name_tab
+        self.groups = GroupPanelArea(name_tab, self)
         self.groups.pack(fill="both", expand=True)
 
         paned.add(left, weight=3)
@@ -246,6 +262,7 @@ class App:
             self.export_all()
 
     def focus_next_name(self):
+        self.review_tabs.select(self.name_tab)
         for i, doc in enumerate(self.ws.documents):
             for gi, group in enumerate(doc.groups):
                 if not group.title_confirmed or not group.unit_confirmed or not group.title.strip() or not group.unit.strip():
@@ -280,21 +297,102 @@ class App:
         if doc:
             cur = f" · 当前 {doc.name} 第 {self.current_page}/{doc.page_count} 页"
         self.status_var.set(
-            f"文件 {len(docs)} · 共 {total_pages} 页 · 空白候选 {blanks} · 疑似 {maybes}"
-            f" · 分组 {n_groups} · 待确认 {n_conf}{cur}"
+            f"已导入 {len(docs)} 个 PDF · 共 {total_pages} 个原始页{cur}"
         )
         self.selected_file_var.set(doc.name if doc else "尚未导入文件")
-        confirmed = sum(1 for d in docs for g in d.groups
-            if not g.need_confirm and g.title.strip() and g.unit.strip() and not d.analysis_stale
-            and not any(p.has_rotation_proposal for p in d.pages[g.start-1:g.end]))
+        confirmed = sum(presentation.name_ready(d,g) for d in docs for g in d.groups)
         if not n_groups:
             notice = "完成拆分与命名后，从右侧“导出 PDF…”保存文件。"
         elif confirmed < n_groups:
-            notice = f"已确认 {confirmed}/{n_groups} 份，还有 {n_groups-confirmed} 份待检查。点击“导出 PDF…”可查看清单。"
+            notice = f"整理就绪 {confirmed}/{n_groups} 份，还有 {n_groups-confirmed} 份待检查。点击“导出 PDF…”可查看清单。"
         else:
-            notice = f"{n_groups} 份文件已确认，点击右侧“导出 PDF…”核对清单并保存。"
+            notice = f"{n_groups} 份文件整理就绪，点击右侧“导出 PDF…”核对清单并保存。"
         self.export_notice_var.set(notice)
         self._update_step_state(len(docs), self._blank_analysis_done(), n_groups, n_conf)
+        self._refresh_checks()
+
+    def _check_key(self):
+        return presentation.state_key(self.ws.documents), self.template_var.get()
+
+    def _on_template_change(self, *args):
+        for panel in self.groups.panels:
+            panel._update_filename()
+        self.update_status()
+
+    def _refresh_checks(self):
+        docs=self.ws.documents
+        key=self._check_key()
+        items=presentation.issues(docs)
+        text="页面完整性：尚未执行导出前检查；保真校验将在导出时执行。"
+        if self._precheck:
+            if self._precheck[0]==key:
+                items += self._precheck[1]
+                text="导出前完整性预检："+("存在阻断问题" if self._precheck[1] else "通过；输出保真尚待导出时验证")
+            else:
+                text="文件状态已变化，导出前需要重新检查。"
+        exported=0
+        if self._last_export and self._last_export[0]==key:
+            feedback=self._last_export[1]
+            exported=feedback['ok']
+            text="\n".join(feedback['lines'][:3])
+            items += presentation.precheck_issues(docs,feedback['errors'],prefix="result")
+        items += list(self._preview_errors.values())
+        if self._operation_notice and self._operation_notice.doc_index < len(docs):
+            items.append(self._operation_notice)
+        ready=sum(presentation.name_ready(d,g) for d in docs for g in d.groups)
+        total=sum(len(d.groups) for d in docs)
+        self.check_center.set_content(items,ready,total,text)
+        self.review_tabs.tab(self.check_center,text=f"检查中心（{len(items)}）" if items else "检查中心")
+        counts=presentation.step_counts(docs,exported)
+        stage=workflow.next_step(docs).stage
+        for i,(done,count,unit) in enumerate(counts):
+            marker="●" if i==stage else "✓" if count and done==count else "○"
+            self.step_labels[i].configure(text=f"{marker} {i+1} {self.step_names[i]}\n{done}/{count}{unit}完成 · 待{max(0,count-done)}")
+
+    def navigate_issue(self, issue, process=False):
+        if self._busy or not 0<=issue.doc_index<len(self.ws.documents):
+            return
+        doc=self.ws.documents[issue.doc_index]
+        self.locate_page(issue.page,doc)
+        if issue.action=="field" and issue.group_index is not None:
+            if not presentation.split_ready(doc,doc.groups[issue.group_index]):
+                if process:
+                    self.review_pending()
+                return
+            self.review_tabs.select(self.name_tab)
+            self.groups.panels[issue.group_index].focus_pending(issue.field)
+        elif process:
+            if issue.action in ("analyze","reanalyze"):
+                self.automatic_split(guided=True,only_doc=doc)
+            elif issue.action=="name":
+                self.ocr_name()
+            elif issue.action in ("direction","boundary","group"):
+                self.review_pending()
+                dialog=self._review_dialog
+                iid=f"d:{issue.page}" if issue.action=="direction" else f"g:{issue.group_index}" if issue.action=="group" else str(issue.page)
+                if dialog and dialog.tree.exists(iid):
+                    dialog.tree.selection_set(iid)
+                    dialog.tree.see(iid)
+                    dialog.selected()
+            else:
+                messagebox.showerror("问题详情",issue.reason)
+
+    def report_preview_error(self,doc,page,error):
+        di=next((i for i,d in enumerate(self.ws.documents) if d is doc),None)
+        if di is not None:
+            key=f"preview:{di}:{page}"
+            self._preview_errors[key]=presentation.Issue(key,"页面预览","页面预览失败",str(error),di,page,severity="error")
+
+    def clear_preview_error(self,doc,page):
+        di=next((i for i,d in enumerate(self.ws.documents) if d is doc),None)
+        self._preview_errors.pop(f"preview:{di}:{page}",None)
+
+    def record_operation_notice(self,title,reason,action="analyze",doc=None,canceled=False):
+        doc=doc or self._active_doc()
+        di=next((i for i,d in enumerate(self.ws.documents) if d is doc),None)
+        if di is not None:
+            self._operation_notice=presentation.Issue("operation","任务状态",title,reason,di,action=action,severity="info" if canceled else "error")
+            self.update_status()
 
     def _blank_analysis_done(self) -> bool:
         """是否已对全部文档执行过空白检测。
@@ -351,12 +449,15 @@ class App:
             set_edit_state(self.groups)
             self.groups.next_btn.state(["!disabled"] if docs and not self._busy else ["disabled"])
             self.groups.rename_btn.state(["!disabled"] if boundaries_ready and not self._busy else ["disabled"])
+            self.groups.set_current(self.groups.current_group)
         step = workflow.next_step(docs)
-        self.hint_var.set("下一步：" + step.button)
+        self.hint_var.set("下一步：" + step.button + ("（自动拆分草稿）" if step.action=="analyze" else ""))
         self.workflow_title.set("正在处理，请稍候…" if self._busy else step.title)
         self.workflow_detail.set("可在进度窗口取消。完成后会继续提示下一步。" if self._busy else step.detail)
         self.next_button.configure(text=step.button)
         self.next_button.state(["disabled"] if self._busy else ["!disabled"])
+        if self._busy:
+            self.check_center.process_button.state(["disabled"])
         self.more_button.state(["disabled"] if self._busy else ["!disabled"])
         for i, label in enumerate(self.step_labels):
             label.configure(foreground="#155cad" if i == step.stage else "#596579",
@@ -413,6 +514,8 @@ class App:
             if self._prog is None or not self._prog.winfo_exists():
                 self._prog = ProgressDialog(self.root, title or "处理中")
             self._prog.set(done, total, phase)
+            self.workflow_title.set(f"{title or '正在处理'} · {done}/{total}")
+            self.workflow_detail.set(f"{phase or '正在本地处理'}。可在进度窗口取消；尚未确认的结果不会正式导出。")
         except tk.TclError:
             pass  # 窗口正在关闭
 
@@ -443,11 +546,13 @@ class App:
         # A tiny/cached job can finish during start()'s first queue poll.
         # Set busy before dispatch so its completion cannot be overwritten.
         self._busy = True
+        self._operation_notice = None
         if not self.tasks.start(kind, work, on_done, title=title):
             self._busy = self.tasks.busy
             messagebox.showinfo("请稍候", "当前已有任务在后台运行，请等待完成或先取消。")
             return False
         self._update_step_state()
+        self._refresh_checks()
         return True
 
     def undo(self, from_key: bool = False):
@@ -606,6 +711,8 @@ class App:
         ):
             return
         self.ws.documents.remove(doc)
+        self._preview_errors.clear()
+        self._operation_notice = None
         renderer = self.renderers.pop(str(doc.path), None)
         if renderer:
             renderer.close()
@@ -821,6 +928,7 @@ class App:
                 self._restore_ws_snapshot(snap)
                 self._refresh_all()
                 self.log("自动拆分已回滚：" + (error.splitlines()[-1] if error else "用户取消"))
+                self.record_operation_notice("自动分析失败" if error else "自动分析已取消",(error.splitlines()[-1] if error else "处理前的草稿和人工决定已保留，可以重新开始。"),doc=docs[0],canceled=not error)
                 return
             self._refresh_all()
             if on_complete:
@@ -837,8 +945,10 @@ class App:
         doc = self._active_doc()
         if doc and not self._busy:
             if self._review_dialog and self._review_dialog.winfo_exists():
-                self._review_dialog.lift()
-                return
+                if self._review_dialog.doc is doc:
+                    self._review_dialog.lift()
+                    return
+                self._review_dialog.close()
             self._review_dialog = ReviewDialog(self.root, self, doc)
 
     def resolve_boundary(self, page_no, split, doc=None):
@@ -1049,7 +1159,7 @@ class App:
             messagebox.showinfo("OCR 自动命名", "请先打开 PDF 文件。")
             return
         if not any(d.groups for d in docs):
-            messagebox.showinfo("OCR 自动命名", "尚未分组。请先运行“自动分组”。")
+            messagebox.showinfo("识别名称", "尚无拆分草稿。请先点击顶部“开始自动分析”。")
             return
         if any(not g.boundary_confirmed for d in docs for g in d.groups):
             messagebox.showinfo("先检查拆分", "还有文档边界待确认。请先检查待处理问题，并确认分组属于哪一份文件，再进行自动命名。")
@@ -1103,12 +1213,14 @@ class App:
                 self._refresh_all()
                 tail = error.splitlines()[-1] if error else "未知错误"
                 self.log(f"OCR 自动命名失败：{tail}（已回滚，无半更新状态）")
+                self.record_operation_notice("名称提取失败",tail,action="name",doc=docs[0])
                 messagebox.showerror("OCR 自动命名", f"命名失败：{tail}")
                 return
             if canceled:
                 self._restore_ws_snapshot(snap)
                 self._refresh_all()
                 self.log("OCR 自动命名已取消，未保存任何修改。")
+                self.record_operation_notice("名称提取已取消","处理前的名称和人工决定已保留，可以重新识别。",action="name",doc=docs[0],canceled=True)
                 return
             # 文档被移除的组不进历史
             for doc in docs:
@@ -1529,11 +1641,13 @@ class App:
             return
         total_g = sum(len(d.groups) for d in docs)
         if not total_g:
-            messagebox.showinfo("导出", "尚未分组。请先运行“自动分组”。")
+            messagebox.showinfo("导出", "尚无拆分草稿。请先点击顶部“开始自动分析”。")
             return
         template = self.template_var.get() or naming.DEFAULT_TEMPLATE
         opts = exporter.ExportOptions(template=template, strict=True)
         field_issues, integrity_issues, stats = self.export_summary(docs, opts)
+        self._precheck=(self._check_key(),presentation.precheck_issues(docs,integrity_issues))
+        self._refresh_checks()
 
         # v1.9.1 改进3：统一改用「可勾选清单」对话框，替代一行 askyesno。
         # - 完整性（fail-closed）：只读展示，无「非严格模式」，不可绕过；
@@ -1564,6 +1678,7 @@ class App:
             return
         opts.strict = bool(result["strict"])
         opts.only = only
+        export_key=self._check_key()
         out_dir = filedialog.askdirectory(
             title="清单已确认，请选择保存位置",
             initialdir=self.settings.get("output_dir") or str(Path.home()),
@@ -1571,6 +1686,7 @@ class App:
         if not out_dir:
             return
         opts.out_dir = out_dir
+        self._last_export = None
         total_g = len(only)
         self._busy = True
         self._update_step_state()
@@ -1589,6 +1705,7 @@ class App:
             if error:
                 tail = error.splitlines()[-1] if error else "未知错误"
                 self.log(f"导出失败：{tail}")
+                self.record_operation_notice("导出任务失败",tail,action="page",doc=docs[0])
                 messagebox.showerror("导出", f"导出过程异常：{tail}\n\n已成功导出的文件保留，源文件未受影响。")
                 return
             # 报告由 worker 产生，此处仅读（主线程收尾）
@@ -1601,21 +1718,14 @@ class App:
             self.settings["template"] = template
             self._save_settings()
             ok, fail = len(report.succeeded), len(report.failed)
-            integrity_ok = all(
-                report.src_sha_before.get(k) == report.src_sha_after.get(k)
-                for k in report.src_sha_before
-                if k in report.src_sha_after
-            )
-            coverage_ok = not report.coverage_issues
-            msg = (
-                f"导出完成：成功 {ok} 份，失败 {fail} 份。\n"
-                f"源文件完整性：{'全部一致（SHA-256 校验通过）' if integrity_ok else '异常！请查看日志'}\n"
-                f"页面覆盖率：{'每个有效原页恰好导出一次' if coverage_ok else '异常！存在漏页/重复页，请查看日志'}"
-            )
-            if report.manifest_path:
-                msg += f"\n页面去向记录：{report.manifest_path.name}"
-            if report.manifest_error:
-                msg += f"\n页面去向记录写入失败：{report.manifest_error}"
+            feedback=presentation.export_feedback(docs,only,report,canceled)
+            self._last_export=(export_key,feedback)
+            self._refresh_checks()
+            msg="\n".join(feedback['lines'])
+            if feedback['errors']:
+                msg += "\n\n需要处理：\n"+"\n".join(feedback['errors'][:8])
+                if len(feedback['errors']) > 8:
+                    msg += f"\n其余 {len(feedback['errors'])-8} 项请在检查中心查看。"
             if canceled or report.canceled:
                 done_names = "、".join(r.filename + ".pdf" for r in report.succeeded) or "（无）"
                 msg += (
@@ -1802,14 +1912,14 @@ class SettingsDialog(tk.Toplevel):
     def __init__(self, master, app: App):
         super().__init__(master)
         self.app = app
-        self.title("设置")
+        self.title("命名与保存位置")
         self.resizable(False, False)
         self.transient(master)
         self.vars: dict[str, tk.DoubleVar] = {}
         self.val_lbls: dict[str, ttk.Label] = {}
 
         f = ttk.LabelFrame(self, text="空白检测阈值（修改后需重新运行“检测空白页”）", padding=8)
-        f.pack(fill="x", padx=8, pady=8)
+        # Retain compatibility variables without exposing analysis parameters here.
         for i, (key, label, lo, hi, step) in enumerate(self.PARAMS):
             ttk.Label(f, text=label).grid(row=i, column=0, sticky="w", padx=4, pady=2)
             var = tk.DoubleVar(value=float(getattr(app.detect_params, key)))
@@ -1847,10 +1957,6 @@ class SettingsDialog(tk.Toplevel):
             self.out_var.set(d)
 
     def _reset(self):
-        defaults = blankdetect.DetectParams()
-        for key, var in self.vars.items():
-            var.set(float(getattr(defaults, key)))
-            self._fmt(key)
         self.template_var.set(naming.DEFAULT_TEMPLATE)
 
     def _ok(self):
@@ -1861,7 +1967,7 @@ class SettingsDialog(tk.Toplevel):
         if out:
             self.app.settings["output_dir"] = out
         self.app._save_settings()
-        self.app.log("设置已保存。新阈值将在下次“检测空白页”时生效。")
+        self.app.log("命名格式与保存位置已保存。")
         self.destroy()
 
 
@@ -1871,7 +1977,7 @@ class ExportDoneDialog(tk.Toplevel):
     def __init__(self, master, out_dir: str, msg: str):
         super().__init__(master)
         self.out_dir = out_dir
-        self.title("导出完成")
+        self.title("导出结果")
         self.resizable(False, False)
         self.transient(master)
         ttk.Label(self, text=msg, padding=16, wraplength=440, justify="left").pack(anchor="w")

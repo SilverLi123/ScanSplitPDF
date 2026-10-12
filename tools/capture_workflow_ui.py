@@ -39,6 +39,9 @@ def run(out):
         d.pages[5].rotation_proposal_note="建议旋转 90°，需人工检查"
         app._refresh_all()
         shot(root,"02-main-review.png")
+        app.check_center.tree.selection_set("0:boundary:6")
+        app.check_center.selected()
+        shot(root,"02b-check-center.png")
         dialog=ReviewDialog(root,app,d)
         shot(dialog,"03-direction.png")
         d.pages[5].rotation_proposal=None
@@ -58,12 +61,16 @@ def run(out):
         dialog.close()
         d.naming_attempted=True
         d.groups[0].title_confirmed=False
+        d.groups[0].title_candidates=[dict(text="教学设备统计表",page=1,source="首页标题区域 OCR",confidence=.7)]
+        d.groups[0].unit_candidates=[dict(text="教务处",page=1,source="填报单位标签 OCR",confidence=.95)]
         d.groups[1].unit=""
         app._refresh_all()
         app.focus_next_name()
         shot(root,"07-names.png")
         root.geometry("1100x680+20+20")
         shot(root,"08-main-small.png")
+        app.review_tabs.select(app.check_center)
+        shot(root,"09-check-small.png")
         print(str(out.resolve()))
     finally:
         app.on_close()

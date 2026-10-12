@@ -165,6 +165,9 @@ class Group:
     unit_confirmed: bool = True
     title_manual: bool = False
     unit_manual: bool = False
+    # UI provenance only: empty means older records did not distinguish editing.
+    title_edit_kind: str = ""
+    unit_edit_kind: str = ""
     boundary_confirmed: bool = True
 
     @property
@@ -200,6 +203,8 @@ class Group:
             "unit_confirmed": self.unit_confirmed,
             "title_manual": self.title_manual,
             "unit_manual": self.unit_manual,
+            "title_edit_kind": self.title_edit_kind,
+            "unit_edit_kind": self.unit_edit_kind,
             "boundary_confirmed": self.boundary_confirmed,
             "need_confirm": self.need_confirm,  # 兼容旧版读取
         }
@@ -218,6 +223,8 @@ class Group:
         g.unit_confirmed = bool(uc)
         g.title_manual = bool(d.get("title_manual", False))
         g.unit_manual = bool(d.get("unit_manual", False))
+        g.title_edit_kind = d.get("title_edit_kind", "")
+        g.unit_edit_kind = d.get("unit_edit_kind", "")
         g.boundary_confirmed = bool(d.get("boundary_confirmed", True))
         # 候选以 dict 形态存储（与 auto_name_groups 写入、UI 面板读取一致）
         g.title_candidates = [dict(x) for x in d.get("title_candidates", [])]

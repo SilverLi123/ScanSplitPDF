@@ -161,6 +161,8 @@ def _migrate_group_fields(src: Group, dst: Group) -> None:
     dst.unit_confirmed = src.unit_confirmed
     dst.title_manual = src.title_manual
     dst.unit_manual = src.unit_manual
+    dst.title_edit_kind = src.title_edit_kind
+    dst.unit_edit_kind = src.unit_edit_kind
     dst.boundary_confirmed = src.boundary_confirmed
 
 

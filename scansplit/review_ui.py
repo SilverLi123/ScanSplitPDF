@@ -101,6 +101,7 @@ class ReviewDialog(tk.Toplevel):
         self.draft_angle = 0
         self._waiting = False
         self._wait_job = None
+        self._all_boundaries = False
         self.title(f"检查方向与拆分 — {doc.name}")
         self.geometry(f"{min(1180,self.winfo_screenwidth()-80)}x{min(820,self.winfo_screenheight()-100)}")
         self.minsize(960, 640)
@@ -143,6 +144,8 @@ class ReviewDialog(tk.Toplevel):
         body.bind("<Configure>", lambda e: body.sashpos(0, min(320, max(260, int(e.width*.27)))))
         self.context = ttk.Label(self, padding=(16, 5), wraplength=1000, foreground="#6a4b12")
         self.context.pack(fill="x")
+        self.bind("<Configure>",lambda e:self.context.configure(wraplength=max(400,self.winfo_width()-40)),add="+")
+        evidence.bind("<Configure>",lambda e:self.question.configure(wraplength=max(300,e.width-16)))
         self.actions = ttk.Frame(self, padding=(16, 6))
         self.actions.pack(fill="x")
         self.adjust = ttk.Frame(self, padding=(16, 2))
@@ -165,9 +168,10 @@ class ReviewDialog(tk.Toplevel):
             self.refresh()
 
     def _button(self, text, command, primary=False):
+        i=len(self.actions.winfo_children())
         button = ttk.Button(self.actions, text=text, command=command,
                             style="Primary.TButton" if primary else "TButton")
-        button.pack(side="left", padx=(0, 8))
+        button.grid(row=i//3,column=i%3,sticky="w",padx=(0,8),pady=3)
         return button
 
     def refresh(self):
@@ -199,25 +203,35 @@ class ReviewDialog(tk.Toplevel):
             self._button("更新拆分并继续检查", self.reanalyze, True)
             self.left_page.show(None, "")
             self.right_page.show(None, "")
-        elif self.doc.pending_boundaries:
+        elif self.doc.pending_boundaries or self._all_boundaries:
             self.mode = "boundary"
             self.heading.configure(text=f"判断文件交界 · 剩余 {len(self.doc.pending_boundaries)} 处")
             self.detail.configure(text="比较前后两页：右侧是另一份文件的首页，还是左侧文件的续页 / 附件？")
-            for p, reason in sorted(self.doc.pending_boundaries.items()):
-                self.tree.insert("", "end", iid=str(p), values=(p, "文件归属待确认"))
-            self.split_button = self._button("这里开始新文件（保留页面）", lambda: self.resolve(True), True)
+            pages=set(self.doc.pending_boundaries)
+            if self._all_boundaries:
+                pages.update(g.start for g in self.doc.groups[1:])
+                self.heading.configure(text="审核文件交界 · 自动结果与人工决定分开显示")
+            for p in sorted(pages):
+                label="需要确认" if p in self.doc.pending_boundaries else "人工确认交界" if p in self.doc.manual_boundaries else "规则建立交界"
+                self.tree.insert("", "end", iid=str(p), values=(p,label))
+            self.split_button = self._button("确认从这里拆分（保留页面）", lambda: self.resolve(True), True)
             self._button("属于上一份（保留页面）", lambda: self.resolve(False))
+            self._button("稍后处理此处",self.skip_current)
             self.blank_button = self._button("排除已确认的分隔空白…", self.exclude_blank)
+            if self._all_boundaries:
+                self._button("返回文件范围总览",self.overview)
         else:
             self.mode = "groups"
             self.heading.configure(text=f"检查拆分总览 · 当前 {len(self.doc.groups)} 份文件")
             excluded = len(self.doc.separators)
             self.detail.configure(text=f"点击每份查看首页和末页，确认页码范围。源文件 {self.doc.page_count} 页；保留 {self.doc.page_count-excluded} 页；明确排除 {excluded} 页。")
             for i, g in enumerate(self.doc.groups):
-                self.tree.insert("", "end", iid=f"g:{i}", values=(f"{g.start}–{g.end}", f"文件 {i+1} · {'已确认' if g.boundary_confirmed else '待确认'}"))
+                status="人工确认" if all(p in self.doc.manual_boundaries for p in g.pages) else "规则通过" if g.boundary_confirmed else "待确认"
+                self.tree.insert("", "end", iid=f"g:{i}", values=(f"{g.start}–{g.end}", f"文件 {i+1} · {status}"))
             self._button("这份的页码范围正确", self.confirm_group, True)
             self.merge_button = self._button("与上一份合并", self.merge_previous)
             self._button("检查完成，继续下一步", self.finish)
+            self._button("审核全部文件交界",self.all_boundaries)
             ttk.Label(self.adjust, text="发现漏拆？输入第二份文件的原始首页：").pack(side="left")
             self.split_page_var = tk.StringVar()
             ttk.Spinbox(self.adjust, from_=2, to=self.doc.page_count, width=6, textvariable=self.split_page_var).pack(side="left", padx=4)
@@ -266,7 +280,9 @@ class ReviewDialog(tk.Toplevel):
             self.blank_button.state(["!disabled"] if blank else ["disabled"])
             self.split_button.state(["!disabled"] if p > 1 else ["disabled"])
             note = f"中间第 {prev+1}–{p-1} 页为空白候选，当前仍保留。" if prev < p-1 else "页面默认保留。"
-            self.context.configure(text=f"需要你判断：{self.doc.pending_boundaries.get(p, '')}\n{note}")
+            reason=self.doc.pending_boundaries.get(p) or ("这是人工决定的交界，可对照原页再次核对。" if p in self.doc.manual_boundaries else "这是规则自动建立的交界。未保存详细分析依据，请直接对照原页核对。")
+            status="规则分析建议 · 需要确认" if p in self.doc.pending_boundaries else "人工决定" if p in self.doc.manual_boundaries else "规则自动结果"
+            self.context.configure(text=f"{status}\n判断依据：{reason}\n{note}")
         elif self.mode == "groups":
             i = int(self.tree.selection()[0][2:])
             g = self.doc.groups[i]
@@ -324,8 +340,32 @@ class ReviewDialog(tk.Toplevel):
     def resolve(self, split):
         p = self.page()
         if p and self.mode == "boundary" and not self.app._busy:
+            children=list(self.tree.get_children())
+            next_i=children[(children.index(str(p))+1)%len(children)] if children else None
             self.app.resolve_boundary(p, split, self.doc)
             self.refresh()
+            if self._all_boundaries and next_i and self.tree.exists(next_i):
+                self.tree.selection_set(next_i)
+                self.selected()
+
+    def skip_current(self):
+        if self.app._busy:
+            return
+        children=list(self.tree.get_children())
+        selected=self.tree.selection()
+        if children and selected:
+            i=(children.index(selected[0])+1)%len(children)
+            self.tree.selection_set(children[i])
+            self.tree.see(children[i])
+            self.selected()
+
+    def all_boundaries(self):
+        self._all_boundaries=True
+        self.refresh()
+
+    def overview(self):
+        self._all_boundaries=False
+        self.refresh()
 
     def exclude_blank(self):
         p = self.page()

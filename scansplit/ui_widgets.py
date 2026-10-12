@@ -14,7 +14,7 @@ from tkinter import messagebox, ttk
 
 from PIL import ImageTk
 
-from . import naming
+from . import naming, presentation
 
 THUMB_CELL_W = 176
 THUMB_CELL_H = 234
@@ -26,8 +26,10 @@ BADGE_STYLES = {
     "rotate": ("#5d6d7e", "#ffffff"),
     "split": ("#8e44ad", "#ffffff"),
     "internal": ("#1e8449", "#ffffff"),
-    "uncertain": ("#d68910", "#ffffff"),
+    "uncertain": ("#805200", "#ffffff"),
     "proposal": ("#8e44ad", "#ffffff"),
+    "confirmed": ("#17643c", "#ffffff"),
+    "aux": ("#536173", "#ffffff"),
 }
 
 
@@ -92,46 +94,26 @@ class ThumbnailStrip(ttk.Frame):
         return list(range(first, last + 1))
 
     def _badges(self, page) -> list[tuple[str, str]]:
-        out = []
-        if page.separator:
-            out.append(("分隔", "separator"))
+        doc=self._doc
+        g=next((g for g in doc.groups if g.start<=page.src_index<=g.end),None) if doc else None
+        pending=page.has_rotation_proposal or (doc and (doc.analysis_stale or page.src_index in doc.pending_boundaries or (g and not g.boundary_confirmed)))
+        if pending:
+            out=[("⚠ 待确认","uncertain")]
+        elif page.separator:
+            out=[("✓ 已确认排除","confirmed")] if doc and page.src_index in doc.manual_separator_pages else [("⚠ 排除需核查","uncertain")]
+        elif doc and (page.src_index in doc.manual_boundaries or page.src_index in doc.manual_separator_pages):
+            out=[("✓ 已人工确认","confirmed")]
+        elif doc and doc.analysis_complete:
+            out=[("规则检查通过","confirmed")]
+        else:
+            out=[("待分析","aux")]
         if page.split_before:
-            out.append(("新文档", "split"))
-        if page.blank is not None:
-            if page.blank.verdict == "blank":
-                # 业务属性区分（v1.9.1 改进1）：分隔 vs 内部空白 vs 待确认
-                ctx = getattr(page, "blank_context", "") or ""
-                if ctx == "internal_blank":
-                    out.append(("内部空白", "internal"))
-                elif ctx == "uncertain":
-                    out.append(("待确认", "uncertain"))
-                else:
-                    out.append(("空白", "blank"))
-            elif page.blank.verdict == "maybe":
-                out.append(("疑似", "maybe"))
-        err = page.effective_rotation % 360
-        if err:
-            tag = f"{err}°" + ("" if page.is_rotation_manual else "·自动")
-            out.append((tag, "rotate"))
-        if getattr(page, "has_rotation_proposal", False):
-            out.append((f"建议{int(page.rotation_proposal) % 360}°", "proposal"))
+            out.append(("▶ 新文件","aux"))
         return out
 
     def _page_strip_color(self, page) -> str | None:
         """页面左侧色带颜色（v1.9.1 改进1）：按业务属性直观区分。"""
-        if page.separator:
-            return "#a93226"                     # 分隔页（导出排除）
-        ctx = getattr(page, "blank_context", "") or ""
-        if page.blank is not None and page.blank.verdict == "blank":
-            if ctx == "internal_blank":
-                return "#1e8449"                 # 内部空白（保留）
-            if ctx == "uncertain":
-                return "#d68910"                 # 待确认（默认保留）
-        if getattr(page, "has_rotation_proposal", False):
-            return "#8e44ad"                     # 有方向建议待处理
-        if page.split_before:
-            return "#8e44ad"                     # 新文档起点
-        return None
+        return BADGE_STYLES[self._badges(page)[0][1]][0]
 
     def _draw_page(self, p: int):
         doc, renderer = self._doc, self._renderer
@@ -301,6 +283,13 @@ class PreviewPane(ttk.Frame):
         rotate_menu.pack(side="left", padx=4)
         self.rot_lbl = ttk.Label(self, text="", foreground="#49566a", wraplength=480)
         self.rot_lbl.pack(anchor="w", padx=8)
+        info=ttk.Frame(self)
+        info.pack(fill="x",padx=8,pady=(2,4))
+        ttk.Button(info,text="详情",width=5,command=self.show_page_detail).pack(side="right")
+        self.page_info_lbl=ttk.Label(info,wraplength=350,foreground=presentation.COLORS["info"])
+        self.page_info_lbl.pack(side="left",fill="x",expand=True)
+        info.bind("<Configure>",lambda e:self.page_info_lbl.configure(wraplength=max(160,e.width-70)))
+        self.bind("<Configure>",lambda e:self.rot_lbl.configure(wraplength=max(160,e.width-16)),add="+")
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True)
         self.canvas = tk.Canvas(body, bg="#5a5a5a", highlightthickness=0)
@@ -336,6 +325,9 @@ class PreviewPane(ttk.Frame):
         self._render()
 
     def _on_configure(self, _e):
+        if self._doc is None:
+            self.show_guide()
+            return
         if self.fit_mode and self._doc is not None:
             if self._fit_job:
                 self.after_cancel(self._fit_job)
@@ -359,26 +351,35 @@ class PreviewPane(ttk.Frame):
         self.canvas.configure(scrollregion=(0, 0, 0, 0))
         self.page_lbl.configure(text="第 - / - 页")
         self.rot_lbl.configure(text="")
+        self.page_info_lbl.configure(text="")
+
+    def show_page_detail(self):
+        if self._doc is None:
+            return
+        summary,direction,boundary=presentation.page_info(self._doc,self._page_no)
+        page=self._doc.pages[self._page_no-1]
+        reason=page.rotation_proposal_note if page.has_rotation_proposal else ""
+        messagebox.showinfo("当前页面",f"{self._doc.name}\n{summary}\n方向：{direction}\n{boundary}\n{reason}")
 
     def show_guide(self):
         """无文档时的空状态引导：4 步工作流 + 常用快捷键。"""
         self.clear()
-        cw = max(self.canvas.winfo_width(), 720)
-        ch = max(self.canvas.winfo_height(), 560)
+        cw = max(self.canvas.winfo_width(), 280)
+        ch = max(self.canvas.winfo_height(), 320)
         self.canvas.configure(scrollregion=(0, 0, cw, ch))
         cx = cw // 2
-        y = ch // 2 - 120
-        self.canvas.create_text(cx, y, text="ScanSplit PDF 使用流程",
-                                fill="#ffffff", font=("Segoe UI", 15, "bold"))
+        y = 45
+        self.canvas.create_text(cx, y, text="整理扫描 PDF",width=cw-36,
+                                fill="#ffffff", font=("Microsoft YaHei UI", 13, "bold"))
         steps = [
-            "选择 PDF，然后按顶部的大按钮继续",
-            "检查时直接比较两页：是新文件，还是上一份的续页？",
-            "拆分确认后，核对标题与填报单位，再导出",
-            "拿不准可以稍后处理，待确认结果不会被导出",
+            "导入 → 自动分析 → 检查拆分 → 确认名称 → 导出",
+            "程序处理确定的部分；检查中心列出需要你确认的问题。",
+            "输出：标题——填报单位.pdf。原文件保持不变。",
+            "拿不准可稍后处理，待确认结果不会正式导出。",
         ]
         for s in steps:
-            y += 38
-            self.canvas.create_text(cx, y, text=s, fill="#e8e8e8", font=("Segoe UI", 11))
+            y += 66
+            self.canvas.create_text(cx, y, text=s,width=cw-36, fill="#e8e8e8", font=("Microsoft YaHei UI", 10))
         y += 52
         self.canvas.create_text(
             cx, y,
@@ -411,6 +412,8 @@ class PreviewPane(ttk.Frame):
             self.clear()
             self.page_lbl.configure(text=f"第 {self._page_no} / {len(doc.pages)} 页")
             self.app.log(f"预览渲染失败：{e}")
+            self.app.report_preview_error(doc,self._page_no,e)
+            self.page_info_lbl.configure(text="页面预览失败。可在检查中心查看详情并重新定位。",foreground=presentation.COLORS["error"])
             return
         if self.fit_mode:
             cw = self.canvas.winfo_width()
@@ -428,6 +431,10 @@ class PreviewPane(ttk.Frame):
         except Exception:
             tk_scale = 1.0
         scale = (self.DPI / 72.0) * self.zoom * tk_scale
+        if self.fit_mode:
+            # Tk canvas dimensions already use device pixels. Do not apply DPI twice.
+            scale=min((cw-24)/w_pt,(ch-24)/h_pt)
+            self.zoom=scale*72.0/self.DPI/tk_scale
         scale = min(scale, 2800.0 / max(w_pt, 1.0))  # 单页渲染宽度上限
         try:
             img = renderer.render(
@@ -437,8 +444,11 @@ class PreviewPane(ttk.Frame):
             self.clear()
             self.page_lbl.configure(text=f"第 {self._page_no} / {len(doc.pages)} 页")
             self.app.log(f"预览渲染失败：{e}")
+            self.app.report_preview_error(doc,self._page_no,e)
+            self.page_info_lbl.configure(text="页面预览失败。可在检查中心查看详情并重新定位。",foreground=presentation.COLORS["error"])
             return
         self._img = img
+        self.app.clear_preview_error(doc,self._page_no)
         self._photo = ImageTk.PhotoImage(img)
         self.canvas.delete("all")
         self._place()
@@ -452,16 +462,9 @@ class PreviewPane(ttk.Frame):
         # v1.9.1 改进2：预览内明确区分"已生效方向"与"待确认建议"，
         # 建议绝不改动画布朝向，仅在文字/描边层面提示（避免误以为已生效）。
         prop = int(page.rotation_proposal) % 360 if getattr(page, "has_rotation_proposal", False) else None
-        if prop is not None:
-            self.rot_lbl.configure(
-                text=f"{('未旋转' if rot == 0 else f'当前 {rot}°')} ｜ 建议 {prop}°（待确认）",
-                foreground="#8e44ad",
-            )
-        else:
-            self.rot_lbl.configure(
-                text="未旋转" if rot == 0 else f"旋转 {rot}°（将写入导出）",
-                foreground="#5d6d7e",
-            )
+        summary,direction,boundary=presentation.page_info(doc,self._page_no)
+        self.page_info_lbl.configure(text=summary,foreground=presentation.COLORS["info"])
+        self.rot_lbl.configure(text=direction,foreground=presentation.COLORS["warning" if prop is not None else "info"])
         self._draw_highlight(page, prop)
 
     def _draw_highlight(self, page, proposal_deg):
@@ -469,21 +472,23 @@ class PreviewPane(ttk.Frame):
         已生效旋转=蓝色实线，分隔页=红色实线（导出排除）。"""
         cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
         if page.separator:
+            confirmed=self._doc and page.src_index in self._doc.manual_separator_pages
+            color=presentation.COLORS["info" if confirmed else "error"]
             self.canvas.create_rectangle(
-                2, 2, cw - 3, ch - 3, outline="#a93226", width=3, dash=(8, 4), tags="hl",
+                2, 2, cw - 3, ch - 3, outline=color, width=2, dash=(8, 4), tags="hl",
             )
             self.canvas.create_text(
-                cw // 2, 16, text="分隔页 · 导出时排除", fill="#a93226",
+                cw // 2, 16, text="已确认排除 · 不进入导出" if confirmed else "排除状态需核查", fill=color,
                 font=("Segoe UI", 10, "bold"), tags="hl",
             )
         elif proposal_deg is not None:
             self.canvas.create_rectangle(
-                2, 2, cw - 3, ch - 3, outline="#8e44ad", width=3, dash=(8, 4), tags="hl",
+                2, 2, cw - 3, ch - 3, outline="#805200", width=2, dash=(8, 4), tags="hl",
             )
             self.canvas.create_text(
                 cw // 2, 16,
-                text=f"方向建议 {proposal_deg}° 待确认 · 请在上方“识别方向”中采用或忽略",
-                fill="#8e44ad", font=("Segoe UI", 10, "bold"), tags="hl",
+                text=f"方向建议 {proposal_deg}° 未应用 · 请到检查中心确认",width=max(150,cw-20),
+                fill="#805200", font=("Segoe UI", 10, "bold"), tags="hl",
             )
 
     def _place(self):
@@ -534,6 +539,7 @@ class GroupPanel(ttk.LabelFrame):
         self.gi = gi
         self.group = group
         self._loading = True
+        self._edit_started=set()
 
         head = ttk.Frame(self)
         head.pack(fill="x")
@@ -568,16 +574,21 @@ class GroupPanel(ttk.LabelFrame):
         name_host = ttk.Frame(self)
         if group.boundary_confirmed and not doc.analysis_stale:
             name_host.pack(fill="x")
+            actions.pack_forget()
+            bd.pack_forget()
         else:
             ttk.Label(self, text="先检查这一份的方向和拆分，再识别名称。",
                       foreground="#6a4b12", wraplength=360).pack(anchor="w", pady=8)
 
         r1 = ttk.Frame(name_host)
         r1.pack(fill="x", pady=(6, 2))
-        r1.columnconfigure(1, weight=1)
+        r1.columnconfigure(0, weight=1)
         ttk.Label(r1, text="标题", width=8).grid(row=0,column=0,sticky="w")
         self.title_entry = ttk.Entry(r1, textvariable=self.title_var, width=16)
-        self.title_entry.grid(row=0,column=1,sticky="ew")
+        self.title_entry.grid(row=1,column=0,columnspan=3,sticky="ew",pady=(4,0))
+        self.title_entry.grid_remove()
+        self.title_value_lbl=ttk.Label(r1,textvariable=self.title_var,font=("Microsoft YaHei UI",11,"bold"),wraplength=400)
+        self.title_value_lbl.grid(row=1,column=0,columnspan=3,sticky="ew",pady=(4,0))
         title_options = ttk.Frame(name_host)
         title_options.pack(fill="x", pady=2)
         ttk.Label(title_options, text="候选", width=5).pack(side="left")
@@ -593,15 +604,18 @@ class GroupPanel(ttk.LabelFrame):
 
         r2 = ttk.Frame(name_host)
         r2.pack(fill="x", pady=2)
-        r2.columnconfigure(1, weight=1)
+        r2.columnconfigure(0, weight=1)
         ttk.Label(r2, text="填报单位", width=8).grid(row=0,column=0,sticky="w")
         self.unit_entry = ttk.Entry(r2, textvariable=self.unit_var, width=16)
-        self.unit_entry.grid(row=0,column=1,sticky="ew")
+        self.unit_entry.grid(row=1,column=0,columnspan=3,sticky="ew",pady=(4,0))
+        self.unit_entry.grid_remove()
+        self.unit_value_lbl=ttk.Label(r2,textvariable=self.unit_var,font=("Microsoft YaHei UI",11,"bold"),wraplength=400)
+        self.unit_value_lbl.grid(row=1,column=0,columnspan=3,sticky="ew",pady=(4,0))
         unit_options = ttk.Frame(name_host)
         unit_options.pack(fill="x", pady=2)
         ttk.Label(unit_options, text="候选", width=5).pack(side="left")
         # 单位候选：OCR 候选（降序）+ 历史单位（无置信度）
-        uc_cands = [c for c in group.unit_candidates if c.get("text")]
+        uc_cands = [c for c in presentation.candidates(group,"unit") if c.get("text")]
         self.unit_cb_map = self._build_candidate_map(uc_cands)
         for h in history_items:
             if h and all(h != c.get("text") for c in uc_cands):
@@ -615,17 +629,22 @@ class GroupPanel(ttk.LabelFrame):
         self.unit_conf_lbl.pack(anchor="w", pady=(2, 6))
         ttk.Button(unit_options, text="查看来源", command=lambda: self._show_source("unit")).pack(side="right")
         ttk.Button(title_options, text="查看来源", command=lambda: self._show_source("title")).pack(side="right")
-        ttk.Button(r1, text="确认标题", command=lambda: self._confirm_field("title")).grid(row=0,column=2,padx=(4,0))
-        ttk.Button(r2, text="确认单位", command=lambda: self._confirm_field("unit")).grid(row=0,column=2,padx=(4,0))
+        ttk.Button(r1, text="确认标题", command=lambda: self._confirm_field("title")).grid(row=0,column=1,padx=(4,0))
+        ttk.Button(r2, text="确认单位", command=lambda: self._confirm_field("unit")).grid(row=0,column=1,padx=(4,0))
+        ttk.Button(r1,text="修改",command=lambda:self._edit_field("title")).grid(row=0,column=2,padx=(4,0))
+        ttk.Button(r2,text="修改",command=lambda:self._edit_field("unit")).grid(row=0,column=2,padx=(4,0))
         self.title_options, self.unit_options = title_options, unit_options
         self._options_visible = False
         title_options.pack_forget()
         unit_options.pack_forget()
         ttk.Button(name_host, text="查看候选与识别来源", command=self._toggle_evidence).pack(anchor="w", pady=(4,0))
+        self.page_controls=(actions,bd,head)
+        self._pages_visible=False
+        ttk.Button(name_host,text="查看页码与拆分",command=self._toggle_pages).pack(anchor="w",pady=(2,0))
 
         r3 = ttk.Frame(name_host)
         r3.pack(fill="x", pady=(4, 0))
-        ttk.Label(r3, text="导出为").pack(side="left")
+        ttk.Label(r3, text="文件名预览").pack(side="left")
         self.fname_lbl = ttk.Label(r3, text="", foreground="#1a6b3c", font=("Segoe UI", 9), wraplength=330)
         self.fname_lbl.pack(side="left", padx=4)
         ttk.Button(name_host, text="确认本份名称并看下一份", command=self._confirm_name).pack(anchor="e", pady=(8, 2))
@@ -638,11 +657,15 @@ class GroupPanel(ttk.LabelFrame):
         self._update_filename()
         self._update_confirm_badge()
         self._refresh_field_hints()
+        for field in ("title","unit"):
+            label=getattr(self,field+"_conf_lbl")
+            label.configure(cursor="hand2")
+            label.bind("<Button-1>",lambda e,f=field:self._show_source(f))
         self.bind("<Configure>", self._resize_text)
 
     def _resize_text(self,event):
         width = max(160,event.width-24)
-        for label in (self.header_label,self.confirm_lbl,self.title_conf_lbl,self.unit_conf_lbl):
+        for label in (self.header_label,self.confirm_lbl,self.title_conf_lbl,self.unit_conf_lbl,self.title_value_lbl,self.unit_value_lbl):
             label.configure(wraplength=width)
         self.fname_lbl.configure(wraplength=max(120,width-60))
 
@@ -654,6 +677,7 @@ class GroupPanel(ttk.LabelFrame):
         """
         best: dict[str, dict] = {}
         for c in cands:
+            c=c.to_dict() if hasattr(c,"to_dict") else c
             t = (c.get("text") or "").strip()
             if not t:
                 continue
@@ -680,6 +704,23 @@ class GroupPanel(ttk.LabelFrame):
         label = cb.get()
         text = next((k for k, v in m.items() if v == label), label)
         var.set(text)
+        setattr(self.group,field+"_edit_kind","candidate")
+        self._refresh_field_hints()
+
+    def _edit_field(self,field):
+        if self.app._busy:
+            return
+        self.app.groups.set_current(self.gi)
+        getattr(self,field+"_value_lbl").grid_remove()
+        entry=getattr(self,field+"_entry")
+        entry.grid()
+        entry.focus_set()
+        entry.selection_range(0,"end")
+
+    def _finish_edit(self,field):
+        self._edit_started.discard(field)
+        getattr(self,field+"_entry").grid_remove()
+        getattr(self,field+"_value_lbl").grid()
 
     def _confirm_field(self, field):
         if self.app._busy:
@@ -689,6 +730,7 @@ class GroupPanel(ttk.LabelFrame):
             messagebox.showinfo("确认名称", "请先填写该字段。")
             return
         self._on_change(field)
+        self._finish_edit(field)
 
     def _toggle_evidence(self):
         self._options_visible = not self._options_visible
@@ -707,8 +749,20 @@ class GroupPanel(ttk.LabelFrame):
         self.app._push_undo()
         self._on_change("title")
         self._on_change("unit")
+        self._finish_edit("title")
+        self._finish_edit("unit")
         self.app.groups._update_summary(self.doc)
         self.app.focus_next_name()
+
+    def _toggle_pages(self):
+        self._pages_visible=not self._pages_visible
+        actions,bd,head=self.page_controls
+        if self._pages_visible:
+            actions.pack(fill="x",pady=2,after=head)
+            bd.pack(fill="x",pady=2,after=actions)
+        else:
+            actions.pack_forget()
+            bd.pack_forget()
 
     def _conf_text(self, cands: list, field: str = "title", confirmed: bool = True) -> str:
         """字段证据行（v1.9.1 阶段四）：明确区分"已人工确认 / 自动建议 / 待确认"，
@@ -740,18 +794,27 @@ class GroupPanel(ttk.LabelFrame):
     def _refresh_field_hints(self):
         """刷新标题/单位证据行（区分自动建议与已人工确认）。"""
         for field in ("title", "unit"):
-            text = self._conf_text(getattr(self.group, f"{field}_candidates"), field,
-                                  getattr(self.group, f"{field}_confirmed"))
+            status,source,severity,_=presentation.field_info(self.group,field)
+            text=f"{status}\n来源：{source}（点击核对）"
             if not getattr(self.group, field).strip():
                 text = "尚未识别，请先点击顶部“识别标题与填报单位”。" if not self.doc.naming_attempted else (
                     "未找到明确的填报单位，请核对原件后填写。" if field == "unit" else "未找到可靠标题，请按原件填写。")
-            getattr(self, f"{field}_conf_lbl").configure(text=text)
+            getattr(self, f"{field}_conf_lbl").configure(text=text,foreground=presentation.COLORS[severity])
 
     def _on_change(self, field_name: str, *a):
         """字段级确认（v1.8）：编辑哪个字段只确认哪个字段，
         另一个字段的人工待确认状态不受影响。"""
         if self._loading or self.app._busy:
             return
+        self.app.groups.set_current(self.gi)
+        value=(self.title_var if field_name=="title" else self.unit_var).get().strip()
+        if value != getattr(self.group,field_name):
+            if field_name not in self._edit_started:
+                self.app._push_undo()
+                self._edit_started.add(field_name)
+            setattr(self.group,field_name+"_edit_kind","edited")
+        elif not getattr(self.group,field_name+"_edit_kind",""):
+            setattr(self.group,field_name+"_edit_kind","confirmed")
         if field_name == "title":
             self.group.title = self.title_var.get().strip()
             self.group.title_confirmed = bool(self.group.title)
@@ -768,19 +831,22 @@ class GroupPanel(ttk.LabelFrame):
         self._update_filename()
 
     def _update_confirm_badge(self):
-        if not self.group.need_confirm and self.group.title.strip() and self.group.unit.strip():
-            self.confirm_lbl.configure(text="已确认", background="#1e8449", foreground="#ffffff")
+        if presentation.name_ready(self.doc,self.group):
+            label="已人工确认" if self.group.title_manual and self.group.unit_manual else "规则检查通过 · 含自动结果"
+            self.confirm_lbl.configure(text=label, background="#17643c", foreground="#ffffff")
         else:
             pending = []
             if not self.group.boundary_confirmed:
                 pending.append("边界")
+            if self.doc.analysis_stale:
+                pending.append("更新分析")
             if not self.group.title_confirmed or not self.group.title.strip():
                 pending.append("标题")
             if not self.group.unit_confirmed or not self.group.unit.strip():
                 pending.append("填报单位")
             self.confirm_lbl.configure(
-                text=f"{'、'.join(pending)}待确认",
-                background="#d68910", foreground="#ffffff",
+                text=f"{'、'.join(pending) or '拆分检查'}待确认",
+                background="#805200", foreground="#ffffff",
             )
 
     def _update_filename(self):
@@ -795,7 +861,7 @@ class GroupPanel(ttk.LabelFrame):
         if dup and dup > 1:
             self.fname_lbl.configure(text=name + ".pdf  ⚠ 重名 ×" + str(dup), foreground="#a93226")
         else:
-            self.fname_lbl.configure(text=name + ".pdf", foreground="#1a6b3c")
+            self.fname_lbl.configure(text=name + ".pdf", foreground=presentation.COLORS["success" if presentation.name_ready(self.doc,self.group) else "info"])
 
     def _preview(self, page_no: int):
         """定位到指定页（用于查看分组首页 / 边界前后页）。"""
@@ -804,8 +870,12 @@ class GroupPanel(ttk.LabelFrame):
 
     def _show_source(self, field):
         value = getattr(self.group, field)
-        candidates = getattr(self.group, f"{field}_candidates")
-        c = next((c for c in candidates if c.get("text") == value), candidates[0] if candidates else {})
+        candidates = presentation.candidates(self.group,field)
+        c = next((c for c in candidates if c.get("text") == value), {})
+        if getattr(self.group,field+"_edit_kind","")=="edited" or not c:
+            self._preview(self.group.start)
+            messagebox.showinfo("字段来源","当前文字由人工填写或没有对应 OCR 来源。请对照原件核对，不能引用其他候选作为来源。")
+            return
         if c.get("page"):
             self._preview(c["page"])
             if c.get("bbox") and c.get("image_size"):
@@ -815,11 +885,13 @@ class GroupPanel(ttk.LabelFrame):
                 f"来源：{c.get('source', '')}\n文字：{c.get('text', '')}\n"
                 f"依据：{c.get('reason', '')}")
 
-    def focus_pending(self):
+    def focus_pending(self,field=None):
         """定位本组首页，并让面板滚动到可视区（"下一处待确认"用）。"""
         self._preview(self.group.start)
         if self.group.boundary_confirmed and not self.doc.analysis_stale:
-            entry = self.title_entry if not self.group.title_confirmed or not self.group.title.strip() else self.unit_entry
+            field=field or ("title" if not self.group.title_confirmed or not self.group.title.strip() else "unit")
+            self._edit_field(field)
+            entry = getattr(self,field+"_entry")
             entry.focus_set()
             entry.selection_range(0, "end")
         try:
@@ -830,9 +902,11 @@ class GroupPanel(ttk.LabelFrame):
             inner_h = max(self.master.winfo_height(), 1)
             area = getattr(self.app, "groups", None)
             if area is not None:
+                area.set_current(self.gi)
                 bbox = area.canvas.bbox("all")
                 if bbox and bbox[3] > 0:
-                    area.canvas.yview_moveto(max(0.0, (y - 20) / bbox[3]))
+                    target=entry.winfo_rooty()-area.inner.winfo_rooty()-12 if self.group.boundary_confirmed and not self.doc.analysis_stale else y-20
+                    area.canvas.yview_moveto(max(0.0, target / bbox[3]))
         except Exception:
             pass
 
@@ -860,6 +934,13 @@ class GroupPanelArea(ttk.Frame):
         self._pending_pages: list[int] = []
         self._pending_cursor = -1
         self._doc = None
+        self.current_group=0
+        footer=ttk.Frame(self,padding=(6,4))
+        footer.pack(side="bottom",fill="x")
+        self.current_label=ttk.Label(footer,text="",wraplength=400,foreground=presentation.COLORS["info"])
+        self.current_label.pack(fill="x")
+        self.confirm_next_btn=ttk.Button(footer,text="确认当前文件名称并看下一份",style="Primary.TButton",command=self.confirm_current)
+        self.confirm_next_btn.pack(fill="x",pady=(4,0))
 
         self.canvas = tk.Canvas(self, highlightthickness=0)
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
@@ -874,7 +955,7 @@ class GroupPanelArea(ttk.Frame):
         self.panels = []
 
     def set_document(self, doc):
-        for p in self.panels:
+        for p in self.inner.winfo_children():
             p.destroy()
         self.panels = []
         self._pending_panels = []
@@ -883,6 +964,8 @@ class GroupPanelArea(ttk.Frame):
         self._doc = doc
         if doc is None:
             self.summary_lbl.configure(text="")
+            self.current_label.configure(text="尚无文件名称")
+            self.confirm_next_btn.state(["disabled"])
             return
         history = self.app.unit_history.items
         for gi, g in enumerate(doc.groups):
@@ -895,10 +978,25 @@ class GroupPanelArea(ttk.Frame):
                     bind_wheel(child)
             bind_wheel(panel)
         if not doc.groups:
-            ttk.Label(self.inner, text="尚未分组。请先运行“检测空白页”与“自动分组”。",
+            ttk.Label(self.inner, text="尚无拆分草稿。请点击顶部“开始自动分析”。",
                       foreground="#5d6d7e").pack(pady=12)
         self._update_summary(doc)
+        self.set_current(min(self.current_group,max(0,len(self.panels)-1)))
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def set_current(self,gi):
+        self.current_group=gi
+        if self._doc and 0<=gi<len(self._doc.groups):
+            g=self._doc.groups[gi]
+            self.current_label.configure(text=f"当前文件 {gi+1} · 原第 {g.start}–{g.end} 页")
+            ready=presentation.split_ready(self._doc,g) and not self.app._busy
+            self.confirm_next_btn.state(["!disabled"] if ready else ["disabled"])
+        else:
+            self.confirm_next_btn.state(["disabled"])
+
+    def confirm_current(self):
+        if not self.app._busy and 0<=self.current_group<len(self.panels):
+            self.panels[self.current_group]._confirm_name()
 
     def _scroll_on_wheel(self, event):
         self.canvas.yview_scroll(-int(event.delta/120)*2, "units")
@@ -911,17 +1009,14 @@ class GroupPanelArea(ttk.Frame):
         n_sep = len(doc.separators)
         n_split = len(doc.split_starts)
         n_prop = sum(1 for p in doc.pages if getattr(p, "has_rotation_proposal", False))
-        parts = [f"共 {len(doc.groups)} 组"]
+        parts = [f"文件 {len(doc.groups)} 份"]
         if n_boundary:
-            parts.append(f"⚠ {n_boundary} 组拆分待确认")
+            parts.append(f"拆分待确认 {n_boundary} 份")
         if n_conf:
-            parts.append(f"⚠ {len(n_conf)} 组待确认命名")
+            parts.append(f"名称待确认 {len(n_conf)} 份")
         if n_prop:
-            parts.append(f"⚠ {n_prop} 页有方向建议待处理")
-        if n_sep:
-            parts.append(f"分隔页 {n_sep}（导出排除）")
-        if n_split:
-            parts.append(f"拆分点 {n_split}")
+            parts.append(f"方向待确认 {n_prop} 页")
+        self.rename_btn.pack_forget()
         if n_conf or n_prop or n_boundary:
             self.summary_lbl.configure(
                 text=" · ".join(parts), foreground="#a04000")
@@ -978,6 +1073,80 @@ class GroupPanelArea(ttk.Frame):
 
 
 # -- 日志与进度 ---------------------------------------------------------------
+
+
+class CheckCenter(ttk.Frame):
+    """Workspace-wide issue navigation. Merely selecting never confirms anything."""
+    def __init__(self, master, app):
+        super().__init__(master, padding=8)
+        self.app, self.items = app, {}
+        self._signature = None
+        self.summary = ttk.Label(self, wraplength=430, justify="left")
+        self.summary.pack(fill="x", pady=(0,8))
+        wrap=ttk.Frame(self)
+        wrap.pack(fill="both",expand=True)
+        self.tree=ttk.Treeview(wrap,columns=("location",),show="tree headings",selectmode="browse")
+        self.tree.heading("#0",text="检查事项")
+        self.tree.heading("location",text="位置")
+        self.tree.column("#0",width=265,minwidth=170)
+        self.tree.column("location",width=125,minwidth=90)
+        scroll=ttk.Scrollbar(wrap,command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right",fill="y")
+        self.tree.pack(fill="both",expand=True)
+        for severity,color in presentation.COLORS.items():
+            self.tree.tag_configure(severity,foreground=color)
+        self.tree.bind("<<TreeviewSelect>>",self.selected)
+        self.tree.bind("<Double-1>",lambda e:self.process())
+        self.tree.bind("<Return>",lambda e:self.process())
+        self.reason=ttk.Label(self,text="点击事项查看原因和原页；双击开始处理。",wraplength=430,justify="left")
+        self.reason.pack(fill="x",pady=8)
+        self.process_button=ttk.Button(self,text="处理选中事项",command=self.process)
+        self.process_button.pack(anchor="e")
+        self.bind("<Configure>",lambda e:[w.configure(wraplength=max(180,e.width-20)) for w in (self.summary,self.reason)])
+
+    def set_content(self, issues, ready, total, check_text):
+        signature=(tuple(issues),ready,total,check_text)
+        self.summary.configure(text=f"{ready}/{total} 份文件整理就绪\n{check_text}" if total else "导入 PDF 后，程序会分析页面并在这里列出需要你确认的事项。")
+        if signature == self._signature:
+            self.process_button.state(["disabled"] if self.app._busy or not self.tree.selection() else ["!disabled"])
+            return
+        self._signature=signature
+        self.items={issue.key:issue for issue in issues}
+        old=self.tree.selection()
+        self.tree.delete(*self.tree.get_children())
+        pending=[i for i in issues if i.severity!="error"]
+        blocked=[i for i in issues if i.severity=="error"]
+        for key,title,values,tag in (("pending",f"待处理（{len(pending)} 项）",pending,"warning"),("blocked",f"导出 / 处理阻断（{len(blocked)} 项）",blocked,"error")):
+            self.tree.insert("","end",iid=key,text=title,open=True,tags=(tag,))
+            for issue in values:
+                doc=self.app.ws.documents[issue.doc_index] if self.app.ws.documents else None
+                location=f"PDF {issue.doc_index+1} · 第 {issue.page} 页" if doc else "工作区"
+                self.tree.insert(key,"end",iid=issue.key,text=issue.label,values=(location,),tags=(issue.severity,))
+        self.tree.insert("","end",iid="done",text=f"已完成：{ready} 份整理就绪",tags=("success",))
+        if old and old[0] in self.items:
+            self.tree.selection_set(old[0])
+        else:
+            self.reason.configure(text="点击事项查看原因和原页；双击或点按钮开始处理。")
+            self.process_button.state(["disabled"])
+
+    def selected(self, _event=None):
+        selected=self.tree.selection()
+        issue=self.items.get(selected[0]) if selected else None
+        if issue:
+            doc=self.app.ws.documents[issue.doc_index]
+            self.reason.configure(text=f"{doc.name}\n{issue.reason}",foreground=presentation.COLORS[issue.severity])
+            self.process_button.state(["disabled"] if self.app._busy else ["!disabled"])
+            if not self.app._busy:
+                self.app.navigate_issue(issue, process=False)
+        else:
+            self.process_button.state(["disabled"])
+
+    def process(self):
+        selected=self.tree.selection()
+        issue=self.items.get(selected[0]) if selected else None
+        if issue and not self.app._busy:
+            self.app.navigate_issue(issue,process=True)
 
 
 class LogPanel(ttk.Frame):
@@ -1049,7 +1218,8 @@ class ExportSummaryDialog(tk.Toplevel):
         self.title("导出前检查")
         self.transient(master)
         self.resizable(True, True)
-        self.geometry("640x560")
+        self.geometry(f"{min(920,self.winfo_screenwidth()-100)}x{min(650,self.winfo_screenheight()-120)}")
+        self.minsize(760,520)
         self.result = {"items": [], "strict": True, "confirmed": False}
         self._docs = docs
         self._name_of = name_of
@@ -1102,7 +1272,7 @@ class ExportSummaryDialog(tk.Toplevel):
             for gi, g in enumerate(doc.groups):
                 idx += 1
                 name = self._name_of(doc, gi, g)
-                state = "已确认" if not g.need_confirm else "待确认"
+                state = "人工确认" if g.title_manual and g.unit_manual and not g.need_confirm else "规则通过" if not g.need_confirm else "待确认"
                 if not g.title.strip() or not g.unit.strip():
                     state = "字段缺失"
                 if stats.get("dup", {}).get(name):

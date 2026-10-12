@@ -17,7 +17,7 @@ def next_step(docs):
         return NextStep(0, "open", "导入需要整理的扫描 PDF", "可多选或直接拖入窗口。源文件始终保留。", "选择 PDF…")
     for i, doc in enumerate(docs):
         if not doc.analysis_complete:
-            return NextStep(1, "analyze", "文件已导入，开始自动拆分", "系统先检查方向和文档边界，结果作为草稿供你检查。", "开始自动拆分", i)
+            return NextStep(1, "analyze", "文件已导入，开始自动分析", "在本机检查空白、方向与文件交界，生成拆分草稿；不确定的结果交给你确认。", "开始自动分析", i)
     for i, doc in enumerate(docs):
         count = sum(p.has_rotation_proposal for p in doc.pages)
         if count:
@@ -35,5 +35,5 @@ def next_step(docs):
             return NextStep(3, "name", "拆分已确认，可以识别文件名", "只提取标题和明确标注的填报单位，找不到的内容由你补填。", "识别标题与填报单位", i)
     for i, doc in enumerate(docs):
         if any(g.need_confirm or not g.title.strip() or not g.unit.strip() for g in doc.groups):
-            return NextStep(3, "names", f"{doc.name}：检查文件名称", "右侧直接修改标题、填报单位；核对后点“确认本份名称并看下一份”。", "定位待确认名称", i)
+            return NextStep(3, "names", f"{doc.name}：确认文件名称", "在文件名称卡片核对标题、填报单位及来源；需要改字时点“修改”。", "定位待确认名称", i)
     return NextStep(4, "export", "已准备好导出", "检查导出清单、页码范围及排除页，再选择保存位置。", "查看清单并导出…")
