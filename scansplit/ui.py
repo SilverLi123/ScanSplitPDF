@@ -945,8 +945,8 @@ class App:
                 self.log("拆分草稿已更新。点击顶部主要操作，继续检查方向和拆分。")
         self._start_task("automatic", work, on_done, title="自动拆分")
 
-    def review_pending(self):
-        doc = self._active_doc()
+    def review_pending(self, doc=None):
+        doc = doc or self._active_doc()
         if doc and not self._busy:
             if self._review_dialog and self._review_dialog.winfo_exists():
                 if self._review_dialog.doc is doc:
@@ -1027,11 +1027,7 @@ class App:
         self._refresh_all()
 
     def show_direction_proposals(self, doc):
-        pages = [p.src_index for p in doc.pages if p.has_rotation_proposal]
-        results = [autoname.DirectionResult(p, {}, doc.pages[p-1].rotation_proposal,
-                   doc.pages[p-1].rotation_proposal_note,
-                   doc.pages[p-1].rotation_proposal_confidence) for p in pages]
-        DirectionDialog(self.root, self, doc, pages, results, {}, "待确认")
+        self.review_pending(doc)
 
     def _log_migrate_notes(self, doc):
         """转述 refresh_groups 的迁移/歧义说明（v1.8：人工编辑不静默丢失）。"""

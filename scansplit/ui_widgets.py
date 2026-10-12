@@ -143,7 +143,7 @@ class ThumbnailStrip(ttk.Frame):
             key = (p, rot)
             if key not in self._photos:
                 pil = img.resize((nw, nh)) if (nw, nh) != img.size else img
-                self._photos[key] = ImageTk.PhotoImage(pil)
+                self._photos[key] = ImageTk.PhotoImage(pil, master=self.canvas)
             self.canvas.create_image(THUMB_CELL_W // 2, y0 + 6, image=self._photos[key], anchor="n")
             img_h = nh
         except Exception:
@@ -451,7 +451,7 @@ class PreviewPane(ttk.Frame):
             return
         self._img = img
         self.app.clear_preview_error(doc,self._page_no)
-        self._photo = ImageTk.PhotoImage(img)
+        self._photo = ImageTk.PhotoImage(img, master=self.canvas)
         self.canvas.delete("all")
         self._place()
         self.canvas.xview_moveto(fx)

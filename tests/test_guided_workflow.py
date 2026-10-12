@@ -211,7 +211,10 @@ def test_small_review_keeps_decision_buttons_visible(ui_env, make_scan):
         d.analysis_complete = True
         d.pending_boundaries = {3:"test"}
         dialog = ReviewDialog(root, app, d)
+        root.update()
+        dialog.state("normal")
         dialog.geometry("960x640")
+        dialog.notebook.select(dialog.comparison)
         root.update()
         button = dialog.split_button
         assert button.winfo_y()+button.winfo_height() <= dialog.actions.winfo_height()
