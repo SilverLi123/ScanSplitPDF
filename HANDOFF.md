@@ -1,6 +1,14 @@
 # ScanSplit PDF — 项目交接文档（给接手的 Agent）
 
-## 当前维护入口：v1.18.0
+## 当前维护入口：v1.18.1
+
+基线 `22ebf02`，分支 `codex/reliable-scansplit`。本轮修复导出检查头部长排除信息挤掉按钮、标题多行拼接附带“页次：1”。主要改 `ui_widgets.ExportSummaryDialog`（固定grid按钮/可滚动完整详情）和 `ocrfields.extract_title`（过滤元数据的行副本，原OCR留给页码分析）。未修改拆分、方向、导出或验证算法。15项新增测试，最终505项全部通过；首轮旧OCR30秒超时、单项与完整复测均通过，未放宽要求。
+
+完整 computer-use 实际EXE操作指定81页图片样本，输出 `D:/pdf-test`：12份64页，17明确空白排除，源SHA/去向/保真检查通过。初次自动分析仍1组63待确认，全部人工审交界后得到12组；11份人工名称确认，其中1份补填单位。首轮分析约8分15秒，审核后更新49秒，导出1–2秒；完整Agent GUI墙钟49分47秒包含工具等待，不计人工速度。尚未达到少量确认，应先诊断清晰小字页码证据未通过的原因，不能降低可靠性门槛。
+
+运行包 `D:/ScanSplitPDF-Reliable-1.18.1`，EXE自检0、21模块/模型配置/TclTk一致。当前交付说明 `work/v1181-delivery-report.md`，当前验证以 `TEST_REPORT.md` 为准；用户源文件及成品不提交Git。
+
+## v1.18.0 历史维护记录
 
 当前版本1.18.0，分支 `codex/reliable-scansplit`，基线 `9075a33`（v1.17.1，461项）。用户最新授权现有方向建议直接应用，再集中审核。最新操作与交付说明：`work/v118-user-guide.md`、`work/v118-delivery-report.md`。最终验证以当前 `TEST_REPORT.md` 和独立运行包验证记录为准。
 

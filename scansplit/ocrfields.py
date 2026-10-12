@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .ocr import OcrLine
 
@@ -49,6 +49,15 @@ PLACE_STOPWORDS = {
 
 DATE_PATTERN = re.compile(r"^[\d〇○零一二三四五六七八九十]{4}年[\d〇○零一二三四五六七八九十]{1,2}月[\d〇○零一二三四五六七八九十]{1,3}日?$")
 PAGE_NO_PATTERN = re.compile(r"^[-—\s]*\d{1,4}[-—\s]*$")
+# Form pagination is metadata even when printed immediately below the title.
+TITLE_PAGE_SUFFIX = re.compile(
+    r"\s*(?:页\s*次|页\s*码)\s*[：:]\s*\d{1,4}(?:\s*[/／]\s*\d{1,4})?\s*$"
+)
+TITLE_PAGE_LINE = re.compile(
+    r"^(?:(?:页\s*次|页\s*码)\s*[：:]?\s*\d{1,4}(?:\s*[/／]\s*\d{1,4})?"
+    r"|第\s*\d{1,4}\s*页(?:\s*共\s*\d{1,4}\s*页)?)$"
+)
+TITLE_DATE_LINE = re.compile(r"^\d{4}年\s*\d{1,2}月(?:\s*\d{1,2}日)?$")
 RECIPIENT_PATTERN = re.compile(r"(主送|抄送|致|呈|报：|送：)|^各.{0,20}[：:]$")
 # 表格/表单里的明确单位标注行："填报单位：教务处"、"部门：教务办公室"。
 # 这类行含"："无法被 UNIT_PATTERN 整行匹配，但比落款几何推断更可靠。
@@ -176,6 +185,13 @@ def _join_multiline_title(lines: list[OcrLine], img_w: float) -> str:
 
 def extract_title(lines: list[OcrLine], img_w: float, img_h: float) -> list[FieldCandidate]:
     """标题候选：页面上方区域中标题特征最强的行（支持多行拼接）。"""
+    # Work on copies: keep the original OCR text/coordinates for pagination and audit.
+    # Reject standalone metadata and strip only an explicit numeric pagination suffix.
+    lines = [replace(l, text=TITLE_PAGE_SUFFIX.sub("", l.text).strip())
+             for l in lines if not _is_date_or_pageno(l)
+             and not TITLE_PAGE_LINE.fullmatch(l.text.strip())
+             and not TITLE_DATE_LINE.fullmatch(l.text.strip())]
+    lines = [l for l in lines if l.text]
     if not lines:
         return []
     max_h = max(l.height for l in lines)

@@ -1235,7 +1235,9 @@ class ExportSummaryDialog(tk.Toplevel):
         self.transient(master)
         self.resizable(True, True)
         self.geometry(f"{min(920,self.winfo_screenwidth()-100)}x{min(650,self.winfo_screenheight()-120)}")
-        self.minsize(760,520)
+        self.minsize(min(760, self.winfo_screenwidth()-80), min(520, self.winfo_screenheight()-100))
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
         self.result = {"items": [], "strict": True, "confirmed": False}
         self._docs = docs
         self._name_of = name_of
@@ -1243,7 +1245,7 @@ class ExportSummaryDialog(tk.Toplevel):
         self._vars: list[tuple[object, tk.BooleanVar]] = []
 
         head = ttk.Frame(self, padding=(12, 10, 12, 4))
-        head.pack(fill="x")
+        head.grid(row=0, column=0, sticky="ew")
         ttk.Label(head, text="导出前检查摘要", font=("Segoe UI", 12, "bold")).pack(anchor="w")
         ttk.Label(
             head,
@@ -1254,16 +1256,18 @@ class ExportSummaryDialog(tk.Toplevel):
         ex = stats.get("excluded") or []
         ttk.Label(
             head,
-            text=("排除原始页：" + "、".join(ex[:8]) + ("……" if len(ex) > 8 else "")) if ex
+            text=f"排除原始页 {len(ex)} 页（完整页码与依据见下方详情，可返回恢复）" if ex
             else "无被排除的原始页",
             foreground="#a93226" if ex else "#1e8449",
             wraplength=600, justify="left",
         ).pack(anchor="w", pady=(2, 0))
 
         # -- 清单表 ----------------------------------------------------------
-        ttk.Label(self, text="导出清单（取消勾选可跳过该组）：",
+        body = ttk.Frame(self)
+        body.grid(row=1, column=0, sticky="nsew")
+        ttk.Label(body, text="导出清单（取消勾选可跳过该组）：",
                   padding=(12, 6, 12, 0)).pack(anchor="w")
-        wrap = ttk.Frame(self)
+        wrap = ttk.Frame(body)
         wrap.pack(fill="both", expand=True, padx=12, pady=(2, 6))
         cols = ("on", "idx", "pages", "name", "state")
         self.tree = ttk.Treeview(wrap, columns=cols, show="headings", height=9)
@@ -1302,8 +1306,13 @@ class ExportSummaryDialog(tk.Toplevel):
         self._refresh_marks()
 
         # -- 问题区 ----------------------------------------------------------
-        info = tk.Text(self, height=6, wrap="word", font=("Segoe UI", 9))
-        info.pack(fill="x", padx=12)
+        details = ttk.Frame(self)
+        details.grid(row=2, column=0, sticky="ew", padx=12)
+        self.details = info = tk.Text(details, height=6, wrap="word", font=("Segoe UI", 9))
+        detail_scroll = ttk.Scrollbar(details, orient="vertical", command=info.yview)
+        info.configure(yscrollcommand=detail_scroll.set)
+        detail_scroll.pack(side="right", fill="y")
+        info.pack(side="left", fill="both", expand=True)
         lines = []
         if integrity_issues:
             lines.append("【页面完整性】以下问题不可放宽，正式导出被阻断：")
@@ -1317,20 +1326,25 @@ class ExportSummaryDialog(tk.Toplevel):
                 lines.append("  ……")
         if not lines:
             lines.append("未发现阻断项，可直接导出。")
+        if ex:
+            lines.append(f"\n【排除原始页 · {len(ex)} 页】只从输出排除，原文件不变：")
+            lines.extend("  · " + m for m in ex)
         info.insert("1.0", "\n".join(lines))
         info.configure(state="disabled")
 
         # -- 按钮 ------------------------------------------------------------
         btns = ttk.Frame(self, padding=(12, 6, 12, 12))
-        btns.pack(fill="x")
+        btns.grid(row=3, column=0, sticky="ew")
+        self.buttons = btns
         ttk.Button(btns, text="取消", width=10, command=self._cancel).pack(side="right")
         if integrity_blocked:
             ttk.Button(btns, text="返回修改", width=12, command=self._cancel).pack(side="right", padx=6)
             ttk.Button(btns, text="关闭", width=10, command=self._cancel).pack_forget()
         else:
-            ok = ttk.Button(btns, text="按清单导出", width=14, command=self._confirm_strict)
+            self.export_button = ok = ttk.Button(btns, text="按清单导出", width=14, command=self._confirm_strict)
             ok.pack(side="right", padx=6)
         self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda e: self._cancel())
         self.update_idletasks()
         self.grab_set()
 
