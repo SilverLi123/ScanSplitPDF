@@ -284,21 +284,26 @@ def test_step_state_and_guide(ui_env, tmp_path, make_scan):
         app = App(root)
         # 无文档：检测/分组/命名/导出全部置灰
         app._update_step_state(0, False, 0, 0)
-        for key in ("detect", "group", "ocr", "direction", "review", "export"):
+        for key in ("detect", "group", "ocr", "review", "export"):
             assert app.tool_btns[key].instate(["disabled"]), key
-        assert "打开 PDF" in app.hint_var.get()
-        # 已分组：后续步骤启用，提示导出/确认
-        app._update_step_state(1, True, 2, 0)
-        for key in ("detect", "group", "ocr", "direction", "review", "export"):
-            assert app.tool_btns[key].instate(["!disabled"]), key
-        # 有待确认字段时提示确认
-        app._update_step_state(1, True, 2, 1)
-        assert "待确认" in app.hint_var.get()
+        assert "选择 PDF" in app.hint_var.get()
         # 空状态引导页绘制不报错
         app.preview.show_guide()
         # 带文档时 show() 正常回归（引导页不影响预览）
         scan = make_scan("guide.pdf", ["text"])
         app.import_files([str(scan)])
+        doc = app._active_doc()
+        app.update_status()
+        assert app.tool_btns["ocr"].instate(["disabled"])
+        assert "自动拆分" in app.hint_var.get()
+        doc.analysis_complete = True
+        doc.groups[0].boundary_confirmed = True
+        app.update_status()
+        assert app.tool_btns["ocr"].instate(["!disabled"])
+        assert "识别标题" in app.hint_var.get()
+        doc.naming_attempted = True
+        app.update_status()
+        assert "待确认名称" in app.hint_var.get()
         app.on_page_select(1, preview=True)
         assert app.preview._photo is not None
     finally:

@@ -23,7 +23,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import autoname, blankdetect, exporter, grouping, loader, naming, rotation, settings, splitctx, pipeline
+from . import autoname, blankdetect, exporter, grouping, loader, naming, rotation, settings, splitctx, pipeline, workflow
+from .review_ui import ReviewDialog
 from .loader import LoadError
 from .model import ScanDocument, Workspace
 from .ocr import OcrEngine
@@ -57,6 +58,8 @@ class App:
         self.undo_stack: list[dict] = []
         self.redo_stack: list[dict] = []
         self._busy = False
+        self._review_dialog = None
+        self._log_visible = False
         # v1.9 后台任务：单工作线程 + Queue/root.after 回传（UI 不冻结）
         self.tasks = TaskManager(root, self.log)
         self.tasks.progress_hook = self._on_task_progress
@@ -71,7 +74,7 @@ class App:
         except (TypeError, ValueError):
             self.preview.zoom = 1.0
         self.preview.fit_mode = bool(self.settings.get("fit_mode", True))
-        self.update_status()
+        self._refresh_all()
         enable_drag_drop(self.root, self.import_files_async)
         self.log("就绪。请打开 PDF 文件（可多选或直接拖入窗口）。")
 
@@ -81,40 +84,54 @@ class App:
         root = self.root
         root.title("ScanSplit PDF — 扫描件拆分与命名工具")
 
-        tools = ttk.Frame(root, padding=(6, 4))
+        style = ttk.Style(root)
+        style.configure("Primary.TButton", font=("Microsoft YaHei UI", 10, "bold"), padding=(16, 8))
+        style.configure("Step.TLabel", font=("Microsoft YaHei UI", 10), padding=(12, 6))
+        steps = ttk.Frame(root, padding=(8, 4))
+        steps.pack(fill="x")
+        self.step_labels = []
+        for text in ("1  导入", "2  自动拆分", "3  检查拆分", "4  检查名称", "5  导出"):
+            label = ttk.Label(steps, text=text, style="Step.TLabel")
+            label.pack(side="left", expand=True, fill="x")
+            self.step_labels.append(label)
+
+        guide = ttk.Frame(root, padding=(18, 8, 18, 12))
+        guide.pack(fill="x")
+        self.next_button = ttk.Button(guide, style="Primary.TButton", command=self.workflow_next)
+        self.next_button.pack(side="right", padx=(16, 0))
+        self.workflow_title = tk.StringVar()
+        self.workflow_detail = tk.StringVar()
+        title_label = ttk.Label(guide, textvariable=self.workflow_title, font=("Microsoft YaHei UI", 12, "bold"))
+        title_label.pack(anchor="w")
+        detail_label = ttk.Label(guide, textvariable=self.workflow_detail, foreground="#49566a", wraplength=800)
+        detail_label.pack(anchor="w", pady=(4, 0))
+        guide.bind("<Configure>", lambda e: [label.configure(wraplength=max(300, e.width-self.next_button.winfo_reqwidth()-60)) for label in (title_label,detail_label)])
+        tools = ttk.Frame(root, padding=(8, 4))
         tools.pack(fill="x")
-        # 工具栏按工作流分三段（参考 pdf-split-and-rename 的步骤化流程）：
-        # ①拆分 → ②命名/检查 → ③导出；未就绪的按钮自动置灰（见 _update_step_state）。
         self.tool_btns: dict[str, ttk.Button] = {}
+        for key, text, cmd in [
+            ("open", "添加 PDF…", self.open_dialog),
+            ("detect", "重新自动拆分", self.automatic_split),
+            ("group", "查看 / 调整拆分", self.review_pending),
+            ("ocr", "重新识别名称", self.ocr_name),
+            ("export", "导出清单…", self.export_all),
+        ]:
+            b = ttk.Button(tools, text=text, command=cmd)
+            b.pack(side="left", padx=3)
+            self.tool_btns[key] = b
+        self.tool_btns["review"] = self.tool_btns["group"]
+        more = ttk.Menubutton(tools, text="更多操作")
+        menu = tk.Menu(more, tearoff=False)
+        for text, cmd in [("撤销上一步", self.undo), ("重做", self.redo),
+                          ("重新检查方向…", self.direction_analyze),
+                          ("设置命名格式…", self.open_settings),
+                          ("使用帮助", self.show_help), ("显示 / 隐藏处理记录", self.toggle_log)]:
+            menu.add_command(label=text, command=cmd)
+        more.configure(menu=menu)
+        more.pack(side="right", padx=4)
+        self.more_button = more
 
-        def tool_section(title: str, cmds: list[tuple[str, str, object]]):
-            ttk.Label(tools, text=title, foreground="#5d6d7e",
-                      font=("Segoe UI", 9, "bold")).pack(side="left", padx=(10, 2))
-            for key, text, cmd in cmds:
-                b = ttk.Button(tools, text=text, command=cmd)
-                b.pack(side="left", padx=2)
-                self.tool_btns[key] = b
-
-        tool_section("① 拆分", [
-            ("open", "打开 PDF…", self.open_dialog),
-            ("detect", "自动拆分", self.automatic_split),
-            ("group", "检查拆分", self.review_pending),
-        ])
-        tool_section("② 命名 / 检查", [
-            ("ocr", "OCR 自动命名（本地）", self.ocr_name),
-            ("direction", "识别方向", self.direction_analyze),
-            ("review", "待处理问题", self.review_pending),
-        ])
-        tool_section("③ 导出", [
-            ("export", "导出全部…", self.export_all),
-        ])
-        tool_section("其他", [
-            ("undo", "撤销", self.undo),
-            ("redo", "重做", self.redo),
-            ("settings", "设置…", self.open_settings),
-        ])
-
-        paned = ttk.PanedWindow(root, orient="horizontal")
+        paned = ttk.PanedWindow(root, orient="horizontal", height=250)
         paned.pack(fill="both", expand=True, padx=4, pady=2)
 
         left = ttk.Frame(paned)
@@ -124,19 +141,30 @@ class App:
         self.file_list.pack(fill="x")
         self.file_list.bind("<<ListboxSelect>>", self._on_file_select)
         self.file_list.bind("<Button-3>", self._on_file_menu)
-        ttk.Label(left, text="页面缩略图（右键：分隔/旋转；Ctrl/Shift 多选）").pack(anchor="w", padx=4, pady=(4, 0))
+        ttk.Label(left, text="原始页面 · 点击预览").pack(anchor="w", padx=4, pady=(4, 0))
         self.thumbs = ThumbnailStrip(left, self)
         self.thumbs.pack(fill="both", expand=True, padx=2, pady=(0, 4))
 
         self.preview = PreviewPane(paned, self)
 
-        right = ttk.LabelFrame(paned, text="文档分组（标题/单位可修改）", padding=2)
+        right = ttk.LabelFrame(paned, text="拆分草稿 / 文件名称", padding=2, width=400)
+        self.right_panel = right
         self.groups = GroupPanelArea(right, self)
         self.groups.pack(fill="both", expand=True)
 
         paned.add(left, weight=1)
         paned.add(self.preview, weight=4)
         paned.add(right, weight=3)
+        self._pane_width = None
+        def size_panes(event):
+            if event.width == self._pane_width:
+                return
+            self._pane_width = event.width
+            left_width = 190 if event.width >= 1300 else 170
+            right_width = 440
+            paned.sashpos(0, left_width)
+            paned.sashpos(1, max(left_width+260, event.width-right_width))
+        paned.bind("<Configure>", size_panes)
 
         bottom = ttk.Frame(root, padding=(6, 0, 6, 4))
         bottom.pack(fill="x")
@@ -149,7 +177,6 @@ class App:
         ttk.Label(status_row, textvariable=self.hint_var, foreground="#1a5276",
                   font=("Segoe UI", 9, "bold")).pack(side="right")
         self.log_panel = LogPanel(bottom)
-        self.log_panel.pack(fill="x", pady=(2, 0))
 
         root.bind("<Control-o>", lambda e: self.open_dialog())
         root.bind("<Control-z>", lambda e: self.undo(from_key=True))
@@ -158,6 +185,57 @@ class App:
         root.bind("<Left>", lambda e: self._nav_key(-1))
         root.bind("<Right>", lambda e: self._nav_key(1))
         root.bind("<Delete>", lambda e: self._delete_key())
+
+    def toggle_log(self):
+        self._log_visible = not self._log_visible
+        if self._log_visible:
+            self.log_panel.pack(fill="x", pady=(2, 0))
+        else:
+            self.log_panel.pack_forget()
+
+    def show_help(self):
+        messagebox.showinfo("如何整理扫描 PDF", "按顶部的大按钮往下走：\n\n"
+            "1. 选择 PDF → 开始自动拆分。\n"
+            "2. 检查窗口会先让你把页面转正，再检查文件交界。\n"
+            "   左右页属于不同文件：选“这里开始新文件”。\n"
+            "   是续页或附件：选“属于上一份”。\n"
+            "   空白页默认保留，只有明确确认才排除。\n"
+            "3. 拆分确认后识别名称，右侧修改标题和填报单位。\n"
+            "4. 核对导出清单，选择保存位置。\n\n"
+            "暂时拿不准可稍后处理；待确认结果无法正式导出。人工决定可撤销，源文件保持不变。")
+
+    def activate_document(self, index):
+        self.doc_index = index
+        self.current_page, self.sel_pages = 1, {1}
+        self._refresh_all()
+
+    def workflow_next(self):
+        if self._busy:
+            return
+        step = workflow.next_step(self.ws.documents)
+        if self.ws.documents and step.action not in ("analyze", "name", "export"):
+            self.activate_document(step.doc_index)
+        if step.action == "open":
+            self.open_dialog()
+        elif step.action in ("analyze", "reanalyze"):
+            self.automatic_split(guided=True)
+        elif step.action == "review":
+            self.review_pending()
+        elif step.action == "name":
+            self.ocr_name()
+        elif step.action == "names":
+            self.focus_next_name()
+        else:
+            self.export_all()
+
+    def focus_next_name(self):
+        for i, doc in enumerate(self.ws.documents):
+            for gi, group in enumerate(doc.groups):
+                if not group.title_confirmed or not group.unit_confirmed or not group.title.strip() or not group.unit.strip():
+                    if self._active_doc() is not doc:
+                        self.activate_document(i)
+                    self.groups.panels[gi].focus_pending()
+                    return
 
     # -- 基础状态 -----------------------------------------------------------
 
@@ -218,12 +296,16 @@ class App:
             has_blank_analysis = self._blank_analysis_done()
             n_groups = sum(len(d.groups) for d in docs)
             n_conf = sum(1 for d in docs for g in d.groups if g.need_confirm)
+        docs = self.ws.documents
+        boundaries_ready = bool(docs) and all(d.groups and not d.pending_boundaries
+            and not d.analysis_stale and not any(p.has_rotation_proposal for p in d.pages)
+            and all(g.boundary_confirmed for g in d.groups) for d in docs)
         readiness = {
+            "open": True,
             "detect": n_docs > 0,
             "group": n_docs > 0 and has_blank_analysis,
-            "ocr": n_docs > 0 and n_groups > 0,
-            "direction": n_docs > 0 and n_groups > 0,
-            "review": n_docs > 0 and n_groups > 0,
+            "ocr": boundaries_ready,
+            "review": n_docs > 0 and has_blank_analysis,
             "export": n_docs > 0 and n_groups > 0,
         }
         for key, ready in readiness.items():
@@ -239,20 +321,18 @@ class App:
                 set_edit_state(child)
         if hasattr(self, "groups"):
             set_edit_state(self.groups)
-        if not n_docs:
-            hint = "下一步：打开 PDF（可拖入窗口）"
-        elif not has_blank_analysis:
-            hint = "下一步：自动拆分（检测空白、检查方向和文档边界）"
-        elif not n_groups:
-            if self._has_blank_candidates():
-                hint = "下一步：自动分组"
-            else:
-                hint = "未检测到空白页（连续件）：下一步“复核拆分/补拆”建立分组"
-        elif n_conf:
-            hint = "下一步：检查待确认的拆分边界，再确认标题与填报单位"
-        else:
-            hint = "下一步：检查导出清单，然后导出"
-        self.hint_var.set(hint)
+            self.groups.next_btn.state(["!disabled"] if docs and not self._busy else ["disabled"])
+            self.groups.rename_btn.state(["!disabled"] if boundaries_ready and not self._busy else ["disabled"])
+        step = workflow.next_step(docs)
+        self.hint_var.set("下一步：" + step.button)
+        self.workflow_title.set("正在处理，请稍候…" if self._busy else step.title)
+        self.workflow_detail.set("可在进度窗口取消。完成后会继续提示下一步。" if self._busy else step.detail)
+        self.next_button.configure(text=step.button)
+        self.next_button.state(["disabled"] if self._busy else ["!disabled"])
+        self.more_button.state(["disabled"] if self._busy else ["!disabled"])
+        for i, label in enumerate(self.step_labels):
+            label.configure(foreground="#155cad" if i == step.stage else "#596579",
+                            font=("Microsoft YaHei UI", 10, "bold" if i == step.stage else "normal"))
 
     def _has_blank_candidates(self) -> bool:
         return any(
@@ -332,10 +412,13 @@ class App:
         self.ws.restore(snap)
 
     def _start_task(self, kind, work, on_done, title) -> bool:
+        # A tiny/cached job can finish during start()'s first queue poll.
+        # Set busy before dispatch so its completion cannot be overwritten.
+        self._busy = True
         if not self.tasks.start(kind, work, on_done, title=title):
+            self._busy = self.tasks.busy
             messagebox.showinfo("请稍候", "当前已有任务在后台运行，请等待完成或先取消。")
             return False
-        self._busy = True
         self._update_step_state()
         return True
 
@@ -689,10 +772,10 @@ class App:
 
         self._start_task("autogroup", work, on_done, title="自动分组（上下文判定）")
 
-    def automatic_split(self):
+    def automatic_split(self, guided=False, only_doc=None, on_complete=None):
         if self._busy or not self.ws.documents:
             return
-        docs = list(self.ws.documents)
+        docs = [only_doc] if only_doc else list(self.ws.documents)
         self._push_undo()
         snap = self.ws.snapshot()
 
@@ -712,17 +795,23 @@ class App:
                 self.log("自动拆分已回滚：" + (error.splitlines()[-1] if error else "用户取消"))
                 return
             self._refresh_all()
-            n = sum(len(d.pending_boundaries) for d in docs)
-            rotations = sum(p.has_rotation_proposal for d in docs for p in d.pages)
-            messagebox.showinfo("自动拆分完成", f"已生成 {sum(len(d.groups) for d in docs)} 份草稿。\n"
-                f"待确认边界 {n} 处，待处理方向 {rotations} 页。\n"
-                "先检查拆分与方向，再点击自动命名；内部与不确定空白均保留。")
+            if on_complete:
+                on_complete()
+            elif guided:
+                step = workflow.next_step(self.ws.documents)
+                self.activate_document(step.doc_index)
+                self.review_pending()
+            else:
+                self.log("拆分草稿已更新。点击顶部主要操作，继续检查方向和拆分。")
         self._start_task("automatic", work, on_done, title="自动拆分")
 
     def review_pending(self):
         doc = self._active_doc()
         if doc and not self._busy:
-            ReviewDialog(self.root, self, doc)
+            if self._review_dialog and self._review_dialog.winfo_exists():
+                self._review_dialog.lift()
+                return
+            self._review_dialog = ReviewDialog(self.root, self, doc)
 
     def resolve_boundary(self, page_no, split, doc=None):
         doc = doc or self._active_doc()
@@ -776,6 +865,9 @@ class App:
         if self._busy:
             return
         g = doc.groups[gi]
+        if doc.analysis_stale:
+            self.review_pending()
+            return
         if any(g.start <= p <= g.end + 1 for p in doc.pending_boundaries):
             self.review_pending()
             return
@@ -859,6 +951,8 @@ class App:
                 return
             self._refresh_all()
             still = sum(1 for gi in targets if gi < len(doc.groups) and doc.groups[gi].need_confirm)
+            doc.naming_attempted = True
+            self.update_status()
             self.log(f"重新识别完成：处理 {len(targets)} 组，仍有 {still} 组待确认"
                      "（人工已确认字段未被覆盖）。")
             messagebox.showinfo(
@@ -991,6 +1085,7 @@ class App:
             # 文档被移除的组不进历史
             for doc in docs:
                 if self._doc_still_open(doc):
+                    doc.naming_attempted = True
                     for g in doc.groups:
                         if g.unit.strip() and g.unit_confirmed and g.boundary_confirmed:
                             self.unit_history.add(g.unit)
@@ -1002,13 +1097,7 @@ class App:
                 return
             self.log(f"OCR 自动命名完成：待确认 {n_conf} 组。")
             if n_conf:
-                messagebox.showinfo(
-                    "OCR 自动命名完成",
-                    f"共 {total_g} 组，其中 {n_conf} 组存在不确定字段（右侧面板橙色“待确认”标记）。\n"
-                    "请人工确认或修改标题/单位后再导出。",
-                )
-            else:
-                messagebox.showinfo("OCR 自动命名完成", "全部组的标题/单位已提取，无待确认项。")
+                self.focus_next_name()
 
         self._start_task("ocrname", work, on_done, title="OCR 自动命名（本地）")
 
@@ -1154,6 +1243,7 @@ class App:
                 ps.rotation = int(angle) % 360
                 ps.rotation_proposal = None  # 建议已被采纳，清除暂存
                 if doc.analysis_complete:
+                    doc.analysis_stale = True
                     doc.pending_boundaries[p] = "方向已变化，请重新自动拆分以更新页面证据"
                     for g in doc.groups:
                         if g.start <= p <= g.end:
@@ -1413,14 +1503,8 @@ class App:
         if not total_g:
             messagebox.showinfo("导出", "尚未分组。请先运行“自动分组”。")
             return
-        out_dir = filedialog.askdirectory(
-            title="选择导出目录",
-            initialdir=self.settings.get("output_dir") or str(Path.home()),
-        )
-        if not out_dir:
-            return
         template = self.template_var.get() or naming.DEFAULT_TEMPLATE
-        opts = exporter.ExportOptions(template=template, out_dir=out_dir, strict=True)
+        opts = exporter.ExportOptions(template=template, strict=True)
         field_issues, integrity_issues, stats = self.export_summary(docs, opts)
 
         # v1.9.1 改进3：统一改用「可勾选清单」对话框，替代一行 askyesno。
@@ -1452,6 +1536,13 @@ class App:
             return
         opts.strict = bool(result["strict"])
         opts.only = only
+        out_dir = filedialog.askdirectory(
+            title="清单已确认，请选择保存位置",
+            initialdir=self.settings.get("output_dir") or str(Path.home()),
+        )
+        if not out_dir:
+            return
+        opts.out_dir = out_dir
         total_g = len(only)
         self._busy = True
         self._update_step_state()
@@ -1620,67 +1711,6 @@ class DirectionDialog(tk.Toplevel):
 
 
 # -- 拆分边界复核对话框 -----------------------------------------------------------
-
-
-class ReviewDialog(tk.Toplevel):
-    """Scrollable boundary review; split and merge both preserve content pages."""
-    def __init__(self, master, app, doc):
-        super().__init__(master)
-        self.app, self.doc = app, doc
-        self.title(f"检查拆分 — {doc.name}")
-        self.geometry("880x440")
-        ttk.Label(self, text="选择问题，查看前后页，再决定拆开或继续同一份。空白页默认保留。", padding=8).pack(anchor="w")
-        frame = ttk.Frame(self)
-        frame.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(frame, columns=("page", "reason"), show="headings", selectmode="browse")
-        self.tree.heading("page", text="原页码")
-        self.tree.heading("reason", text="需要确认的原因")
-        self.tree.column("page", width=70, stretch=False)
-        self.tree.column("reason", width=680)
-        scrollbar = ttk.Scrollbar(frame, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
-        self.tree.pack(fill="both", expand=True)
-        row = ttk.Frame(self, padding=8)
-        row.pack(fill="x")
-        for label, fn in [("查看前页", lambda: self.preview(-1)), ("查看该页", lambda: self.preview(0)),
-                          ("保留页面并拆开", lambda: self.resolve(True)), ("继续同一份", lambda: self.resolve(False)),
-                          ("确认并排除分隔空白", self.exclude_blank),
-                          ("处理方向建议", lambda: app.show_direction_proposals(doc))]:
-            ttk.Button(row, text=label, command=fn).pack(side="left", padx=3)
-        ttk.Button(row, text="关闭", command=self.destroy).pack(side="right")
-        self.refresh()
-
-    def refresh(self):
-        self.tree.delete(*self.tree.get_children())
-        for p, reason in sorted(self.doc.pending_boundaries.items()):
-            self.tree.insert("", "end", iid=str(p), values=(p, reason))
-        children = self.tree.get_children()
-        if children:
-            self.tree.selection_set(children[0])
-        else:
-            self.tree.insert("", "end", iid="done", values=("✓", "没有待确认边界，可检查分组并命名。"))
-
-    def page(self):
-        selection = self.tree.selection()
-        return int(selection[0]) if selection and selection[0].isdigit() else None
-
-    def preview(self, delta):
-        p = self.page()
-        if p and 1 <= p + delta <= self.doc.page_count:
-            self.app.locate_page(p + delta, self.doc)
-
-    def resolve(self, split):
-        p = self.page()
-        if p:
-            self.app.resolve_boundary(p, split, self.doc)
-            self.refresh()
-
-    def exclude_blank(self):
-        p = self.page()
-        if p:
-            self.app.exclude_confirmed_blank(p, self.doc)
-            self.refresh()
 
 
 class BoundaryDialog(tk.Toplevel):

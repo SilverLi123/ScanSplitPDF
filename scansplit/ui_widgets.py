@@ -284,19 +284,23 @@ class PreviewPane(ttk.Frame):
         self.page_lbl = ttk.Label(bar, text="第 - / - 页", width=13, anchor="center")
         self.page_lbl.pack(side="left", padx=4)
         ttk.Button(bar, text="下一页 ▶", width=9, command=lambda: self.app.step_page(1)).pack(side="left")
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8, pady=2)
-        ttk.Button(bar, text="适应窗口", width=8, command=self._fit).pack(side="left")
-        ttk.Button(bar, text="−", width=3, command=lambda: self.zoom_around(1 / 1.25)).pack(side="left")
-        self.zoom_lbl = ttk.Label(bar, text="100%", width=9, anchor="center")
+        zoom_bar = ttk.Frame(self)
+        zoom_bar.pack(fill="x", padx=4, pady=2)
+        ttk.Button(zoom_bar, text="适应窗口", width=8, command=self._fit).pack(side="left")
+        ttk.Button(zoom_bar, text="−", width=3, command=lambda: self.zoom_around(1 / 1.25)).pack(side="left")
+        self.zoom_lbl = ttk.Label(zoom_bar, text="100%", width=7, anchor="center")
         self.zoom_lbl.pack(side="left", padx=2)
-        ttk.Button(bar, text="＋", width=3, command=lambda: self.zoom_around(1.25)).pack(side="left")
-        ttk.Button(bar, text="实际大小", width=8, command=lambda: self._set_zoom(1.0)).pack(side="left")
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8, pady=2)
-        ttk.Button(bar, text="逆时针 90°", width=10, command=lambda: self.app.rotate_selection(-90)).pack(side="left")
-        ttk.Button(bar, text="顺时针 90°", width=10, command=lambda: self.app.rotate_selection(90)).pack(side="left")
-        ttk.Button(bar, text="恢复 0°", width=8, command=lambda: self.app.rotate_selection(0, absolute=True)).pack(side="left")
-        self.rot_lbl = ttk.Label(bar, text="", foreground="#5d6d7e")
-        self.rot_lbl.pack(side="left", padx=8)
+        ttk.Button(zoom_bar, text="＋", width=3, command=lambda: self.zoom_around(1.25)).pack(side="left")
+        rotate_menu = ttk.Menubutton(zoom_bar, text="旋转页面")
+        menu = tk.Menu(rotate_menu, tearoff=False)
+        for text, command in [("向左转 90°", lambda: self.app.rotate_selection(-90)),
+                              ("向右转 90°", lambda: self.app.rotate_selection(90)),
+                              ("恢复原方向", lambda: self.app.rotate_selection(0, absolute=True))]:
+            menu.add_command(label=text, command=command)
+        rotate_menu.configure(menu=menu)
+        rotate_menu.pack(side="left", padx=4)
+        self.rot_lbl = ttk.Label(self, text="", foreground="#49566a", wraplength=480)
+        self.rot_lbl.pack(anchor="w", padx=8)
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True)
         self.canvas = tk.Canvas(body, bg="#5a5a5a", highlightthickness=0)
@@ -367,10 +371,10 @@ class PreviewPane(ttk.Frame):
         self.canvas.create_text(cx, y, text="ScanSplit PDF 使用流程",
                                 fill="#ffffff", font=("Segoe UI", 15, "bold"))
         steps = [
-            "① 打开 PDF —— 点击“打开 PDF…”或直接把文件拖入窗口（可多选）",
-            "② 自动拆分 → 检查 —— 确认方向及待确认边界；不确定空白默认保留",
-            "③ OCR 自动命名 —— 检查标题与填报单位，可查看来源并直接修改",
-            "④ 检查清单 → 导出 —— 复制原页面无损导出，保留页面去向记录",
+            "选择 PDF，然后按顶部的大按钮继续",
+            "检查时直接比较两页：是新文件，还是上一份的续页？",
+            "拆分确认后，核对标题与填报单位，再导出",
+            "拿不准可以稍后处理，待确认结果不会被导出",
         ]
         for s in steps:
             y += 38
@@ -378,7 +382,7 @@ class PreviewPane(ttk.Frame):
         y += 52
         self.canvas.create_text(
             cx, y,
-            text="快捷键：Ctrl+O 打开 · Ctrl+E 导出 · Ctrl+Z / Ctrl+Y 撤销/重做 · ←/→ 翻页 · Delete 标记分隔页",
+            text="全程本地离线 · 源 PDF 保留 · 不确定的空白页默认保留",
             fill="#b0b0b0", font=("Segoe UI", 9),
         )
 
@@ -534,39 +538,46 @@ class GroupPanel(ttk.LabelFrame):
         head = ttk.Frame(self)
         head.pack(fill="x")
         ttk.Label(head, text=f"文档 {gi + 1} · 第 {group.start}-{group.end} 页（{group.page_count} 页）",
-                  font=("Segoe UI", 10, "bold")).pack(side="left")
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
         self.confirm_lbl = ttk.Label(head, text="", padding=(5, 0))
-        self.confirm_lbl.pack(side="left", padx=6)
+        self.confirm_lbl.pack(anchor="w", pady=(4, 0))
         actions = ttk.Frame(self)
         actions.pack(fill="x", pady=2)
         ttk.Button(actions, text="预览首页", width=8, command=lambda: self._preview(group.start)).pack(side="left")
-        ttk.Button(actions, text="整组识别方向", width=12,
-                   command=lambda: self.app.direction_analyze_group(gi, self.doc)).pack(side="left", padx=2)
-        ttk.Button(actions, text="整组+90°", width=8, command=lambda: self.app.rotate_pages_in_group(gi, 90)).pack(side="left", padx=2)
+        ttk.Button(actions, text="查看 / 调整拆分", command=self.app.review_pending).pack(side="left", padx=4)
 
         # 边界前后页查看：判断是否误拆（上一边界前页 / 本组首页 / 本组末页 / 下一边界后页）
         bd = ttk.Frame(self)
         bd.pack(fill="x", pady=(2, 0))
-        ttk.Label(bd, text="边界前后页：", foreground="#5d6d7e").pack(side="left")
+        ttk.Label(bd, text="页码：", foreground="#49566a").pack(side="left")
         prev_p = group.start - 1
         next_p = group.end + 1
-        ttk.Button(bd, text=f"‹前页({prev_p})" if prev_p >= 1 else "‹前页(—)", width=11,
+        ttk.Button(bd, text=f"前页 {prev_p}" if prev_p >= 1 else "前页 —", width=7,
                    command=lambda p=prev_p: self._preview(p)).pack(side="left", padx=1)
-        ttk.Button(bd, text=f"首页({group.start})", width=10,
+        ttk.Button(bd, text=f"首页 {group.start}", width=7,
                    command=lambda: self._preview(group.start)).pack(side="left", padx=1)
-        ttk.Button(bd, text=f"末页({group.end})", width=10,
+        ttk.Button(bd, text=f"末页 {group.end}", width=7,
                    command=lambda: self._preview(group.end)).pack(side="left", padx=1)
-        ttk.Button(bd, text=f"后页({next_p})›" if next_p <= self.doc.page_count else "后页(—)›", width=11,
+        ttk.Button(bd, text=f"后页 {next_p}" if next_p <= self.doc.page_count else "后页 —", width=7,
                    command=lambda p=next_p: self._preview(p)).pack(side="left", padx=1)
 
         self.title_var = tk.StringVar(value=group.title)
         self.unit_var = tk.StringVar(value=group.unit)
 
-        r1 = ttk.Frame(self)
+        name_host = ttk.Frame(self)
+        if group.boundary_confirmed and not doc.analysis_stale:
+            name_host.pack(fill="x")
+        else:
+            ttk.Label(self, text="先检查这一份的方向和拆分，再识别名称。",
+                      foreground="#6a4b12", wraplength=360).pack(anchor="w", pady=8)
+
+        r1 = ttk.Frame(name_host)
         r1.pack(fill="x", pady=(6, 2))
-        ttk.Label(r1, text="标题", width=5).pack(side="left")
-        ttk.Entry(r1, textvariable=self.title_var).pack(side="left", fill="x", expand=True)
-        title_options = ttk.Frame(self)
+        r1.columnconfigure(1, weight=1)
+        ttk.Label(r1, text="标题", width=8).grid(row=0,column=0,sticky="w")
+        self.title_entry = ttk.Entry(r1, textvariable=self.title_var, width=16)
+        self.title_entry.grid(row=0,column=1,sticky="ew")
+        title_options = ttk.Frame(name_host)
         title_options.pack(fill="x", pady=2)
         ttk.Label(title_options, text="候选", width=5).pack(side="left")
         # 候选下拉：按置信度降序展示，标注置信度与来源（v1.9.1 改进5）
@@ -576,14 +587,16 @@ class GroupPanel(ttk.LabelFrame):
             self.title_cb.set(next(iter(self.title_cb_map.values())))
         self.title_cb.pack(side="left", fill="x", expand=True, padx=(4, 0))
         self.title_cb.bind("<<ComboboxSelected>>", lambda e: self._pick_candidate("title"))
-        self.title_conf_lbl = ttk.Label(self, text="", foreground="#5d6d7e")
-        self.title_conf_lbl.pack(anchor="e")
+        self.title_conf_lbl = ttk.Label(name_host, text="", foreground="#49566a", wraplength=360)
+        self.title_conf_lbl.pack(anchor="w", pady=(2, 6))
 
-        r2 = ttk.Frame(self)
+        r2 = ttk.Frame(name_host)
         r2.pack(fill="x", pady=2)
-        ttk.Label(r2, text="填报单位", width=8).pack(side="left")
-        ttk.Entry(r2, textvariable=self.unit_var).pack(side="left", fill="x", expand=True)
-        unit_options = ttk.Frame(self)
+        r2.columnconfigure(1, weight=1)
+        ttk.Label(r2, text="填报单位", width=8).grid(row=0,column=0,sticky="w")
+        self.unit_entry = ttk.Entry(r2, textvariable=self.unit_var, width=16)
+        self.unit_entry.grid(row=0,column=1,sticky="ew")
+        unit_options = ttk.Frame(name_host)
         unit_options.pack(fill="x", pady=2)
         ttk.Label(unit_options, text="候选", width=5).pack(side="left")
         # 单位候选：OCR 候选（降序）+ 历史单位（无置信度）
@@ -597,19 +610,26 @@ class GroupPanel(ttk.LabelFrame):
             self.unit_cb.set(next(iter(self.unit_cb_map.values())))
         self.unit_cb.pack(side="left", fill="x", expand=True, padx=(4, 0))
         self.unit_cb.bind("<<ComboboxSelected>>", lambda e: self._pick_candidate("unit"))
-        self.unit_conf_lbl = ttk.Label(self, text="", foreground="#5d6d7e")
-        self.unit_conf_lbl.pack(anchor="e")
+        self.unit_conf_lbl = ttk.Label(name_host, text="", foreground="#49566a", wraplength=360)
+        self.unit_conf_lbl.pack(anchor="w", pady=(2, 6))
         ttk.Button(unit_options, text="查看来源", command=lambda: self._show_source("unit")).pack(side="right")
         ttk.Button(title_options, text="查看来源", command=lambda: self._show_source("title")).pack(side="right")
-        ttk.Button(r1, text="确认标题", command=lambda: self._confirm_field("title")).pack(side="right")
-        ttk.Button(r2, text="确认单位", command=lambda: self._confirm_field("unit")).pack(side="right")
-        ttk.Button(bd, text="确认边界", command=lambda: self.app.confirm_group_boundary(self.doc, self.gi)).pack(side="left", padx=2)
+        ttk.Button(r1, text="确认标题", command=lambda: self._confirm_field("title")).grid(row=0,column=2,padx=(4,0))
+        ttk.Button(r2, text="确认单位", command=lambda: self._confirm_field("unit")).grid(row=0,column=2,padx=(4,0))
+        self.title_options, self.unit_options = title_options, unit_options
+        self._options_visible = False
+        title_options.pack_forget()
+        unit_options.pack_forget()
+        ttk.Button(name_host, text="查看候选与识别来源", command=self._toggle_evidence).pack(anchor="w", pady=(4,0))
 
-        r3 = ttk.Frame(self)
+        r3 = ttk.Frame(name_host)
         r3.pack(fill="x", pady=(4, 0))
         ttk.Label(r3, text="导出为").pack(side="left")
-        self.fname_lbl = ttk.Label(r3, text="", foreground="#1a6b3c", font=("Segoe UI", 9))
+        self.fname_lbl = ttk.Label(r3, text="", foreground="#1a6b3c", font=("Segoe UI", 9), wraplength=330)
         self.fname_lbl.pack(side="left", padx=4)
+        ttk.Button(name_host, text="确认本份名称并看下一份", command=self._confirm_name).pack(anchor="e", pady=(8, 2))
+        self.title_entry.bind("<Return>", lambda e: self._confirm_name())
+        self.unit_entry.bind("<Return>", lambda e: self._confirm_name())
 
         self.title_var.trace_add("write", lambda *a, f="title": self._on_change(f))
         self.unit_var.trace_add("write", lambda *a, f="unit": self._on_change(f))
@@ -662,6 +682,26 @@ class GroupPanel(ttk.LabelFrame):
             return
         self._on_change(field)
 
+    def _toggle_evidence(self):
+        self._options_visible = not self._options_visible
+        for frame, before in ((self.title_options,self.title_conf_lbl),(self.unit_options,self.unit_conf_lbl)):
+            if self._options_visible:
+                frame.pack(fill="x", pady=2, before=before)
+            else:
+                frame.pack_forget()
+
+    def _confirm_name(self):
+        if self.app._busy or not self.group.boundary_confirmed or self.doc.analysis_stale:
+            return
+        if not self.title_var.get().strip() or not self.unit_var.get().strip():
+            messagebox.showinfo("补全文件名称", "请填写标题和填报单位。未找到填报单位时，请按原件核对后手动填写。")
+            return
+        self.app._push_undo()
+        self._on_change("title")
+        self._on_change("unit")
+        self.app.groups._update_summary(self.doc)
+        self.app.focus_next_name()
+
     def _conf_text(self, cands: list, field: str = "title", confirmed: bool = True) -> str:
         """字段证据行（v1.9.1 阶段四）：明确区分"已人工确认 / 自动建议 / 待确认"，
         并展示 OCR 候选来源（文头/落款/正文/标题/文本层）。"""
@@ -691,10 +731,13 @@ class GroupPanel(ttk.LabelFrame):
 
     def _refresh_field_hints(self):
         """刷新标题/单位证据行（区分自动建议与已人工确认）。"""
-        self.title_conf_lbl.configure(text=self._conf_text(
-            self.group.title_candidates, "title", self.group.title_confirmed))
-        self.unit_conf_lbl.configure(text=self._conf_text(
-            self.group.unit_candidates, "unit", self.group.unit_confirmed))
+        for field in ("title", "unit"):
+            text = self._conf_text(getattr(self.group, f"{field}_candidates"), field,
+                                  getattr(self.group, f"{field}_confirmed"))
+            if not getattr(self.group, field).strip():
+                text = "尚未识别，请先点击顶部“识别标题与填报单位”。" if not self.doc.naming_attempted else (
+                    "未找到明确的填报单位，请核对原件后填写。" if field == "unit" else "未找到可靠标题，请按原件填写。")
+            getattr(self, f"{field}_conf_lbl").configure(text=text)
 
     def _on_change(self, field_name: str, *a):
         """字段级确认（v1.8）：编辑哪个字段只确认哪个字段，
@@ -703,27 +746,29 @@ class GroupPanel(ttk.LabelFrame):
             return
         if field_name == "title":
             self.group.title = self.title_var.get().strip()
-            self.group.title_confirmed = True
+            self.group.title_confirmed = bool(self.group.title)
             self.group.title_manual = True
         else:
             self.group.unit = self.unit_var.get().strip()
-            self.group.unit_confirmed = True
+            self.group.unit_confirmed = bool(self.group.unit)
             self.group.unit_manual = True
         self._update_confirm_badge()
         self._refresh_field_hints()
         self.app.update_status()
+        if self.app.groups._doc is self.doc:
+            self.app.groups._update_summary(self.doc)
         self._update_filename()
 
     def _update_confirm_badge(self):
-        if not self.group.need_confirm:
+        if not self.group.need_confirm and self.group.title.strip() and self.group.unit.strip():
             self.confirm_lbl.configure(text="已确认", background="#1e8449", foreground="#ffffff")
         else:
             pending = []
             if not self.group.boundary_confirmed:
                 pending.append("边界")
-            if not self.group.title_confirmed:
+            if not self.group.title_confirmed or not self.group.title.strip():
                 pending.append("标题")
-            if not self.group.unit_confirmed:
+            if not self.group.unit_confirmed or not self.group.unit.strip():
                 pending.append("填报单位")
             self.confirm_lbl.configure(
                 text=f"{'、'.join(pending)}待确认",
@@ -765,6 +810,10 @@ class GroupPanel(ttk.LabelFrame):
     def focus_pending(self):
         """定位本组首页，并让面板滚动到可视区（"下一处待确认"用）。"""
         self._preview(self.group.start)
+        if self.group.boundary_confirmed and not self.doc.analysis_stale:
+            entry = self.title_entry if not self.group.title_confirmed or not self.group.title.strip() else self.unit_entry
+            entry.focus_set()
+            entry.selection_range(0, "end")
         try:
             self.update_idletasks()
             y = self.winfo_y()
@@ -789,12 +838,14 @@ class GroupPanelArea(ttk.Frame):
         # 顶部汇总条：集中展示待处理问题（不靠日志），并提供待确认项快速跳转
         self.summary = ttk.Frame(self, padding=(6, 4))
         self.summary.pack(fill="x")
-        self.summary_lbl = ttk.Label(self.summary, text="", anchor="w", justify="left")
-        self.summary_lbl.pack(side="left", fill="x", expand=True)
-        self.next_btn = ttk.Button(self.summary, text="下一处待确认", width=12,
+        self.summary_lbl = ttk.Label(self.summary, text="", anchor="w", justify="left", wraplength=360)
+        self.summary_lbl.pack(fill="x")
+        summary_actions = ttk.Frame(self.summary)
+        summary_actions.pack(fill="x", pady=(4, 0))
+        self.next_btn = ttk.Button(summary_actions, text="下一处待确认", width=12,
                                    command=self._goto_next_pending)
         self.next_btn.pack(side="right")
-        self.rename_btn = ttk.Button(self.summary, text="重新识别受影响组", width=15,
+        self.rename_btn = ttk.Button(summary_actions, text="重新识别待确认名称", width=18,
                                      command=lambda: self.app.rename_affected_groups())
         self.rename_btn.pack(side="right", padx=(0, 4))
         self._pending_panels: list = []
@@ -830,15 +881,24 @@ class GroupPanelArea(ttk.Frame):
             panel = GroupPanel(self.inner, self.app, doc, gi, g, history)
             panel.pack(fill="x", padx=4, pady=4)
             self.panels.append(panel)
+            def bind_wheel(widget):
+                widget.bind("<MouseWheel>", self._scroll_on_wheel, add="+")
+                for child in widget.winfo_children():
+                    bind_wheel(child)
+            bind_wheel(panel)
         if not doc.groups:
             ttk.Label(self.inner, text="尚未分组。请先运行“检测空白页”与“自动分组”。",
                       foreground="#5d6d7e").pack(pady=12)
         self._update_summary(doc)
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
+    def _scroll_on_wheel(self, event):
+        self.canvas.yview_scroll(-int(event.delta/120)*2, "units")
+        return "break"
+
     def _update_summary(self, doc):
         """汇总本文件的待处理问题（待确认字段 / 待确认边界 / 分隔页）。"""
-        n_conf = [gi for gi, g in enumerate(doc.groups) if not g.title_confirmed or not g.unit_confirmed]
+        n_conf = [gi for gi, g in enumerate(doc.groups) if not g.title_confirmed or not g.unit_confirmed or not g.title.strip() or not g.unit.strip()]
         n_boundary = sum(not g.boundary_confirmed for g in doc.groups)
         n_sep = len(doc.separators)
         n_split = len(doc.split_starts)
@@ -873,7 +933,7 @@ class GroupPanelArea(ttk.Frame):
             self._pending_cursor = -1
             return
         self._pending_panels = [self.panels[gi] for gi, g in enumerate(doc.groups)
-                                if g.need_confirm and gi < len(self.panels)]
+                                if (g.need_confirm or not g.title.strip() or not g.unit.strip()) and gi < len(self.panels)]
         self._pending_pages = [p.src_index for p in doc.pages
                                if getattr(p, "has_rotation_proposal", False)]
         n = len(self._pending_panels) + len(self._pending_pages)

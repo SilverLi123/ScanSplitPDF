@@ -255,6 +255,8 @@ class ScanDocument:
         self.manual_boundaries: dict[int, bool] = {}
         self.pending_boundaries: dict[int, str] = {}
         self.analysis_complete = False
+        self.analysis_stale = False
+        self.naming_attempted = False
         self.status = "loaded"  # loaded | analyzed | grouped | exported | error
         self.error: Optional[str] = None
 
@@ -286,6 +288,8 @@ class ScanDocument:
             "manual_boundaries": dict(self.manual_boundaries),
             "pending_boundaries": dict(self.pending_boundaries),
             "analysis_complete": self.analysis_complete,
+            "analysis_stale": self.analysis_stale,
+            "naming_attempted": self.naming_attempted,
         }
 
     def restore(self, d: dict) -> None:
@@ -298,6 +302,8 @@ class ScanDocument:
         self.manual_boundaries = {int(k): bool(v) for k, v in d.get("manual_boundaries", {}).items()}
         self.pending_boundaries = {int(k): str(v) for k, v in d.get("pending_boundaries", {}).items()}
         self.analysis_complete = bool(d.get("analysis_complete", False))
+        self.analysis_stale = bool(d.get("analysis_stale", False))
+        self.naming_attempted = bool(d.get("naming_attempted", False))
 
 
 @dataclass

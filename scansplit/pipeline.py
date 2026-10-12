@@ -74,6 +74,8 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None):
             for g in doc.groups:
                 g.boundary_confirmed = False
             doc.analysis_complete = True
+            doc.analysis_stale = False
+            doc.naming_attempted = False
             return
         directions = autoname.analyze_directions(doc, renderer,
             [p for p in content if not doc.pages[p-1].is_rotation_manual],
@@ -135,6 +137,8 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None):
                     doc.pending_boundaries[p] = '未识别到可靠文字，请核对该页的文档归属'
         grouping.auto_group(doc)
         doc.analysis_complete = True
+        doc.analysis_stale = False
+        doc.naming_attempted = False
         update_boundary_state(doc)
         doc.status = 'grouped'
     finally:
