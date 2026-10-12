@@ -58,6 +58,7 @@ def run(out):
         image.save(out/name)
         assert dialog.actions.winfo_y()+dialog.actions.winfo_height() <= dialog.winfo_height()
         captures.append(dict(file=name, geometry=dialog.geometry(), mode=dialog.mode,
+                             selected_view="comparison" if str(dialog.notebook.select())==str(dialog.comparison) else "browser",
                              original_page=dialog.browser_number, review_target=dialog.page(),
                              canvas_size=[dialog.browser_page.canvas.winfo_width(),
                                           dialog.browser_page.canvas.winfo_height()]))
@@ -81,7 +82,11 @@ def run(out):
         assert doc.snapshot() == before
         doc.pending_boundaries = {3: "页码信息不明确，请检查当前文件的正文与附件。"*30}
         dialog.refresh()
-        dialog.notebook.select(dialog.comparison)
+        assert str(dialog.notebook.select())==str(dialog.comparison)
+        dialog.state("zoomed")
+        shot("04a-boundary-maximized.png")
+        dialog.state("normal")
+        dialog.geometry("960x640+20+20")
         shot("04-boundary-small.png")
         dialog.notebook.select(dialog.browser)
         dialog.scope_var.set("原 PDF 全部页（含排除页）")

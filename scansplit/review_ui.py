@@ -137,8 +137,8 @@ class ReviewPage(ttk.Frame):
         self.canvas.delete("all")
         self.photo = None
         cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
-        width = max(80, cw-18) if cw > 1 else 280
-        height = max(80, ch-18) if ch > 1 else 300
+        width = max(1, cw-18) if cw > 1 else 280
+        height = max(1, ch-18) if ch > 1 else 300
         if not self.page_no:
             self.canvas.create_text(width/2, height/2, text=self.caption.cget("text") or "没有上一页", fill="#49566a")
             return
@@ -149,7 +149,7 @@ class ReviewPage(ttk.Frame):
             renderer = self.app.renderers[str(self.doc.path)]
             w, h = renderer.display_size_pt(self.page_no-1, self.angle)
             fitted = width if self.fit_mode == "width" else min(width, height*w/h)
-            target = min(2400, max(150, int(fitted*self.zoom)))
+            target = min(2400, max(1, int(fitted*self.zoom)))
             fx, fy = self.canvas.xview()[0], self.canvas.yview()[0]
             img = renderer.render(self.page_no-1, width_px=target,
                                   user_rotation=self.angle, bucket="review")
@@ -368,7 +368,7 @@ class ReviewDialog(tk.Toplevel):
         self.browser_page = ReviewPage(self.browser,self.app,self.doc)
         self.browser_page.caption.master.pack_forget()
         self.browser_page.zoom_bar.pack_forget()
-        self.browser_page.fit_mode = "width"
+        self.browser_page.fit_mode = "page"
         for text,command in (("整页",lambda:self.browser_page.scale(0)),("按宽度",self.browser_page.fit_width),
                              ("+",lambda:self.browser_page.scale(1.25)),("−",lambda:self.browser_page.scale(.8))):
             ttk.Button(zoom,text=text,width=5 if text not in ("+","−") else 2,command=command).pack(side="left",padx=1)
@@ -502,7 +502,7 @@ class ReviewDialog(tk.Toplevel):
         elif self.doc.pending_boundaries or self._all_boundaries:
             self.mode = "boundary"
             self.heading.configure(text=f"判断文件交界 · 剩余 {len(self.doc.pending_boundaries)} 处")
-            self.detail.configure(text="可翻阅当前文件草稿，或切换“两页对照”比较交界前后。浏览页码不会改变下方确认的交界。")
+            self.detail.configure(text="左边是交界前一内容页，右边是交界后页，两页默认完整显示。需要更多上下文时可切换“浏览整份文件”；浏览不会改变确认目标。")
             pages=set(self.doc.pending_boundaries)
             if self._all_boundaries:
                 pages.update(g.start for g in self.doc.groups[1:])
@@ -537,7 +537,9 @@ class ReviewDialog(tk.Toplevel):
         self.notebook.tab(self.browser,text="查看待确认方向" if self.mode=="direction" else "浏览整份文件")
         self.notebook.tab(self.comparison,text="当前与预览方向对照" if self.mode=="direction" else
                           "首页与末页对照" if self.mode=="groups" else "交界两页对照")
-        if self.mode != old_mode:
+        if self.mode == "boundary":
+            self.notebook.select(self.comparison)
+        elif self.mode != old_mode:
             self.notebook.select(self.browser)
         if self.mode == "update":
             self.browser_page.show(None,"更新分析后可浏览文件")
@@ -580,13 +582,15 @@ class ReviewDialog(tk.Toplevel):
             self.right_page.show(p, "待确认预览", self.draft_angle)
             self.context.configure(text=f"系统建议：{ps.rotation_proposal_note}。建议尚未应用，请按实际页面判断。")
         elif self.mode == "boundary":
+            self.notebook.select(self.comparison)
+            self.left_page.fit_mode = self.right_page.fit_mode = "page"
             prev = p-1
             while prev >= 1 and (prev in self.doc.excluded_pages or
                     (self.doc.pages[prev-1].blank and self.doc.pages[prev-1].blank.verdict == "blank")):
                 prev -= 1
             self.question.configure(text=f"是否从原第 {p} 页开始一份新文件？")
-            self.left_page.show(prev or None, f"前一内容页 · 原第 {prev} 页" if prev else "文件开头")
-            self.right_page.show(p, f"待判断页 · 原第 {p} 页")
+            self.left_page.show(prev or None, f"交界前一内容页 · 原第 {prev} 页" if prev else "文件开头")
+            self.right_page.show(p, f"交界后页 · 原第 {p} 页")
             blank_start = p if self.doc.pages[p-1].blank and self.doc.pages[p-1].blank.verdict=="blank" else p-1
             blank = bool(blank_start >= 1 and self.doc.pages[blank_start-1].blank
                          and self.doc.pages[blank_start-1].blank.verdict=="blank")

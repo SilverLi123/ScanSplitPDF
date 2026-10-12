@@ -1,6 +1,17 @@
 # ScanSplit PDF — 项目交接文档（给接手的 Agent）
 
-## 当前维护入口：v1.17
+## 当前维护入口：v1.17.1
+
+当前版本1.17.1，基线 `87e435c`（459项）；当前说明为 `work/v1171-user-guide.md` 与 `work/v1171-delivery-report.md`。用户明确纠正默认视图：判断交界必须先看前后两页，文件浏览必须先看完整一页。
+
+最终普通优先级完整461项通过，0失败/跳过，无警告。新EXE自检与图形窗口启动/关闭0，21嵌入模块及模型/配置/TclTk核对通过；独立包 `D:/ScanSplitPDF-Reliable-1.17.1`。
+
+- `ReviewDialog` boundary默认选comparison，并在选择下一处交界时将两侧预览重置整页。左侧上一内容页跳过明确空白/排除页，标签标明原页码；这些页仍可通过原PDF全部页核对。
+- browser默认fit_mode=page，用户显式放大/按宽度仍可保留至翻页。预览渲染不再强制最小150px，画布可用范围不再强制80px，防止小区域整页裁切。
+- 导航/视图只读及交界确认目标保护不变；没有修改OCR、拆分、命名、导出/验证算法。
+- 最终pytest、原生截图及独立包自检以当前 `TEST_REPORT.md` 为准。
+
+## 历史维护入口：v1.17
 
 当前版本1.17.0，分支 `codex/reliable-scansplit`，基线 `9ccb780`（v1.16.0，438项）。最新文档：`work/v117-user-guide.md`、`work/v117-delivery-report.md`、`TEST_REPORT.md`。
 

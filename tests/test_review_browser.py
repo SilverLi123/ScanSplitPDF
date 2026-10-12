@@ -44,7 +44,7 @@ def test_default_maximized_full_file_browsing_never_confirms_pages(ui_env,make_s
     try:
         before=d.snapshot()
         assert dialog.state()=="zoomed" and str(dialog.notebook.select())==str(dialog.browser)
-        assert dialog.browser_pages==[1,2,3,4,5,6] and dialog.browser_page.fit_mode=="width"
+        assert dialog.browser_pages==[1,2,3,4,5,6] and dialog.browser_page.fit_mode=="page"
         dialog.browse(1)
         assert dialog.browser_number==2 and dialog.page()==1
         dialog.browse_at(3)
@@ -139,7 +139,7 @@ def test_zoom_keyboard_and_jump_preserve_review_target_and_manual_state(ui_env,m
         before=d.snapshot()
         dialog.browser_page.scale(1.25)
         dialog.browse(1)
-        assert dialog.browser_page.zoom==1.25 and dialog.browser_page.fit_mode=="width"
+        assert dialog.browser_page.zoom==1.25 and dialog.browser_page.fit_mode=="page"
         dialog.browser_page.wheel(SimpleNamespace(state=4,delta=120))
         assert dialog.browser_page.zoom==1.5625
         dialog.key_browse(SimpleNamespace(widget=dialog.page_entry),1)
@@ -212,7 +212,8 @@ def test_small_window_with_long_reason_keeps_actions_visible(ui_env,make_scan):
         root.update()
         assert dialog.actions.winfo_y()+dialog.actions.winfo_height()<dialog.winfo_height()
         assert dialog.split_button.winfo_ismapped()
-        assert dialog.browser_page.canvas.winfo_height()>60
+        assert dialog.left_page.canvas.winfo_height()>60
+        assert dialog.right_page.canvas.winfo_height()>60
         assert len(dialog.context.cget("text"))>1000
         assert dialog.context.master.yview()[1]<1
     finally:
@@ -289,6 +290,75 @@ def test_first_retained_page_cannot_create_an_empty_document(ui_env,make_scan):
         assert dialog.browser_number==2 and dialog.view_split_button.instate(["disabled"])
         dialog.split_page_var.set("2")
         dialog.manual_split()
+        assert d.snapshot()==before
+    finally:
+        dialog.close()
+        app.on_close()
+
+
+def assert_complete_page(preview):
+    preview.draw()
+    assert preview.photo is not None
+    assert preview.photo.width()<=preview.canvas.winfo_width()
+    assert preview.photo.height()<=preview.canvas.winfo_height()
+    box=preview.canvas.bbox("all")
+    assert box[0]>=0 and box[1]>=0
+    assert box[2]<=preview.canvas.winfo_width() and box[3]<=preview.canvas.winfo_height()
+
+
+def test_whole_page_remains_visible_after_navigation_resize_and_rotation(ui_env,make_scan):
+    root,app,d,dialog=open_review(ui_env,make_scan)
+    try:
+        root.deiconify()
+        root.update()
+        before=d.snapshot()
+        dialog.state("normal")
+        for geometry in ("1366x768+20+20","960x640+20+20"):
+            dialog.geometry(geometry)
+            root.update()
+            for page,angle in ((1,0),(2,90),(3,0)):
+                dialog.browse_at(page-1)
+                dialog.browser_page.show(page,"整页验证",angle,reset_zoom=False)
+                root.update()
+                assert dialog.browser_page.fit_mode=="page" and dialog.browser_page.zoom==1
+                assert_complete_page(dialog.browser_page)
+        # Explicit enlargement remains available; returning to whole-page fits again.
+        dialog.browser_page.fit_width()
+        assert dialog.browser_page.fit_mode=="width"
+        dialog.browse(1)
+        assert dialog.browser_page.fit_mode=="width"
+        dialog.browser_page.scale(0)
+        assert_complete_page(dialog.browser_page)
+        assert d.snapshot()==before
+    finally:
+        dialog.close()
+        app.on_close()
+
+
+def test_boundary_opens_two_complete_pages_and_restores_pair_for_next_target(ui_env,make_scan):
+    root,app,d,dialog=open_review(ui_env,make_scan)
+    try:
+        root.deiconify()
+        root.update()
+        d.pending_boundaries={3:"第一处交界",5:"第二处交界"}
+        dialog.refresh()
+        dialog.state("normal")
+        dialog.geometry("960x640+20+20")
+        root.update()
+        before=d.snapshot()
+        assert str(dialog.notebook.select())==str(dialog.comparison)
+        assert dialog.left_page.page_no==2 and dialog.right_page.page_no==3
+        for preview in (dialog.left_page,dialog.right_page): assert_complete_page(preview)
+        dialog.notebook.select(dialog.browser)
+        dialog.browse_at(5)
+        assert dialog.page()==3 and dialog.browser_number==6 and d.snapshot()==before
+        dialog.left_page.fit_width()
+        dialog.skip_current()
+        root.update()
+        assert str(dialog.notebook.select())==str(dialog.comparison)
+        assert dialog.left_page.page_no==4 and dialog.right_page.page_no==5
+        assert dialog.left_page.fit_mode==dialog.right_page.fit_mode=="page"
+        for preview in (dialog.left_page,dialog.right_page): assert_complete_page(preview)
         assert d.snapshot()==before
     finally:
         dialog.close()
