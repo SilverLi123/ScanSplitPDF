@@ -410,7 +410,7 @@ def test_analysis_failure_is_visible_and_retry_keeps_pending_state(ui_env,make_s
         app.import_files([str(make_scan("task-error.pdf",["text"]))])
         d=app._active_doc()
         before=d.snapshot()
-        def fail(*args):
+        def fail(*args,**kwargs):
             raise RuntimeError("测试处理失败")
         monkeypatch.setattr(ui_env.pipeline,"analyze_document",fail)
         app.automatic_split()

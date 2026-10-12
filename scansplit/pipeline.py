@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from . import autoname, blankdetect, grouping, ocrfields, pagenum, splitctx, jointsplit, pagination_read, automation
+from . import autoname, blankdetect, blankpolicy, grouping, ocrfields, pagenum, splitctx, jointsplit, pagination_read, automation
 from .ocr import OcrEngine
 from .render import PageRenderer
 
@@ -39,7 +39,7 @@ def boundary_decision(previous: dict, current: dict) -> tuple[str, str]:
 def update_boundary_state(doc):
     for g in doc.groups:
         if doc.analysis_complete:
-            g.boundary_confirmed = not any(g.start <= p <= g.end + 1 for p in doc.pending_boundaries)
+            g.boundary_confirmed = not bool(doc.pending_for_group(g))
         else:
             # One manual split does not certify every other page in the new ranges.
             g.boundary_confirmed = all(p in doc.manual_boundaries for p in g.pages)
@@ -47,7 +47,7 @@ def update_boundary_state(doc):
             g.boundary_confirmed = False
 
 
-def analyze_document(doc, params=None, engine=None, progress=None, cancel=None):
+def analyze_document(doc, params=None, engine=None, progress=None, cancel=None, remove_blank=False):
     """Single worker-owned renderer; cache analysed OCR for all downstream stages."""
     engine = engine or OcrEngine.get()
     params = params or blankdetect.DetectParams()
@@ -64,7 +64,17 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None):
             if ps.src_index not in doc.manual_boundaries:
                 ps.split_before = False
         doc.boundary_evidence = {}
-        content = [ps.src_index for ps in doc.pages if ps.blank.verdict != 'blank']
+        if remove_blank:
+            blankpolicy.apply(doc, renderer, cancel, progress)
+        else:
+            for ps in doc.pages:
+                if ps.src_index not in doc.manual_separator_pages:
+                    ps.omitted_blank = False
+                    ps.blank_exclusion_evidence = {}
+        if cancel():
+            return
+        content = [ps.src_index for ps in doc.pages if ps.blank.verdict != 'blank'
+                   and not (ps.src_index in doc.manual_separator_pages and (ps.separator or ps.omitted_blank))]
         if not engine.available:
             doc.pending_boundaries = {p.src_index: '本地 OCR 不可用，请人工核对该页方向与文档归属'
                                       for p in doc.pages}
@@ -104,10 +114,18 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None):
             cache[p] = (lines, w, h)
             evidence = pagination_read.refine(renderer,p-1,engine,ps.effective_rotation,
                 pagenum.pagination_evidence(lines,w,h),cancel)
-            features[p] = dict(structure=ocrfields.first_page_structure(lines,w,h),
+            structure = ocrfields.first_page_structure(lines,w,h)
+            titles = ocrfields.extract_title(lines,w,h)
+            units = ocrfields.extract_reporting_unit(lines,w,h)
+            features[p] = dict(structure=structure,
+                reliable_first_page=bool(structure.get('has_title') and structure.get('title_is_max')
+                    and not structure.get('has_section') and not structure.get('has_continuation')
+                    and titles and titles[0].confidence >= .85
+                    and ocrfields._title_pattern_score(titles[0].text) >= 1 and units
+                    and units[0].confidence >= .85 and len({c.text for c in units}) == 1),
                 number=pagenum.extract_page_number(lines,h),
                 pagination=evidence,
-                units={c.text for c in ocrfields.extract_reporting_unit(lines,w,h)})
+                units={c.text for c in units})
             progress(done, len(content), '分析文档边界')
         evs = splitctx.judge_blank_context(doc, renderer, engine, page_cache=cache, cancel_cb=cancel)
         for ev in evs:
@@ -118,6 +136,9 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None):
         doc.pending_boundaries = {}
         for ev in evs:
             if ev.verdict == splitctx.UNCERTAIN:
+                if blankpolicy.valid_exclusion(doc.pages[ev.page-1]) and (
+                        ev.prev_content_page is None or ev.next_content_page is None):
+                    continue  # Leading/trailing verified blanks are not boundaries.
                 p = ev.next_content_page or ev.page
                 if p not in doc.manual_boundaries and ev.page not in doc.manual_separator_pages:
                     doc.pending_boundaries[p] = ev.reason
@@ -140,17 +161,25 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None):
                 decision, reason = numbered
             elif decision == 'split':
                 decision, reason = 'review', '首页与数字变化提示新文件，但印刷页码证据不足，请确认'
+            blank_start = jointsplit.blank_start(features[prev], features[p],
+                bool(blank_pages) and all(blankpolicy.valid_exclusion(doc.pages[bp-1]) for bp in blank_pages))
+            if blank_start is not None:
+                decision, reason = blank_start
             decision, reason, sequence = jointsplit.check_sequence(features, content, i,
                 doc.manual_boundaries, doc.separators, decision, reason)
             if blank_pages:
-                # Context classification is separate from exclusion. Auto split retains
-                # the entire blank run at the end of the preceding document.
+                # Document membership and output omission are independent decisions.
                 for bp in blank_pages:
                     ps = doc.pages[bp-1]
                     ps.blank_context = "internal_blank" if decision == "keep" else "uncertain"
                     if bp not in doc.manual_separator_pages:
                         ps.separator = False
                 doc.pending_boundaries.pop(p, None)
+            removed = [bp for bp in blank_pages if doc.pages[bp-1].omitted_blank]
+            if removed:
+                reason = reason.replace('空白候选（保留）', '明确空白').replace(
+                    '页码连续，作为内部空白随原文件保留', '页码连续，仍属于同一份文件')
+                reason += f'；原第 {removed} 页从输出删除，删除不额外拆分'
             doc.boundary_evidence[p] = dict(previous_page=prev, next_page=p,
                 blank_pages=blank_pages, previous_pagination=features[prev]['pagination'].to_dict(),
                 next_pagination=features[p]['pagination'].to_dict(), sequence=sequence,decision=decision, reason=reason)
@@ -172,13 +201,13 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None):
         renderer.close()
 
 
-def organize_document(doc, params=None, engine=None, progress=None, cancel=None):
+def organize_document(doc, params=None, engine=None, progress=None, cancel=None, remove_blank=True):
     """One worker transaction: analysis, then naming where boundaries are reliable."""
     engine = engine or OcrEngine.get()
     cancel = cancel or (lambda: False)
     snapshot = doc.snapshot()
     try:
-        analyze_document(doc, params, engine, progress, cancel)
+        analyze_document(doc, params, engine, progress, cancel, remove_blank=remove_blank)
         if not cancel():
             automation.name_ready(doc, engine, progress, cancel)
         if cancel():

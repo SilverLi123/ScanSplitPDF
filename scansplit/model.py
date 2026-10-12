@@ -64,6 +64,8 @@ class PageState:
     rotation_proposal_confidence: float = 0.0
     blank: Optional[BlankResult] = None
     separator: bool = False  # 当前是否作为分隔页（该页本身是空白分隔页，不进入任何组）
+    omitted_blank: bool = False  # 自动空白/人工排除：只移除输出页，不建立文件交界
+    blank_exclusion_evidence: dict = field(default_factory=dict)
     split_before: bool = False  # 该页是新文档起点（拆分边界，页本身保留在组内）
     # 业务属性（v1.9 阶段 A0）：separator / internal_blank / uncertain。
     # 由 splitctx 依据相邻内容页上下文判定；仅作记录与展示，实际"是否排除"
@@ -122,6 +124,8 @@ class PageState:
             if self.blank
             else None,
             "separator": self.separator,
+            "omitted_blank": self.omitted_blank,
+            "blank_exclusion_evidence": deepcopy(self.blank_exclusion_evidence),
             "split_before": self.split_before,
             "blank_context": self.blank_context,
         }
@@ -142,6 +146,8 @@ class PageState:
         ps.rotation_proposal_note = d.get("rotation_proposal_note", "")
         ps.rotation_proposal_confidence = float(d.get("rotation_proposal_confidence", 0.0) or 0.0)
         ps.separator = d["separator"]
+        ps.omitted_blank = bool(d.get("omitted_blank", False))
+        ps.blank_exclusion_evidence = deepcopy(d.get("blank_exclusion_evidence", {}))
         ps.split_before = bool(d.get("split_before", False))
         ps.blank_context = d.get("blank_context", "")
         if d["blank"]:
@@ -170,14 +176,15 @@ class Group:
     title_edit_kind: str = ""
     unit_edit_kind: str = ""
     boundary_confirmed: bool = True
+    excluded_pages: tuple[int, ...] = ()
 
     @property
     def page_count(self) -> int:
-        return self.end - self.start + 1
+        return len(self.pages)
 
     @property
     def pages(self) -> list[int]:
-        return list(range(self.start, self.end + 1))
+        return [p for p in range(self.start, self.end + 1) if p not in self.excluded_pages]
 
     @property
     def need_confirm(self) -> bool:
@@ -207,6 +214,7 @@ class Group:
             "title_edit_kind": self.title_edit_kind,
             "unit_edit_kind": self.unit_edit_kind,
             "boundary_confirmed": self.boundary_confirmed,
+            "excluded_pages": list(self.excluded_pages),
             "need_confirm": self.need_confirm,  # 兼容旧版读取
         }
 
@@ -227,6 +235,7 @@ class Group:
         g.title_edit_kind = d.get("title_edit_kind", "")
         g.unit_edit_kind = d.get("unit_edit_kind", "")
         g.boundary_confirmed = bool(d.get("boundary_confirmed", True))
+        g.excluded_pages = tuple(d.get("excluded_pages", ()))
         # 候选以 dict 形态存储（与 auto_name_groups 写入、UI 面板读取一致）
         g.title_candidates = [dict(x) for x in d.get("title_candidates", [])]
         g.unit_candidates = [dict(x) for x in d.get("unit_candidates", [])]
@@ -280,6 +289,22 @@ class ScanDocument:
     @property
     def separators(self) -> set[int]:
         return {p.src_index for p in self.pages if p.separator}
+
+    @property
+    def omitted_blanks(self) -> set[int]:
+        return {p.src_index for p in self.pages if p.omitted_blank}
+
+    @property
+    def excluded_pages(self) -> set[int]:
+        return self.separators | self.omitted_blanks
+
+    def pending_for_group(self, group) -> dict[int, str]:
+        """The next content boundary also affects this file, across deleted blanks."""
+        limit = group.end + 1
+        excluded = self.excluded_pages
+        while limit <= self.page_count and limit in excluded:
+            limit += 1
+        return {p: reason for p, reason in self.pending_boundaries.items() if group.start <= p <= limit}
 
     @property
     def split_starts(self) -> set[int]:

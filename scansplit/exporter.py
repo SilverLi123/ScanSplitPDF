@@ -12,7 +12,7 @@ from pathlib import Path
 
 from pypdf import PdfReader, PdfWriter
 
-from . import verify
+from . import verify, blankpolicy
 from .model import Group, ScanDocument
 from .naming import DEFAULT_TEMPLATE, build_filename, unique_path
 from .rotation import apply_target_rotation
@@ -116,6 +116,7 @@ def business_integrity_issues(doc: ScanDocument) -> list[str]:
     - 未在任何分组内的页（= 当前被标为分隔页而排除的页）：
       * 若该页**被用户人工确认过**（src_index ∈ doc.manual_separator_pages）
         或**上下文判定为 separator** → 视为"经确认排除"，允许；
+      * 新自动空白排除必须有有效整页含页边检查及无文本层证据；不因删除而拆分；
       * 否则（uncertain / 无上下文判定 / 视觉空白但未确认）→ **禁止静默排除**，
         列为问题，阻断导出。
     返回问题字符串列表（空 = 通过）。
@@ -128,6 +129,8 @@ def business_integrity_issues(doc: ScanDocument) -> list[str]:
             continue
         for p in g.pages:
             counts[p] = counts.get(p, 0) + 1
+        if not g.pages:
+            issues.append(f"{doc.name}：分组没有可导出的页面 {g.start}-{g.end}")
     duplicates = [p for p, n in counts.items() if n > 1]
     if duplicates:
         issues.append(f"{doc.name}：分组重复包含原页 {duplicates}")
@@ -135,14 +138,14 @@ def business_integrity_issues(doc: ScanDocument) -> list[str]:
     manual = getattr(doc, "manual_separator_pages", None) or set()
     for st in doc.pages:
         if st.src_index in in_group:
-            if st.separator:
+            if st.separator or st.omitted_blank:
                 issues.append(f"{doc.name} 第 {st.src_index} 页同时属于分组与排除页")
             continue  # 已导出
         # 未在分组内 → 被排除。必须有明确、经确认的排除依据。
-        confirmed = st.separator and (
+        confirmed = ((st.separator or st.omitted_blank) and st.src_index in manual) or (st.separator and (
             st.src_index in manual
             or getattr(st, "blank_context", "") == "separator"
-        )
+        )) or blankpolicy.valid_exclusion(st)
         if not confirmed:
             ctx = getattr(st, "blank_context", "") or "未判定"
             issues.append(
@@ -165,7 +168,7 @@ def integrity_preflight(docs: list[ScanDocument], opts: ExportOptions) -> list[s
         for gi, g in enumerate(doc.groups):
             if opts.only is not None and (di, gi) not in opts.only:
                 continue
-            if not g.boundary_confirmed:
+            if not g.boundary_confirmed or doc.pending_for_group(g):
                 issues.append(f"{doc.name} 第 {g.start}-{g.end} 页：拆分边界待确认")
             if any(p.has_rotation_proposal for p in doc.pages[g.start-1:g.end]):
                 issues.append(f"{doc.name} 第 {g.start}-{g.end} 页：方向建议待处理")
@@ -181,8 +184,8 @@ def coverage_issues(doc: ScanDocument, results: list[ExportResult],
                     only_groups: set | None = None) -> list[str]:
     """全局页面覆盖率校验（v1.8）：每个有效原页（组内页）必须恰好导出一次。
 
-    漏导、重复导出、导出了组外页均视为问题。空白页只要未标记为分隔页，
-    就属于某个分组、必须出现在输出中（防止"内部空白页被误删"）。
+    漏导、重复导出、导出了组外页均视为问题。实际 Group.pages 只允许移除
+    已确认的排除页，business_integrity_issues 独立验证排除依据。
 
     only_groups（v1.9.1 改进3）：按清单导出时，只针对这些组索引校验覆盖率；
     未勾选的组属用户主动跳过，不计入漏页。
@@ -247,7 +250,7 @@ def _export_one(
         result.path = final_path
         reader = PdfReader(str(doc.path))
         writer = PdfWriter()
-        for src_page in range(group.start, group.end + 1):
+        for src_page in group.pages:
             if opts.cancel_check and opts.cancel_check():
                 report.canceled = True
                 raise InterruptedError("用户取消")
@@ -264,7 +267,7 @@ def _export_one(
             writer.add_page(page)
         with open(tmp_path, "wb") as f:
             writer.write(f)
-        result.pages = list(range(group.start, group.end + 1))
+        result.pages = group.pages
         # 页码核对
         check = PdfReader(str(tmp_path))
         if len(check.pages) != group.page_count:
@@ -272,7 +275,7 @@ def _export_one(
                 f"页码核对失败：输出 {len(check.pages)} 页，预期 {group.page_count} 页"
             )
         # 保真校验（内容流与嵌入图像）
-        page_map = list(range(group.start, group.end + 1))
+        page_map = group.pages
         rotations = [(doc.pages[p-1].original_rotation + doc.pages[p-1].effective_rotation) % 360
                      for p in page_map]
         issues = verify.verify_mapping(doc.path, tmp_path, page_map, rotations=rotations)
@@ -396,22 +399,24 @@ def _write_manifest(docs, opts, report, out_dir):
     for di, doc in enumerate(docs):
         pages = []
         for ps in doc.pages:
-            group_idx = next((gi for gi, g in enumerate(doc.groups) if g.start <= ps.src_index <= g.end), None)
+            group_idx = next((gi for gi, g in enumerate(doc.groups) if ps.src_index in g.pages), None)
             result = next((r for r in report.results if group_idx is not None
                            and r.group is doc.groups[group_idx]), None)
             if result and result.ok:
                 status = "exported"
             elif group_idx is None:
-                status = "excluded_manual" if ps.src_index in doc.manual_separator_pages else "excluded_context"
+                status = ("excluded_manual" if ps.src_index in doc.manual_separator_pages else
+                          "excluded_blank_rule" if blankpolicy.valid_exclusion(ps) else "excluded_context")
             elif opts.only is not None and (di, group_idx) not in opts.only:
                 status = "unselected"
             else:
                 status = "canceled" if report.canceled else "failed"
             pages.append(dict(source_page=ps.src_index, status=status,
                 output=str(result.path) if result and result.ok else None,
-                output_page=ps.src_index-result.group.start+1 if result and result.ok else None,
+                output_page=result.pages.index(ps.src_index)+1 if result and result.ok else None,
                 rotation=(ps.original_rotation+ps.effective_rotation)%360,
-                note=ps.blank_context_reason if hasattr(ps, "blank_context_reason") else "",
+                note="明确空白：整页含页边图像复核，无文本层；从输出删除" if blankpolicy.valid_exclusion(ps) else "",
+                blank_exclusion_evidence=ps.blank_exclusion_evidence if ps.omitted_blank else None,
                 manual_separator=ps.src_index in doc.manual_separator_pages))
         sources.append(dict(path=str(doc.path), imported_sha256=doc.source_sha256,
             after_sha256=report.src_sha_after.get(str(doc.path)), page_count=doc.page_count, pages=pages))

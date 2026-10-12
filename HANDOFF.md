@@ -1,6 +1,21 @@
 # ScanSplit PDF — 项目交接文档（给接手的 Agent）
 
-## 当前维护入口：v1.14
+## 当前维护入口：v1.15
+
+当前版本1.15.0，分支 `codex/reliable-scansplit`，基线 `d4b44d5`（366项）。当前文档：`work/v115-user-guide.md`、`work/v115-delivery-report.md`、`TEST_REPORT.md`。最终407项通过。
+
+- 最新用户要求空白删除，替代历史“所有空白保留”默认。`organize_document(remove_blank=True)` 为当前UI入口；仅分析旧API默认False及v1.14验收脚本显式False仅为兼容。
+- `blankpolicy` 2400px整页含页边+文本层复核，复用原分类器，明确空白才自动删除，疑似和失败保留并展示。证据存入页面快照，不写源文件。
+- `omitted_blank` 与 `separator/split_before` 分离；doc.excluded_pages是完整去向，doc.separators仍仅结构分隔；Group.excluded_pages/Group.pages支持内部删除，快照、人工字段迁移保护。
+- `set_output_exclusion` 为右键删除/恢复入口，不改变交界；人工决定在manual_separator_pages保护。旧set_separator及交界窗口“排除分隔空白”仍为明确结构操作。
+- `pending_for_group` 跨删除页计算交界影响；分析、命名、UI和导出共同使用，部分导出也不能绕过真实pending。
+- `jointsplit.blank_start` 仅在无页码候选、明确空白、强首页字段且信息变化时独立拆分。新增真实中文样本字段低分仍待确认；该条件分支的强证据正例为单元/编排测试，不冒称真实OCR验收正例。
+- 导出确实改为Group.pages复制与映射，逐页记录自动空白删除/人工删除及检查证据；保真/源SHA/防覆盖标准未改。OCR引擎/模型、字段命名、方向和原空白分类器未改。
+- 同输入16页三清晰场景：五份名称自动提取，最终名称批准模拟人工；输出10内容页+2自动删除空白。新3页无页码弱字段仍需确认，页脚标记反例保留。
+- 历史11页只读诊断自动删除3/7/8/11，剩余3方向/4交界待确认；未标注gold不计正确率。样本/记录为ignored验收目录，用户PDF不入仓库/包。
+- 新独立运行包 `D:/ScanSplitPDF-Reliable-1.15.0`，自检0、12模块与源码一致，旧包保留。下一步按真实人工标注核对交界与确认量；业务准确率、几百页长期体验、干净另一台Windows和项目恢复仍未验收/实现。
+
+## 历史维护入口：v1.14
 
 当前版本1.14.0，分支 `codex/reliable-scansplit`，基线 `8b57298`（321项）。当前说明/验收：`work/v114-user-guide.md`、`work/v114-delivery-report.md`、`TEST_REPORT.md`。
 

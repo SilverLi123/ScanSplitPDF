@@ -4,8 +4,8 @@
 - 视觉空白检测（blankdetect）生成分隔候选，本身只回答"这页看起来是不是空白"；
 - 业务属性由上下文判定（splitctx）依据印刷页码、首页结构（标题/主送机关）、
   续页标记与前后内容页标题关系区分：separator / internal_blank / uncertain；
-- 只有 separator 允许作为分隔空白排除；internal_blank 与 uncertain 一律默认保留
-  （不静默丢页）；证据不足或互相矛盾时降级为待确认，交人工/复核；
+- 整页复核通过的明确空白默认从输出删除，内部空白删除不建立交界；
+  疑似、冲突、检查失败先保留；人工恢复/删除与交界决定独立；
 - 无空白页的文件由"智能补拆"（autoname.smart_split_review）产生自动建议或
   待确认边界（页码重置 + 标题特征双信号一致才自动补拆，可撤销）；
 - 页面方向采用统一三来源模型（PageState.effective_rotation）：人工覆盖 ??
@@ -920,7 +920,8 @@ class App:
                 if cancel():
                     break
                 pipeline.organize_document(doc, self.detect_params, engine, progress, cancel)
-                log(f"{doc.name}：{len(doc.groups)} 份，{len(doc.pending_boundaries)} 处边界待确认")
+                automatic_blanks = doc.omitted_blanks - doc.manual_separator_pages
+                log(f"{doc.name}：{len(doc.groups)} 份，自动删除明确空白 {len(automatic_blanks)} 页，{len(doc.pending_boundaries)} 处边界待确认")
 
         def on_done(result, canceled, error):
             self._task_finish()
@@ -967,8 +968,9 @@ class App:
         if not split:
             p = page_no - 1
             while p >= 1 and doc.pages[p-1].blank and doc.pages[p-1].blank.verdict == "blank":
-                doc.pages[p-1].separator = False
-                doc.manual_separator_pages.add(p)
+                if doc.pages[p-1].separator:
+                    doc.pages[p-1].separator = False
+                    doc.manual_separator_pages.add(p)
                 p -= 1
         grouping.refresh_groups(doc)
         pipeline.update_boundary_state(doc)
@@ -990,6 +992,8 @@ class App:
         self._push_undo()
         for p in run:
             doc.pages[p-1].separator = True
+            doc.pages[p-1].omitted_blank = False
+            doc.pages[p-1].blank_exclusion_evidence = {}
             doc.manual_separator_pages.add(p)
             doc.pending_boundaries.pop(p, None)
         next_page = max(run)+1
@@ -1009,7 +1013,7 @@ class App:
         if doc.analysis_stale:
             self.review_pending()
             return
-        if any(g.start <= p <= g.end + 1 for p in doc.pending_boundaries):
+        if doc.pending_for_group(g):
             self.review_pending()
             return
         if any(p.has_rotation_proposal for p in doc.pages[g.start-1:g.end]):
@@ -1104,6 +1108,30 @@ class App:
 
         self._start_task("rename_affected", work, on_done, title="重新识别受影响分组")
 
+    def set_output_exclusion(self, pages: list[int], value: bool):
+        """Remove/restore selected pages without inventing a document boundary."""
+        doc = self._active_doc()
+        if not doc or self._busy:
+            return
+        pages = [p for p in pages if 1 <= p <= doc.page_count]
+        if not pages:
+            return
+        if value and not messagebox.askyesno("删除输出页面", f"确认导出时删除原第 {pages} 页？\n只删除输出页面，不改变文件交界；源 PDF 保留，可恢复。"):
+            return
+        self._push_undo()
+        for p in pages:
+            ps = doc.pages[p-1]
+            ps.separator = False
+            ps.omitted_blank = value
+            ps.blank_exclusion_evidence = {}
+            doc.manual_separator_pages.add(p)
+            if value:
+                ps.rotation_proposal = None
+                doc.pending_boundaries.pop(p, None)
+        grouping.refresh_groups(doc)
+        pipeline.update_boundary_state(doc)
+        self._refresh_all()
+
     def set_separator(self, pages: list[int], value: bool):
         doc = self._active_doc()
         if not doc or self._busy:
@@ -1115,6 +1143,8 @@ class App:
         for p in pages:
             if 1 <= p <= doc.page_count:
                 doc.pages[p - 1].separator = value
+                doc.pages[p - 1].omitted_blank = False
+                doc.pages[p - 1].blank_exclusion_evidence = {}
                 # 记录/撤销"人工确认的分隔页"（v1.9.1）：这是导出时允许排除该页的
                 # 保留与排除都是人工决定，重跑分析不得覆盖。
                 doc.manual_separator_pages.add(p)  # both keep and exclude are manual decisions
@@ -1526,7 +1556,7 @@ class App:
         pages = [p for p in pages if 1 <= p <= doc.page_count]
         if not pages:
             return
-        any_sep = any(doc.pages[p - 1].separator for p in pages)
+        any_sep = any(doc.pages[p - 1].separator or doc.pages[p - 1].omitted_blank for p in pages)
         self.set_separator(pages, not any_sep)
 
     # -- 导出 -------------------------------------------------------------------
@@ -1589,9 +1619,9 @@ class App:
             # 异常排除（未确认依据的丢页）→ integrity（fail-closed）
             for msg in exporter.business_integrity_issues(doc):
                 integrity_issues.append(msg)
-            for p in sorted(doc.separators):
+            for p in sorted(doc.excluded_pages):
                 st = doc.pages[p - 1]
-                ctx = getattr(st, "blank_context", "") or "未判定"
+                ctx = "人工确认删除" if p in doc.manual_separator_pages else "明确空白 · 整页复核后自动删除" if st.omitted_blank else getattr(st, "blank_context", "") or "未判定"
                 excluded_pages.append(f"{doc.name} 第 {p} 页（依据：{ctx}）")
 
         # 重名冲突 → field 级（可人工修名后重试，但也不宜静默）

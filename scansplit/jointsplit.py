@@ -2,6 +2,29 @@
 import re
 
 
+def blank_start(previous, current, verified_blank):
+    """A verified gap plus distinct reliable first-page fields can stand alone.
+
+    Never override printed-number conflicts or continuation/appendix evidence.
+    """
+    if not verified_blank or not current.get("reliable_first_page"):
+        return None
+    before, after = previous["pagination"], current["pagination"]
+    if before.text or after.text or before.number is not None or after.number is not None:
+        return None
+    st, old = current["structure"], previous["structure"]
+    if st.get("has_continuation") or re.match(r"^(附件|附录|附表)[：:\s\d一二三四]", st.get("title_text", "")):
+        return None
+    from .splitctx import _titles_same_source
+    units, previous_units = current.get("units", set()), previous.get("units", set())
+    changed_unit = len(units) == len(previous_units) == 1 and units != previous_units
+    changed_title = bool(old.get("title_text") and st.get("title_text")
+        and not _titles_same_source(old["title_text"], st["title_text"]))
+    if not (changed_unit or changed_title):
+        return None
+    return "split", "明确空白间隔与可靠首页标题、填报单位相符，且前后信息发生变化；从后页拆分，空白从输出删除"
+
+
 def decide(previous, current, blank_pages=()):
     """A reliable restart can stand alone; a blank run corroborates it, never deletes.
 
@@ -58,6 +81,8 @@ def check_sequence(features, content, index, manual, separators, decision, reaso
         return not manual.get(b) and not any(p in separators for p in range(a+1,b))
     before = features[previous]["pagination"]
     after = features[current]["pagination"]
+    if before.number is None or after.number is None:
+        return decision, reason, sequence  # Independently verified blank/first-page path.
     # A cropped table cell can look like a centred footer digit. Require a full
     # surrounding number sequence for bare/fraction/dash formats, no extra title
     # or blank requirement. Explicit Page/第...页 labels still stand alone.

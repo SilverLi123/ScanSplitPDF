@@ -50,7 +50,7 @@ def test_preview_rotation_does_not_apply_until_confirm_and_then_reanalyzes(ui_en
         d.manual_boundaries[2] = False
         d.groups[0].title, d.groups[0].title_manual = "人工标题", True
         calls = []
-        def analyze(target, *args):
+        def analyze(target, *args, **kwargs):
             calls.append(target)
             assert target.pages[0].is_rotation_manual
             assert target.pages[0].effective_rotation == 90

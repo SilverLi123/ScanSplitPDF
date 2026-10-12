@@ -200,7 +200,7 @@ def test_organizing_is_atomic_and_preserves_manual_decisions(monkeypatch,make_sc
     d.manual_boundaries={3:True}
     before=d.snapshot()
     canceled=[False]
-    def analyze(document,*a):
+    def analyze(document,*a,**kw):
         document.groups[0].title='不应保留'
     def name(document,*a):
         if failure=='error': raise RuntimeError('expected')

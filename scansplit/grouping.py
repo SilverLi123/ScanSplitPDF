@@ -5,6 +5,7 @@
 - 连续分隔页合并为一个分隔区域；
 - 开头/结尾的分隔页不产生空组；
 - 未被标记为分隔页的空白页保留在文档内部；
+- omitted_blanks 只排除输出页，不另起分组；Group.pages 是真实输出原页列表；
 - 任何组至少包含 1 页。
 """
 
@@ -13,29 +14,36 @@ from __future__ import annotations
 from .model import BLANK, MAYBE, Group, ScanDocument
 
 
-def compute_groups(separators: set[int], n_pages: int, split_starts: set[int] | None = None) -> list[tuple[int, int]]:
+def compute_groups(separators: set[int], n_pages: int, split_starts: set[int] | None = None,
+                   omitted_blanks: set[int] | None = None) -> list[tuple[int, int]]:
     """返回 [(start, end)]，1 起始、含端点、按页序排列、互不重叠、均非空。
 
     separators：空白分隔页（页本身不进入任何组）；
+    omitted_blanks：只从输出排除，不产生分组边界；范围可包含这些内部页；
     split_starts：拆分边界——新文档从该页开始，页本身保留在组内
     （用于无空白页场景的智能补拆，绝不丢页）。
     """
     split_starts = split_starts or set()
     groups: list[tuple[int, int]] = []
     cur_start: int | None = None
+    cur_end = None
     for p in range(1, n_pages + 1):
         if p in separators:
             if cur_start is not None:
-                groups.append((cur_start, p - 1))
+                groups.append((cur_start, cur_end))
                 cur_start = None
+        elif p in (omitted_blanks or ()):
+            continue  # Removing a blank never creates a new document.
         elif p in split_starts:
             if cur_start is not None:
-                groups.append((cur_start, p - 1))
+                groups.append((cur_start, cur_end))
             cur_start = p
         elif cur_start is None:
             cur_start = p
+        if p not in separators:
+            cur_end = p
     if cur_start is not None:
-        groups.append((cur_start, n_pages))
+        groups.append((cur_start, cur_end))
     return groups
 
 
@@ -90,7 +98,7 @@ def refresh_groups(doc: ScanDocument) -> list[Group]:
     迁移与歧义说明写入 doc.group_migrate_notes，由 UI 转述给用户。
     """
     old_list = list(doc.groups)
-    new_ranges = compute_groups(doc.separators, doc.page_count, doc.split_starts)
+    new_ranges = compute_groups(doc.separators, doc.page_count, doc.split_starts, doc.omitted_blanks)
     old_by_range = {(g.start, g.end): g for g in old_list}
 
     # 新组 ↔ 旧组 重叠关系
@@ -110,9 +118,11 @@ def refresh_groups(doc: ScanDocument) -> list[Group]:
     for idx, (start, end) in enumerate(new_ranges):
         prev = old_by_range.get((start, end))
         if prev is not None:
+            prev.excluded_pages = tuple(sorted(p for p in doc.omitted_blanks if start <= p <= end))
             new.append(prev)
             continue
         g = Group(start=start, end=end)
+        g.excluded_pages = tuple(sorted(p for p in doc.omitted_blanks if start <= p <= end))
         srcs = sources_of[(start, end)]
         if len(srcs) == 1 and len(targets_of[id(srcs[0])]) == 1:
             src = srcs[0]

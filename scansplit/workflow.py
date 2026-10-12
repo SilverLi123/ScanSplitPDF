@@ -25,6 +25,8 @@ def next_step(docs):
         if getattr(doc, "analysis_stale", False):
             return NextStep(2, "reanalyze", "方向已确认，更新拆分结果", "系统会按已确认的方向重新分析，保留你的人工决定。", "更新拆分并继续检查", i)
     for i, doc in enumerate(docs):
+        if not doc.groups:
+            return NextStep(2, "review", f"{doc.name}：没有可导出的内容页", "查看已删除空白页；若需保留，右键缩略图选择“恢复选中页”。", "查看空白页处理", i)
         if doc.pending_boundaries or any(not g.boundary_confirmed for g in doc.groups):
             return NextStep(2, "review", f"{doc.name}：拆分需要检查", "并排查看前后页，判断“这里开始新文件”还是“属于上一份”。", "检查拆分结果", i)
     for i, doc in enumerate(docs):

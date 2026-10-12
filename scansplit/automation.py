@@ -38,7 +38,7 @@ def name_ready(doc, engine=None, progress=None, cancel=None):
     if cancel() or not doc.analysis_complete or doc.analysis_stale:
         return []
     ready = {i for i, g in enumerate(doc.groups) if g.boundary_confirmed
-             and not any(g.start <= p <= g.end+1 for p in doc.pending_boundaries)
+             and not doc.pending_for_group(g)
              and not any(p.has_rotation_proposal for p in doc.pages[g.start-1:g.end])}
     if not ready:
         return []

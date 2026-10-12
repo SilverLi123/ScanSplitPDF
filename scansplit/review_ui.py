@@ -223,7 +223,7 @@ class ReviewDialog(tk.Toplevel):
         else:
             self.mode = "groups"
             self.heading.configure(text=f"检查拆分总览 · 当前 {len(self.doc.groups)} 份文件")
-            excluded = len(self.doc.separators)
+            excluded = len(self.doc.excluded_pages)
             self.detail.configure(text=f"点击每份查看首页和末页，确认页码范围。源文件 {self.doc.page_count} 页；保留 {self.doc.page_count-excluded} 页；明确排除 {excluded} 页。")
             for i, g in enumerate(self.doc.groups):
                 status="人工确认" if all(p in self.doc.manual_boundaries for p in g.pages) else "规则通过" if g.boundary_confirmed else "待确认"

@@ -1,5 +1,6 @@
 """Read-only product language. Does not analyse, confirm or export documents."""
 from dataclasses import dataclass
+from . import blankpolicy
 import re
 
 COLORS = dict(success="#17643c", warning="#805200", error="#a12828", info="#536173")
@@ -43,7 +44,7 @@ def field_info(group, field):
 
 def split_ready(doc, group):
     return (doc.analysis_complete and not doc.analysis_stale and group.boundary_confirmed
-            and not any(group.start <= p <= group.end+1 for p in doc.pending_boundaries)
+            and not doc.pending_for_group(group)
             and not any(p.has_rotation_proposal for p in doc.pages[group.start-1:group.end]))
 
 
@@ -55,7 +56,7 @@ def state_key(docs):
     """Cheap invalidation for displayed checks; no hashing PDF on each keystroke."""
     return tuple((str(d.path), d.source_sha256, d.analysis_complete, d.analysis_stale,
         d.naming_attempted, tuple(sorted(d.pending_boundaries.items())),tuple(sorted(d.manual_boundaries.items())),tuple(sorted(d.manual_separator_pages)),
-        tuple((p.separator,p.split_before,p.effective_rotation,p.rotation_proposal) for p in d.pages),
+        tuple((p.separator,p.omitted_blank,p.split_before,p.effective_rotation,p.rotation_proposal) for p in d.pages),
         tuple((g.start,g.end,g.title,g.unit,g.title_confirmed,g.unit_confirmed,g.boundary_confirmed,
                g.title_manual,g.unit_manual) for g in d.groups)) for d in docs)
 
@@ -67,6 +68,8 @@ def issues(docs):
             result.append(Issue(f"{di}:analyze", "自动分析", "文件尚未分析", "点击顶部“开始自动分析”，生成拆分草稿。", di, action="analyze", severity="info"))
             continue
         for p in d.pages:
+            if p.blank and p.blank.verdict in ('maybe', 'blank') and not p.omitted_blank and not p.separator and p.src_index not in d.manual_separator_pages:
+                result.append(Issue(f"{di}:blank:{p.src_index}", "空白页", "疑似空白，已保留", "空白证据不足；可能含页码、印章或签名。查看原页后可右键保留或排除。", di,p.src_index,action="page"))
             if p.has_rotation_proposal:
                 result.append(Issue(f"{di}:direction:{p.src_index}", "页面方向", "方向需要确认", p.rotation_proposal_note or "请按原页确认文字是否正向；建议尚未应用。", di,p.src_index,action="direction"))
         if d.analysis_stale:
@@ -74,7 +77,7 @@ def issues(docs):
         for p,reason in sorted(d.pending_boundaries.items()):
             result.append(Issue(f"{di}:boundary:{p}", "拆分交界", "文件归属需要确认", reason,di,p,action="boundary"))
         for gi,g in enumerate(d.groups):
-            if not g.boundary_confirmed and not any(g.start<=p<=g.end+1 for p in d.pending_boundaries) and not d.analysis_stale and not any(p.has_rotation_proposal for p in d.pages[g.start-1:g.end]):
+            if not g.boundary_confirmed and not d.pending_for_group(g) and not d.analysis_stale and not any(p.has_rotation_proposal for p in d.pages[g.start-1:g.end]):
                 result.append(Issue(f"{di}:group:{gi}", "文件范围", "页码范围需要确认", f"核对原第 {g.start}–{g.end} 页是否属于同一份文件。",di,g.start,gi,action="group"))
             if not d.naming_attempted:
                 continue
@@ -101,7 +104,12 @@ def page_info(doc, number):
     p=doc.pages[number-1]
     gi=next((i for i,g in enumerate(doc.groups) if g.start<=number<=g.end),None)
     belongs = f"文件 {gi+1}" if gi is not None else "未归入文件"
-    if p.separator:
+    if p.omitted_blank:
+        belongs = "不进入输出" + (f" · 原属文件 {gi+1}" if gi is not None else "")
+    if p.omitted_blank:
+        page_type=("已人工确认删除（仅输出，可恢复）" if number in doc.manual_separator_pages else
+                   "明确空白 · 规则自动删除（仅输出，可恢复）" if blankpolicy.valid_exclusion(p) else "空白排除证据无效 · 阻止导出")
+    elif p.separator:
         page_type="已人工确认排除" if number in doc.manual_separator_pages else "排除状态需核查"
     elif not p.blank:
         page_type="尚未分析 · 保留"

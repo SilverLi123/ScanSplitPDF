@@ -14,7 +14,7 @@ from tkinter import messagebox, ttk
 
 from PIL import ImageTk
 
-from . import naming, presentation
+from . import naming, presentation, blankpolicy
 
 THUMB_CELL_W = 176
 THUMB_CELL_H = 234
@@ -97,7 +97,9 @@ class ThumbnailStrip(ttk.Frame):
         doc=self._doc
         g=next((g for g in doc.groups if g.start<=page.src_index<=g.end),None) if doc else None
         pending=page.has_rotation_proposal or (doc and (doc.analysis_stale or page.src_index in doc.pending_boundaries or (g and not g.boundary_confirmed)))
-        if pending:
+        if page.omitted_blank:
+            out=[("人工确认删除","confirmed")] if doc and page.src_index in doc.manual_separator_pages else [("明确空白 · 自动删除","confirmed")] if blankpolicy.valid_exclusion(page) else [("排除需核查","uncertain")]
+        elif pending:
             out=[("⚠ 待确认","uncertain")]
         elif page.separator:
             out=[("✓ 已确认排除","confirmed")] if doc and page.src_index in doc.manual_separator_pages else [("⚠ 排除需核查","uncertain")]
@@ -195,11 +197,11 @@ class ThumbnailStrip(ttk.Frame):
         self.app.on_page_select(p, preview=False)
         page = self._doc.pages[p - 1]
         menu = tk.Menu(self, tearoff=0)
-        if page.separator:
-            menu.add_command(label="取消分隔标记", command=lambda: self.app.set_separator(list(self.app.sel_pages), False))
+        if page.separator or page.omitted_blank:
+            menu.add_command(label="恢复选中页（保留到输出）", command=lambda: self.app.set_output_exclusion(list(self.app.sel_pages), False))
         else:
             menu.add_command(label="从此页开始新文件（保留页）", command=lambda: self.app.add_split_before(p))
-            menu.add_command(label="排除选中页（分隔空白）", command=lambda: self.app.set_separator(list(self.app.sel_pages), True))
+            menu.add_command(label="删除选中页（仅输出，不改变交界）", command=lambda: self.app.set_output_exclusion(list(self.app.sel_pages), True))
         if page.blank is not None:
             menu.add_command(label="查看空白判定详情", command=lambda: self.app.show_blank_detail(p))
         menu.add_separator()
@@ -471,14 +473,14 @@ class PreviewPane(ttk.Frame):
         """在预览页四周画描边：方向建议=紫色虚线（未生效），
         已生效旋转=蓝色实线，分隔页=红色实线（导出排除）。"""
         cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
-        if page.separator:
+        if page.separator or page.omitted_blank:
             confirmed=self._doc and page.src_index in self._doc.manual_separator_pages
-            color=presentation.COLORS["info" if confirmed else "error"]
+            color=presentation.COLORS["info" if confirmed or blankpolicy.valid_exclusion(page) else "error"]
             self.canvas.create_rectangle(
                 2, 2, cw - 3, ch - 3, outline=color, width=2, dash=(8, 4), tags="hl",
             )
             self.canvas.create_text(
-                cw // 2, 16, text="已确认排除 · 不进入导出" if confirmed else "排除状态需核查", fill=color,
+                cw // 2, 16, text="已人工确认删除 · 右键可恢复" if confirmed else "明确空白 · 自动删除 · 右键可恢复" if blankpolicy.valid_exclusion(page) else "排除状态需核查", fill=color,
                 font=("Segoe UI", 10, "bold"), tags="hl",
             )
         elif proposal_deg is not None:
@@ -543,7 +545,7 @@ class GroupPanel(ttk.LabelFrame):
 
         head = ttk.Frame(self)
         head.pack(fill="x")
-        self.header_label = ttk.Label(head, text=f"文档 {gi + 1} · 第 {group.start}-{group.end} 页（{group.page_count} 页）",
+        self.header_label = ttk.Label(head, text=f"文档 {gi + 1} · 原第 {group.start}-{group.end} 页（导出 {group.page_count} 页" + (f"，删除 {len(group.excluded_pages)} 页" if group.excluded_pages else "") + "）",
                   font=("Segoe UI", 10, "bold"),wraplength=450)
         self.header_label.pack(anchor="w")
         self.confirm_lbl = ttk.Label(head, text="", padding=(5, 0),wraplength=450)
@@ -1006,10 +1008,12 @@ class GroupPanelArea(ttk.Frame):
         """汇总本文件的待处理问题（待确认字段 / 待确认边界 / 分隔页）。"""
         n_conf = [gi for gi, g in enumerate(doc.groups) if not g.title_confirmed or not g.unit_confirmed or not g.title.strip() or not g.unit.strip()]
         n_boundary = sum(not g.boundary_confirmed for g in doc.groups)
-        n_sep = len(doc.separators)
+        n_sep = len(doc.excluded_pages)
         n_split = len(doc.split_starts)
         n_prop = sum(1 for p in doc.pages if getattr(p, "has_rotation_proposal", False))
         parts = [f"文件 {len(doc.groups)} 份"]
+        if n_sep:
+            parts.append(f"输出删除 {n_sep} 页")
         if n_boundary:
             parts.append(f"拆分待确认 {n_boundary} 份")
         if n_conf:
@@ -1281,7 +1285,7 @@ class ExportSummaryDialog(tk.Toplevel):
                 var = tk.BooleanVar(value=True)
                 self._vars.append(((di, gi), var))
                 self.tree.insert("", "end", iid=str(idx), values=(
-                    mark, idx, f"{g.start}-{g.end}", name, state,
+                    mark, idx, f"{g.start}-{g.end}" + (f" → {g.page_count} 页" if g.excluded_pages else ""), name, state,
                 ))
         self._refresh_marks()
 

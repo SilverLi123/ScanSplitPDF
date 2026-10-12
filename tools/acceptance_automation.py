@@ -28,7 +28,7 @@ def run(source_folder,out):
         assert before==old['source_sha256'],'Use the exact baseline PDF, never a changed fixture'
         doc=ScanDocument(source,PdfReader(source))
         t=time.monotonic()
-        pipeline.organize_document(doc,engine=engine)
+        pipeline.organize_document(doc,engine=engine,remove_blank=False)  # Preserve v1.14 acceptance policy.
         current=dict(groups=[(g.start,g.end) for g in doc.groups],
                      directions=[p.src_index for p in doc.pages if p.has_rotation_proposal],
                      pending=dict(doc.pending_boundaries),
@@ -69,7 +69,7 @@ def run(source_folder,out):
     orientations[0].save(source,'PDF',save_all=True,append_images=orientations[1:],resolution=144,quality=95)
     before=verify.file_sha256(source)
     doc=ScanDocument(source,PdfReader(source))
-    pipeline.organize_document(doc,engine=engine)
+    pipeline.organize_document(doc,engine=engine,remove_blank=False)
     assert all(doc.pages[i].has_rotation_proposal for i in (1,2,3)), 'Never silently accept a rotated image'
     assert all(p.effective_rotation==0 and not p.is_rotation_manual for p in doc.pages)
     assert verify.file_sha256(source)==before
