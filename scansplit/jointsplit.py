@@ -4,6 +4,55 @@ import math
 from dataclasses import replace
 
 
+def form_identity(lines, width, height, structure, units):
+    """Read a form's identity from actual header boxes, not naming scores.
+
+    Naming confidence includes format priors. Those priors must not discard a
+    clearly read, repeated form header as independent pagination evidence.
+    This is only a sequence cross-check; it never approves a title or unit name.
+    Require one complete title line and one explicit reporting-unit label/value,
+    with every supporting OCR box strong. No footer/header organisation fallback.
+    """
+    if not (math.isfinite(width) and math.isfinite(height) and width > 0 and height > 0
+            and structure.get('has_title') and structure.get('title_is_max')
+            and not structure.get('has_section') and not structure.get('has_continuation')
+            and len(units) == 1 and units[0].source == '填报单位'):
+        return None
+    title = structure.get('title_text', '')
+    ts = [ln for ln in lines if ln.text.strip() == title]
+    if len(ts) != 1 or len(title) < 4:
+        return None
+    def strong(ln):
+        return (math.isfinite(ln.score) and .85 <= ln.score <= 1
+                and all(map(math.isfinite, (ln.x0, ln.y0, ln.x1, ln.y1)))
+                and 0 <= ln.x0 < ln.x1 <= width and 0 <= ln.y0 < ln.y1 <= height)
+    t = ts[0]
+    if not (strong(t) and t.cy <= height*.20 and t.height >= height*.02
+            and abs(t.cx-width/2) < width*.22):
+        return None
+    box = units[0].bbox
+    if not (box and len(box) == 4 and all(map(math.isfinite, box))):
+        return None
+    x0, y0, x1, y1 = box
+    if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height and y1 <= height*.22):
+        return None
+    supporting = [ln for ln in lines if ln.x0 >= x0-1 and ln.x1 <= x1+1
+                  and ln.y0 >= y0-1 and ln.y1 <= y1+1]
+    label = re.compile(r'^填\s*报\s*单\s*位\s*[：:]?\s*(.*)$')
+    labels = [ln for ln in supporting if label.match(ln.text.strip())]
+    if (len(labels) != 1 or not 1 <= len(supporting) <= 2
+            or not all(strong(ln) for ln in supporting)):
+        return None
+    value = label.match(labels[0].text.strip()).group(1).strip()
+    if value:
+        if len(supporting) != 1 or value != units[0].text:
+            return None
+    elif len(supporting) != 2 or not any(
+            ln is not labels[0] and ln.text.strip() == units[0].text for ln in supporting):
+        return None
+    return title, units[0].text
+
+
 def confirm_pagination_sequences(features, content, manual, separators):
     """Certify observed form labels with independent sequence and identity evidence.
 

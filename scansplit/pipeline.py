@@ -129,9 +129,10 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None, 
                 and ln.score >= .85 and ocrfields._title_pattern_score(ln.text.strip()) >= 1}
             features[p] = dict(structure=structure,
                 running_title=next(iter(running_titles)) if len(running_titles)==1 else None,
-                reporting_identity=(titles[0].text, units[0].text) if (
+                reporting_identity=((titles[0].text, units[0].text) if (
                     titles and titles[0].confidence >= .85 and units and units[0].confidence >= .85
-                    and len({c.text for c in units}) == 1) else None,
+                    and len({c.text for c in units}) == 1) else
+                    jointsplit.form_identity(lines,w,h,structure,units)),
                 reliable_first_page=bool(structure.get('has_title') and structure.get('title_is_max')
                     and not structure.get('has_section') and not structure.get('has_continuation')
                     and titles and titles[0].confidence >= .85
