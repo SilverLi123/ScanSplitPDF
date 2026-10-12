@@ -1,5 +1,59 @@
 """Blank-run + printed-pagination decisions. No page exclusion or PDF writes."""
 import re
+import math
+from dataclasses import replace
+
+
+def confirm_pagination_sequences(features, content, manual, separators):
+    """Certify observed form labels with independent sequence and identity evidence.
+
+    Single weak OCR, bare digits, duplicate/conflicting candidates and missing
+    numbers never qualify. Require three actual consecutive numbers at the same
+    position and independent identity evidence. Form labels need a strong title
+    and labelled reporting unit; decorated footer numbers need a strong repeated
+    document title on all three pages and no conflicting labelled units.
+    Manual boundaries and separators stop a sequence; no missing digit is filled.
+    """
+    approved = set()
+    for i in range(len(content)-2):
+        pages = content[i:i+3]
+        if any(p in manual for p in pages[1:]) or any(
+                p in separators for p in range(pages[0]+1, pages[-1])):
+            continue
+        fs = [features.get(p, {}) for p in pages]
+        es = [f.get('pagination') for f in fs]
+        if not all(e and e.number is not None and e.position and not e.ambiguous
+                   and math.isfinite(e.score) and all(map(math.isfinite,e.position)) for e in es):
+            continue
+        form = all(e.kind == 'form_label' and e.score >= .70 for e in es)
+        footer = all(e.kind == 'decorated' and e.score >= .50
+                     and not 1900 <= e.number <= 2099
+                     and e.position[1] >= .94 and abs(e.position[0]-.5) <= .18 for e in es)
+        if not (form or footer):
+            continue
+        if [e.number for e in es] != list(range(es[0].number, es[0].number+3)):
+            continue
+        if len({e.total for e in es}) != 1 or any(
+                abs(e.position[0]-es[0].position[0]) > .025
+                or abs(e.position[1]-es[0].position[1]) > .015 for e in es):
+            continue
+        identities = [f.get('reporting_identity' if form else 'running_title') for f in fs]
+        if not all(identities) or len(set(identities)) != 1:
+            continue
+        if footer and (any(len(f.get('units',set())) > 1 for f in fs)
+                       or len(set().union(*(f.get('units',set()) for f in fs))) > 1):
+            continue
+        if any(f.get('structure', {}).get('has_continuation') for f in fs):
+            continue
+        approved.update(pages)
+    for p in approved:
+        e = features[p]['pagination']
+        if not e.reliable:
+            features[p]['pagination'] = replace(e, reliable=True,
+                reason=('三页明确页次标签连续，位置、标题及填报单位一致（规则交叉核对）'
+                        if e.kind == 'form_label' else
+                        '三页页边印刷页码连续，位置与同源标题一致（规则交叉核对）'))
+    return approved
 
 
 def blank_start(previous, current, verified_blank):
@@ -44,6 +98,8 @@ def decide(previous, current, blank_pages=()):
         return ("review", prefix+f"两侧页码不能可靠比较：前页{before.reason}；后页{after.reason}") if blank_pages or has_candidate else None
     a, b = before.number, after.number
     comparison = f"两侧印刷页码 {a} → {b}；"
+    if any('规则交叉核对' in e.reason for e in (before, after)):
+        comparison += '多页页码与文档信息已交叉核对；'
     if b == 1:
         if continuation:
             return "review", prefix+comparison+"页码重新从1开始，但存在续表/附件标记"
@@ -86,7 +142,7 @@ def check_sequence(features, content, index, manual, separators, decision, reaso
     # A cropped table cell can look like a centred footer digit. Require a full
     # surrounding number sequence for bare/fraction/dash formats, no extra title
     # or blank requirement. Explicit Page/第...页 labels still stand alone.
-    bare = lambda evidence: bool(evidence.text) and not re.match(r"^(第|page\s*\d)", evidence.text, re.I)
+    bare = lambda evidence: bool(evidence.text) and not re.match(r"^(第|page\s*\d|页\s*(?:次|码)\s*[：:])", evidence.text, re.I)
     if bare(before) or bare(after):
         pp = content[index-2] if index >= 2 else None
         np = content[index+1] if index+1 < len(content) else None

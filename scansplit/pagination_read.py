@@ -17,14 +17,18 @@ def refine(renderer, index, engine, angle, base, cancel=lambda: False):
         return base
     if base.text and base.number is None:
         return base
+    if base.ambiguous:
+        return base
     image = renderer.render(index, width_px=WIDTH, user_rotation=angle, bucket="pagination")
     w, h = image.size
     cache = ocr_cache.get_cache()
     lines = []
-    for name, top, bottom in (("header", 0, int(h*.15)), ("footer", int(h*.85), h)):
+    # Keep the entire metadata line on landscape forms. At 15%, the crop can
+    # cut the digits and be so wide/short that RapidOCR skips text detection.
+    for name, top, bottom in (("header", 0, int(h*.18)), ("footer", int(h*.85), h)):
         if cancel():
             return base
-        key = ocr_cache.OcrCache.make_key(renderer, index, WIDTH, angle, "pagination-"+name+"-v1")
+        key = ocr_cache.OcrCache.make_key(renderer, index, WIDTH, angle, "pagination-"+name+("-v2" if name == "header" else "-v1"))
         found = cache.get(key) if cache.enabled else None
         if found is None:
             found = engine.recognize(image.crop((0, top, w, bottom)))
@@ -42,5 +46,8 @@ def refine(renderer, index, engine, angle, base, cancel=lambda: False):
     if regional.reliable:
         return replace(regional, reason="高分辨率页边区域 OCR："+regional.reason)
     if not base.text and regional.text:
+        return replace(regional, reason="页边区域 OCR 仍待确认："+regional.reason)
+    if (base.number is not None and regional.number == base.number and regional.score > base.score
+            and regional.kind and (base.total is None or regional.total == base.total)):
         return replace(regional, reason="页边区域 OCR 仍待确认："+regional.reason)
     return base

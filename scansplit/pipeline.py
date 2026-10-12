@@ -125,7 +125,13 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None, 
             structure = ocrfields.first_page_structure(lines,w,h)
             titles = ocrfields.extract_title(lines,w,h)
             units = ocrfields.extract_reporting_unit(lines,w,h)
+            running_titles = {ln.text.strip() for ln in lines if ln.cy <= h*.20
+                and ln.score >= .85 and ocrfields._title_pattern_score(ln.text.strip()) >= 1}
             features[p] = dict(structure=structure,
+                running_title=next(iter(running_titles)) if len(running_titles)==1 else None,
+                reporting_identity=(titles[0].text, units[0].text) if (
+                    titles and titles[0].confidence >= .85 and units and units[0].confidence >= .85
+                    and len({c.text for c in units}) == 1) else None,
                 reliable_first_page=bool(structure.get('has_title') and structure.get('title_is_max')
                     and not structure.get('has_section') and not structure.get('has_continuation')
                     and titles and titles[0].confidence >= .85
@@ -135,6 +141,7 @@ def analyze_document(doc, params=None, engine=None, progress=None, cancel=None, 
                 pagination=evidence,
                 units={c.text for c in units})
             progress(done, len(content), '分析文档边界')
+        jointsplit.confirm_pagination_sequences(features, content, doc.manual_boundaries, doc.separators)
         evs = splitctx.judge_blank_context(doc, renderer, engine, page_cache=cache, cancel_cb=cancel)
         for ev in evs:
             if ev.verdict == splitctx.SEPARATOR:

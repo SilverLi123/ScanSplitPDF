@@ -17,6 +17,7 @@ OCR 只读渲染图像，识别内容绝不写回 PDF。
 from __future__ import annotations
 
 import re
+import math
 import unicodedata
 from dataclasses import dataclass, asdict
 
@@ -28,6 +29,10 @@ class PaginationEvidence:
     reliable: bool = False
     text: str = ""
     reason: str = "未找到可靠印刷页码"
+    score: float = 0.0
+    kind: str = ""
+    position: tuple[float, float] | None = None
+    ambiguous: bool = False
 
     def to_dict(self):
         return asdict(self)
@@ -43,10 +48,11 @@ def pagination_evidence(lines, page_w: float, page_h: float) -> PaginationEviden
     found = []
     for line in lines:
         cy = (line.y0 + line.y1) / 2
-        if not (cy <= page_h * .15 or cy >= page_h * .85):
-            continue
         text = unicodedata.normalize("NFKC", line.text).strip()
-        explicit = re.fullmatch(r"第\s*(\d{1,4})\s*页(?:\s*[,，]?\s*共\s*(\d{1,4})\s*页)?", text)
+        labeled = re.fullmatch(r"页\s*(?:次|码)\s*[：:]\s*(\d{1,4})(?:\s*/\s*(\d{1,4}))?", text)
+        if not (cy <= page_h * (.18 if labeled else .15) or cy >= page_h * .85):
+            continue
+        explicit = labeled or re.fullmatch(r"第\s*(\d{1,4})\s*页(?:\s*[,，]?\s*共\s*(\d{1,4})\s*页)?", text)
         if explicit is None:
             explicit = re.fullmatch(r"page\s*(\d{1,4})(?:\s*(?:of|/)\s*(\d{1,4}))?", text, re.I)
         match = explicit or re.fullmatch(r"(\d{1,4})\s*/\s*(\d{1,4})", text)
@@ -57,16 +63,25 @@ def pagination_evidence(lines, page_w: float, page_h: float) -> PaginationEviden
             number, total = _match_page_number(text), None
         if number is None:
             continue
+        centred = (hasattr(line, "x0") and hasattr(line, "x1") and page_w > 0
+                   and abs((line.x0 + line.x1)/2 - page_w/2) <= page_w * .18)
+        extreme = cy <= page_h * .06 or cy >= page_h * .94
+        # Table cells near the bottom are ordinary content, not contradictory
+        # pagination candidates. Filter geometry before comparing candidates.
+        if not explicit and not (centred and extreme):
+            continue
         if number < 1 or (total is not None and not number <= total <= _MAX_PAGENO):
             found.append(PaginationEvidence(text=text, reason="页码或总页数格式不合理"))
             continue
         score = float(getattr(line, "score", 0) or 0)
-        centred = (hasattr(line, "x0") and hasattr(line, "x1") and page_w > 0
-                   and abs((line.x0 + line.x1)/2 - page_w/2) <= page_w * .18)
-        extreme = cy <= page_h * .06 or cy >= page_h * .94
+        if not math.isfinite(score) or not 0 <= score <= 1:
+            score = 0.0
         reliable = score >= .85 if explicit else score >= .90 and centred and extreme and not 1900 <= number <= 2099
         found.append(PaginationEvidence(number, total, reliable, text,
-            "明确页码标签" if explicit and reliable else "页边居中印刷页码" if reliable else "数字位置或识别证据不足"))
+            "明确页码标签" if explicit and reliable else "页边居中印刷页码" if reliable else "数字位置或识别证据不足",
+            score, "form_label" if labeled else "explicit" if explicit else
+            "decorated" if re.fullmatch(r"[-—–]\s*\d{1,4}\s*[-—–]", text) else "number",
+            (float(line.cx)/page_w, float(cy)/page_h) if page_w > 0 and page_h > 0 else None))
     if not found:
         return PaginationEvidence()
     if len({(c.number, c.total) for c in found}) != 1:
@@ -74,7 +89,10 @@ def pagination_evidence(lines, page_w: float, page_h: float) -> PaginationEviden
     # Every matching line must qualify; duplicate OCR lines do not add certainty.
     best = found[0]
     if not all(c.reliable for c in found):
-        return PaginationEvidence(best.number, best.total, False, best.text, "页码识别证据不足或重复候选不一致")
+        # A duplicate weak line cannot become a sequence candidate.
+        from dataclasses import replace
+        return replace(best, reliable=False, reason="页码识别证据不足或重复候选不一致",
+                       kind=best.kind if len(found) == 1 else "", ambiguous=len(found) > 1)
     return best
 
 # 整行匹配的页码文本模式（按优先级排列）
