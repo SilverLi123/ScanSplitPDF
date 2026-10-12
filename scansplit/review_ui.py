@@ -18,6 +18,7 @@ class ReviewPage(ttk.Frame):
         bar.pack(fill="x")
         self.caption = ttk.Label(bar, font=("Microsoft YaHei UI", 10, "bold"))
         self.caption.pack(anchor="w")
+        self.bind("<Configure>", lambda e: self.caption.configure(wraplength=max(120,e.width-10)),add="+")
         zoom_bar = ttk.Frame(self, padding=(4, 0))
         zoom_bar.pack(fill="x")
         for label, factor in [("−", .8), ("+", 1.25), ("适合窗口", 0)]:
@@ -139,7 +140,7 @@ class ReviewDialog(tk.Toplevel):
         self.right_page.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
         body.add(queue, weight=1)
         body.add(evidence, weight=5)
-        body.bind("<Configure>", lambda e: body.sashpos(0, min(230, max(200, e.width//5))))
+        body.bind("<Configure>", lambda e: body.sashpos(0, min(320, max(260, int(e.width*.27)))))
         self.context = ttk.Label(self, padding=(16, 5), wraplength=1000, foreground="#6a4b12")
         self.context.pack(fill="x")
         self.actions = ttk.Frame(self, padding=(16, 6))

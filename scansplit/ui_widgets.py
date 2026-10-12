@@ -280,18 +280,18 @@ class PreviewPane(ttk.Frame):
         self._fit_job = None
         bar = ttk.Frame(self)
         bar.pack(fill="x", padx=4, pady=2)
-        ttk.Button(bar, text="◀ 上一页", width=9, command=lambda: self.app.step_page(-1)).pack(side="left")
-        self.page_lbl = ttk.Label(bar, text="第 - / - 页", width=13, anchor="center")
+        ttk.Button(bar, text="上一页", width=6, command=lambda: self.app.step_page(-1)).pack(side="left")
+        self.page_lbl = ttk.Label(bar, text="第 - / - 页", width=11, anchor="center")
         self.page_lbl.pack(side="left", padx=4)
-        ttk.Button(bar, text="下一页 ▶", width=9, command=lambda: self.app.step_page(1)).pack(side="left")
+        ttk.Button(bar, text="下一页", width=6, command=lambda: self.app.step_page(1)).pack(side="left")
         zoom_bar = ttk.Frame(self)
         zoom_bar.pack(fill="x", padx=4, pady=2)
         ttk.Button(zoom_bar, text="适应窗口", width=8, command=self._fit).pack(side="left")
         ttk.Button(zoom_bar, text="−", width=3, command=lambda: self.zoom_around(1 / 1.25)).pack(side="left")
-        self.zoom_lbl = ttk.Label(zoom_bar, text="100%", width=7, anchor="center")
+        self.zoom_lbl = ttk.Label(zoom_bar, text="100%", width=5, anchor="center")
         self.zoom_lbl.pack(side="left", padx=2)
         ttk.Button(zoom_bar, text="＋", width=3, command=lambda: self.zoom_around(1.25)).pack(side="left")
-        rotate_menu = ttk.Menubutton(zoom_bar, text="旋转页面")
+        rotate_menu = ttk.Menubutton(zoom_bar, text="旋转")
         menu = tk.Menu(rotate_menu, tearoff=False)
         for text, command in [("向左转 90°", lambda: self.app.rotate_selection(-90)),
                               ("向右转 90°", lambda: self.app.rotate_selection(90)),
@@ -446,7 +446,7 @@ class PreviewPane(ttk.Frame):
         self.canvas.yview_moveto(fy)
         self.page_lbl.configure(text=f"第 {self._page_no} / {len(doc.pages)} 页")
         if self.fit_mode:
-            self.zoom_lbl.configure(text=f"适应 {int(round(self.zoom * 100))}%")
+            self.zoom_lbl.configure(text=f"{int(round(self.zoom * 100))}%")
         else:
             self.zoom_lbl.configure(text=f"{int(round(self.zoom * 100))}%")
         # v1.9.1 改进2：预览内明确区分"已生效方向"与"待确认建议"，
@@ -537,9 +537,10 @@ class GroupPanel(ttk.LabelFrame):
 
         head = ttk.Frame(self)
         head.pack(fill="x")
-        ttk.Label(head, text=f"文档 {gi + 1} · 第 {group.start}-{group.end} 页（{group.page_count} 页）",
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        self.confirm_lbl = ttk.Label(head, text="", padding=(5, 0))
+        self.header_label = ttk.Label(head, text=f"文档 {gi + 1} · 第 {group.start}-{group.end} 页（{group.page_count} 页）",
+                  font=("Segoe UI", 10, "bold"),wraplength=450)
+        self.header_label.pack(anchor="w")
+        self.confirm_lbl = ttk.Label(head, text="", padding=(5, 0),wraplength=450)
         self.confirm_lbl.pack(anchor="w", pady=(4, 0))
         actions = ttk.Frame(self)
         actions.pack(fill="x", pady=2)
@@ -552,13 +553,13 @@ class GroupPanel(ttk.LabelFrame):
         ttk.Label(bd, text="页码：", foreground="#49566a").pack(side="left")
         prev_p = group.start - 1
         next_p = group.end + 1
-        ttk.Button(bd, text=f"前页 {prev_p}" if prev_p >= 1 else "前页 —", width=7,
+        ttk.Button(bd, text="前页", width=5,
                    command=lambda p=prev_p: self._preview(p)).pack(side="left", padx=1)
-        ttk.Button(bd, text=f"首页 {group.start}", width=7,
+        ttk.Button(bd, text="首页", width=5,
                    command=lambda: self._preview(group.start)).pack(side="left", padx=1)
-        ttk.Button(bd, text=f"末页 {group.end}", width=7,
+        ttk.Button(bd, text="末页", width=5,
                    command=lambda: self._preview(group.end)).pack(side="left", padx=1)
-        ttk.Button(bd, text=f"后页 {next_p}" if next_p <= self.doc.page_count else "后页 —", width=7,
+        ttk.Button(bd, text="后页", width=5,
                    command=lambda p=next_p: self._preview(p)).pack(side="left", padx=1)
 
         self.title_var = tk.StringVar(value=group.title)
@@ -637,6 +638,13 @@ class GroupPanel(ttk.LabelFrame):
         self._update_filename()
         self._update_confirm_badge()
         self._refresh_field_hints()
+        self.bind("<Configure>", self._resize_text)
+
+    def _resize_text(self,event):
+        width = max(160,event.width-24)
+        for label in (self.header_label,self.confirm_lbl,self.title_conf_lbl,self.unit_conf_lbl):
+            label.configure(wraplength=width)
+        self.fname_lbl.configure(wraplength=max(120,width-60))
 
     def _build_candidate_map(self, cands: list) -> dict[str, str]:
         """候选 → 展示标签（按置信度降序）。

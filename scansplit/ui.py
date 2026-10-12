@@ -114,7 +114,6 @@ class App:
             ("detect", "重新自动拆分", self.automatic_split),
             ("group", "查看 / 调整拆分", self.review_pending),
             ("ocr", "重新识别名称", self.ocr_name),
-            ("export", "导出清单…", self.export_all),
         ]:
             b = ttk.Button(tools, text=text, command=cmd)
             b.pack(side="left", padx=3)
@@ -139,6 +138,13 @@ class App:
         files_frame.pack(fill="x", padx=2)
         self.file_list = tk.Listbox(files_frame, height=4, exportselection=False)
         self.file_list.pack(fill="x")
+        file_scroll = ttk.Scrollbar(files_frame, orient="horizontal", command=self.file_list.xview)
+        self.file_list.configure(xscrollcommand=file_scroll.set)
+        file_scroll.pack(fill="x")
+        self.selected_file_var = tk.StringVar(value="尚未导入文件")
+        selected_file_label = ttk.Label(files_frame, textvariable=self.selected_file_var, wraplength=280, justify="left")
+        selected_file_label.pack(fill="x", pady=(3,0))
+        files_frame.bind("<Configure>", lambda e: selected_file_label.configure(wraplength=max(120,e.width-16)))
         self.file_list.bind("<<ListboxSelect>>", self._on_file_select)
         self.file_list.bind("<Button-3>", self._on_file_menu)
         ttk.Label(left, text="原始页面 · 点击预览").pack(anchor="w", padx=4, pady=(4, 0))
@@ -152,24 +158,35 @@ class App:
         self.groups = GroupPanelArea(right, self)
         self.groups.pack(fill="both", expand=True)
 
-        paned.add(left, weight=1)
+        paned.add(left, weight=3)
         paned.add(self.preview, weight=4)
-        paned.add(right, weight=3)
+        paned.add(right, weight=5)
+        self.main_panes = paned
         self._pane_width = None
         def size_panes(event):
             if event.width == self._pane_width:
                 return
             self._pane_width = event.width
-            left_width = 190 if event.width >= 1300 else 170
-            right_width = 440
+            left_width = max(260, int(event.width*.24))
+            right_width = max(480, int(event.width*.44))
             paned.sashpos(0, left_width)
-            paned.sashpos(1, max(left_width+260, event.width-right_width))
+            paned.sashpos(1, max(left_width+300, event.width-right_width))
         paned.bind("<Configure>", size_panes)
 
-        bottom = ttk.Frame(root, padding=(6, 0, 6, 4))
+        bottom = ttk.Frame(root, padding=(12, 6, 12, 8))
         bottom.pack(fill="x")
+        export_row = ttk.Frame(bottom)
+        export_row.pack(fill="x")
+        self.export_button = ttk.Button(export_row, text="导出 PDF…", style="Primary.TButton", command=self.export_all)
+        self.export_button.pack(side="right", padx=(16,0))
+        self.tool_btns["export"] = self.export_button
+        export_info = ttk.Frame(export_row)
+        export_info.pack(side="left",fill="x",expand=True)
+        self.export_notice_var = tk.StringVar()
+        notice = ttk.Label(export_info,textvariable=self.export_notice_var,font=("Microsoft YaHei UI",10,"bold"),wraplength=800)
+        notice.pack(anchor="w")
         status_row = ttk.Frame(bottom)
-        status_row.pack(fill="x")
+        status_row.pack(fill="x",pady=(4,0))
         self.status_var = tk.StringVar()
         ttk.Label(status_row, textvariable=self.status_var, anchor="w").pack(
             side="left", fill="x", expand=True)
@@ -266,6 +283,17 @@ class App:
             f"文件 {len(docs)} · 共 {total_pages} 页 · 空白候选 {blanks} · 疑似 {maybes}"
             f" · 分组 {n_groups} · 待确认 {n_conf}{cur}"
         )
+        self.selected_file_var.set(doc.name if doc else "尚未导入文件")
+        confirmed = sum(1 for d in docs for g in d.groups
+            if not g.need_confirm and g.title.strip() and g.unit.strip() and not d.analysis_stale
+            and not any(p.has_rotation_proposal for p in d.pages[g.start-1:g.end]))
+        if not n_groups:
+            notice = "完成拆分与命名后，从右侧“导出 PDF…”保存文件。"
+        elif confirmed < n_groups:
+            notice = f"已确认 {confirmed}/{n_groups} 份，还有 {n_groups-confirmed} 份待检查。点击“导出 PDF…”可查看清单。"
+        else:
+            notice = f"{n_groups} 份文件已确认，点击右侧“导出 PDF…”核对清单并保存。"
+        self.export_notice_var.set(notice)
         self._update_step_state(len(docs), self._blank_analysis_done(), n_groups, n_conf)
 
     def _blank_analysis_done(self) -> bool:
