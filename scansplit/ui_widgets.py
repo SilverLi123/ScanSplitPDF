@@ -796,8 +796,10 @@ class GroupPanel(ttk.LabelFrame):
     def _refresh_field_hints(self):
         """刷新标题/单位证据行（区分自动建议与已人工确认）。"""
         for field in ("title", "unit"):
-            status,source,severity,_=presentation.field_info(self.group,field)
+            status,source,severity,match=presentation.field_info(self.group,field)
             text=f"{status}\n来源：{source}（点击核对）"
+            if field == "unit" and match and match.get("source") == "末页右下角落款" and not self.group.unit_manual:
+                text += "\n请确认该落款是否为填报单位。"
             if not getattr(self.group, field).strip():
                 text = "尚未识别，请先点击顶部“识别标题与填报单位”。" if not self.doc.naming_attempted else (
                     "未找到明确的填报单位，请核对原件后填写。" if field == "unit" else "未找到可靠标题，请按原件填写。")
@@ -888,10 +890,15 @@ class GroupPanel(ttk.LabelFrame):
                 f"依据：{c.get('reason', '')}")
 
     def focus_pending(self,field=None):
-        """定位本组首页，并让面板滚动到可视区（"下一处待确认"用）。"""
-        self._preview(self.group.start)
+        """定位实际字段来源；分组未确认时仍先查看首页。"""
+        field=field or ("title" if not self.group.title_confirmed or not self.group.title.strip() else "unit")
+        match = (presentation.field_info(self.group,field)[3]
+                 if self.group.boundary_confirmed and not self.doc.analysis_stale
+                 and field in ("title", "unit") and getattr(self.group,field+"_edit_kind", "") != "edited" else None)
+        self._preview((match or {}).get("page") or self.group.start)
+        if match and match.get("bbox") and match.get("image_size"):
+            self.app.preview.show_evidence(match["bbox"], match["image_size"])
         if self.group.boundary_confirmed and not self.doc.analysis_stale:
-            field=field or ("title" if not self.group.title_confirmed or not self.group.title.strip() else "unit")
             self._edit_field(field)
             entry = getattr(self,field+"_entry")
             entry.focus_set()

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from . import naming, ocr_cache, ocrfields, pagenum
+from . import naming, ocr_cache, ocrfields, pagenum, unit_region
 from .model import ScanDocument
 
 CONFIRM_THRESHOLD = 0.55  # 低于此置信度标记"待确认"
@@ -73,7 +73,8 @@ class NameResult:
 
 def reporting_unit_auto_confirm(res: NameResult) -> bool:
     candidates = [c for c in res.unit_candidates if c.source == "填报单位"]
-    return bool(candidates and candidates[0].confidence >= .85
+    return bool(res.best_unit and res.best_unit.source == "填报单位"
+                and candidates and candidates[0].confidence >= .85
                 and len({c.text.strip() for c in candidates}) == 1)
 
 
@@ -185,10 +186,11 @@ def auto_name_groups(
         res = NameResult(group_index=gi)
         first0, last0 = g.start - 1, g.end - 1
         if unit_mode == "reporting":
-            nonblank = [p.src_index-1 for p in doc.pages[g.start-1:g.end]
-                        if not p.blank or p.blank.verdict != "blank"]
-            if nonblank:
-                first0, last0 = nonblank[0], nonblank[-1]
+            nonblank = [number-1 for number in g.pages if number not in doc.excluded_pages
+                        and (not doc.pages[number-1].blank or doc.pages[number-1].blank.verdict != "blank")]
+            if not nonblank:
+                continue  # No retained content page to name.
+            first0, last0 = nonblank[0], nonblank[-1]
 
         # 1) 文本层（可选增强）
         if unit_mode == "reporting" and any(p.has_rotation_proposal for p in doc.pages[g.start-1:g.end]):
@@ -244,8 +246,8 @@ def auto_name_groups(
                     first_units, last_units, seal_units
                 )
                 if unit_mode == "reporting":
-                    # Only explicit reporting labels qualify. Generic issuer/seal candidates
-                    # remain available to legacy extraction APIs, never to this field.
+                    # Explicit reporting labels remain primary. Last-page signatures
+                    # are separate, unconfirmed suggestions authorised in v1.16.
                     res.unit_candidates = []
                     page_data = [(first0, lines, w, h)]
                     for idx0 in nonblank[1:]:
@@ -263,12 +265,18 @@ def auto_name_groups(
                             c.page = idx0 + 1
                             res.unit_candidates.append(c)
                     res.unit_candidates.sort(key=lambda c: c.confidence, reverse=True)
+                    if not (cancel_cb and cancel_cb()):
+                        regional = unit_region.scan(renderer, last0, engine, doc.pages[last0],
+                                                    cancel_cb or (lambda: False))
+                        res.unit_candidates = unit_region.merge(res.unit_candidates, regional)
                 for c in res.title_candidates:
                     c.page = first0 + 1
             except Exception as e:
                 res.error = str(e)
 
         # 2) 填入组字段
+        if cancel_cb and cancel_cb():
+            break  # A cancelled region/page scan must not publish partial names.
         best_t = res.best_title
         best_u = res.best_unit
         if keep_title:
@@ -303,7 +311,7 @@ def auto_name_groups(
                 and best_t.confidence >= CONFIRM_THRESHOLD
             )
         if not keep_unit:
-            g.unit_confirmed = (reporting_unit_auto_confirm(res) if unit_mode == "reporting"
+            g.unit_confirmed = (reporting_unit_auto_confirm(res) and not res.error if unit_mode == "reporting"
                                 else _unit_auto_confirm(res))
         if unit_mode == "reporting":
             if not keep_title:

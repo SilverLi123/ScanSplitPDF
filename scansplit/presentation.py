@@ -1,6 +1,7 @@
 """Read-only product language. Does not analyse, confirm or export documents."""
 from dataclasses import dataclass
 from . import blankpolicy
+from .unit_region import SOURCE as SIGNATURE_SOURCE
 import re
 
 COLORS = dict(success="#17643c", warning="#805200", error="#a12828", info="#536173")
@@ -87,7 +88,12 @@ def issues(docs):
                 cs = candidates(g,field)
                 reason = ("未找到明确的填报单位字段，请按原件填写。" if field=="unit" else "未找到可靠标题，请按原件填写。") if not cs else (
                     "存在多个不同候选，请核对当前文字及来源。" if len({c.get('text') for c in cs})>1 else "自动提取结果需要人工核对。")
-                result.append(Issue(f"{di}:{field}:{gi}",label,label+"需要确认",reason,di,g.start,gi,field,"field"))
+                match = field_info(g, field)[3]
+                if field == "unit" and match and match.get("source") == SIGNATURE_SOURCE:
+                    reason = "末页右下角识别到落款单位，请确认它是否为本文件的填报单位。" + (
+                        "存在多个候选，请核对。" if len({c.get('text') for c in cs}) > 1 else "")
+                page = (match or {}).get("page") or g.start
+                result.append(Issue(f"{di}:{field}:{gi}",label,label+"需要确认",reason,di,page,gi,field,"field"))
     return result
 
 
